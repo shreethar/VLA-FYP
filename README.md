@@ -8,12 +8,12 @@
 This project is broken into 7 stages
 
 - [x] Stage 1: Robot Grounding SFT
-- [] Stage 2: CoT-SFT (Teacher Reasoning Warmup)
-- [] Stage 3: GRPO Teacher Training
-- [] Stage 4: Joint Student Distillation + Spatial Forcing
-- [] Stage 5: Action Expert Training
-- [] Stage 6: Partial VLM Coupling
-- [] Stage 7: LIBERO Fine-Tuning + RL (Optional)
+- [ ] Stage 2: CoT-SFT (Teacher Reasoning Warmup)
+- [ ] Stage 3: GRPO Teacher Training
+- [ ] Stage 4: Joint Student Distillation + Spatial Forcing
+- [ ] Stage 5: Action Expert Training
+- [ ] Stage 6: Partial VLM Coupling
+- [ ] Stage 7: LIBERO Fine-Tuning + RL (Optional)
 
 ---
 Hardware used:
