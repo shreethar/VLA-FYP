@@ -5,7 +5,7 @@
 ### It relies on Conditional Flow Matching Adapter for Action Token Generation. It also has a Goal-Delta injected as conditioning token in first Cross Attention Layer and Memory Module with N=8 recurrent query vectors m_t
 
 ---
-This project is broken into 7 stages
+## This project is broken into 7 stages
 
 - [x] Stage 1: Robot Grounding SFT
 - [ ] Stage 2: CoT-SFT (Teacher Reasoning Warmup)
@@ -16,8 +16,9 @@ This project is broken into 7 stages
 - [ ] Stage 7: LIBERO Fine-Tuning + RL (Optional)
 
 ---
-Stage Details:
-1. Stage 1: Robot Grounding SFT
+## Stage Details:
+
+### Stage 1: Robot Grounding SFT
 * This stage is to give the robotic foundational knowledge to the the VLM as a genral VLM do not have good robotic knowledge
 * The datasets used in this stage are [MolmoAct Trajectory](https://huggingface.co), [RoboVQA](), [RoboFAC](), [PixmoCap](), [PixmoCapQA](), [PixmoAMA](), [ShareRobot]()
 * I sampled around 10% of the data (If the full sample from the dataset is less than 100K samples, I take 100% of that dataset)
@@ -25,8 +26,13 @@ Stage Details:
 * I trained for 750K steps (600K samples / (Batch Size = 1 * Gradient Accum = 8) - Rounded up to 600K samples for calculation, or 1 epoch if you're not streaming
 * Learning Rate: 1e-5, Batch size: 1 due to GPU limitations
 * It's taking around 10 days to train Stage 1 using Unsloth
+
+### Stage 2: CoT-SFT
+* This stage is to give the model the ability to reason to complete the task
+* The datasets used in this stage are [Video-R1]() and 10% of the total dataset we used previously
+
 ---
-Hardware used:
+## Hardware used:
 1. GPU: NVIDIA RTX A4000
 2. RAM: 128GB @ 4400 MT/s
 3. CPU: Intel(R) Xeon(R) w3-2425
