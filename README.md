@@ -8,28 +8,23 @@
 ## This project is broken into 7 stages
 
 - [x] Stage 1: Robot Grounding SFT
-- [ ] Stage 2: CoT-SFT (Teacher Reasoning Warmup)
-- [ ] Stage 3: GRPO Teacher Training
-- [ ] Stage 4: Joint Student Distillation + Spatial Forcing
-- [ ] Stage 5: Action Expert Training
-- [ ] Stage 6: Partial VLM Coupling
-- [ ] Stage 7: LIBERO Fine-Tuning + RL (Optional)
+- [ ] Stage 2: GRPO Teacher Training & Student Distillation & Spatial Forcing
+- [ ] Stage 3: Action Expert Training
+- [ ] Stage 4: Partial VLM Coupling
+- [ ] Stage 5: LIBERO Fine-Tuning + RL (Optional)
 
 ---
 ## Stage Details:
 
-### Stage 1: Robot Grounding SFT
+### Stage 1: Robot Grounding SFT -> Completed
 * This stage is to give the robotic foundational knowledge to the the VLM as a genral VLM do not have good robotic knowledge
 * The datasets used in this stage are [MolmoAct Trajectory](https://huggingface.co), [RoboVQA](), [RoboFAC](), [PixmoCap](), [PixmoCapQA](), [PixmoAMA](), [ShareRobot]()
 * I sampled around 10% of the data (If the full sample from the dataset is less than 100K samples, I take 100% of that dataset)
 * Total came up to be around 560K samples
-* I trained for 750K steps (600K samples / (Batch Size = 1 * Gradient Accum = 8) - Rounded up to 600K samples for calculation, or 1 epoch if you're not streaming
+* I trained for 750K steps (600K samples / (Batch Size = 1 * Gradient Accum = 8)) - Rounded up to 600K samples for calculation, or 1 epoch if you're not streaming
 * Learning Rate: 1e-5, Batch size: 1 due to GPU limitations
 * It's taking around 10 days to train Stage 1 using Unsloth
 
-### Stage 2: CoT-SFT
-* This stage is to give the model the ability to reason to complete the task
-* The datasets used in this stage are [Video-R1]() and 10% of the total dataset we used previously
 
 ---
 ## Hardware used:
