@@ -1,0 +1,36 @@
+# Python-generated files
+__pycache__/
+*.py[oc]
+build/
+dist/
+wheels/
+*.egg-info
+
+# Cache
+unsloth_compiled_cache/
+
+# Virtual environments
+.venv
+
+# Datasets
+data/RoboFAC/
+data/RoboVQA-train/
+data/ShareRobot/
+data/Video-R1-COT-165k.json
+
+# Scripts
+download_ShareRobot.py
+
+# Cleanup files
+data/cleanup_for_stage2.py
+data/cleanup_sharerobot_planning.py
+dataset_recovery_guide.md
+
+# Model output
+data/outputs/
+data/stage1_unsloth/
+
+# Logs
+data/wandb/
+
+.ipynb_checkpoints/
