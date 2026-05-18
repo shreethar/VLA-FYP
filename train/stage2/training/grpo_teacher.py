@@ -28,8 +28,8 @@ import torch.nn.functional as F
 from dataclasses import dataclass, field
 from typing import List, Optional, Tuple, Protocol
 
-from transformers import Qwen2_5_VLForConditionalGeneration, GenerationConfig
-from peft import LoraConfig, TaskType, get_peft_model, get_peft_model_state_dict
+from transformers import AutoModelForImageTextToText, GenerationConfig
+from peft import LoraConfig, get_peft_model, get_peft_model_state_dict
 
 
 # ---------------------------------------------------------------------------
@@ -97,7 +97,7 @@ class RolloutBuffer:
 
 class GRPOTeacher(nn.Module):
     """
-    Textual Teacher (F_θT): Qwen2.5-VL-4B with LoRA.
+    Textual Teacher (F_θT): Qwen3.5-4B with LoRA.
     Identical base architecture to the Latent Student; diverges through training.
 
     Parameters
@@ -113,7 +113,7 @@ class GRPOTeacher(nn.Module):
 
     def __init__(
         self,
-        model_name: str = "Qwen/Qwen2.5-VL-4B-Instruct",
+        model_name: str = "Qwen/Qwen3.5-4B",
         G: int = 5,
         answer_token_id: int = -1,          # set after tokenizer extension
         lora_rank: int = 64,
@@ -133,32 +133,36 @@ class GRPOTeacher(nn.Module):
         # ------------------------------------------------------------------
         # 1. Base VLM
         # ------------------------------------------------------------------
-        base = Qwen2_5_VLForConditionalGeneration.from_pretrained(
+        base = AutoModelForImageTextToText.from_pretrained(
             model_name,
             torch_dtype=torch.bfloat16,
-            attn_implementation="flash_attention_2",
         )
 
         # Freeze vision encoder
-        for param in base.visual.parameters():
+        # Qwen3.5 hierarchy: base.model.visual
+        for param in base.model.visual.parameters():
             param.requires_grad = False
 
         # ------------------------------------------------------------------
-        # 2. LoRA
+        # 2. LoRA — targets both standard Attention and Gated DeltaNet layers
         # ------------------------------------------------------------------
         lora_cfg = LoraConfig(
-            task_type=TaskType.CAUSAL_LM,
             r=lora_rank,
             lora_alpha=lora_alpha,
             lora_dropout=lora_dropout,
             target_modules=[
+                # Standard attention projections
                 "q_proj", "k_proj", "v_proj", "o_proj",
+                # Gated DeltaNet main projections
+                "out_proj", "in_proj_qkv", "in_proj_z",
+                # Feed-forward network
                 "gate_proj", "up_proj", "down_proj",
             ],
             bias="none",
         )
         self.vlm = get_peft_model(base, lora_cfg)
-        self.hidden_dim: int = self.vlm.config.hidden_size   # 2048
+        # Qwen3.5 config: hidden_size is under text_config
+        self.hidden_dim: int = self.vlm.config.text_config.hidden_size   # 2560
 
         # ------------------------------------------------------------------
         # 3. Optional frozen reference snapshot for KL penalty
@@ -191,10 +195,13 @@ class GRPOTeacher(nn.Module):
         image_grid_thw: Optional[torch.Tensor],
     ) -> torch.Tensor:
         """Embed tokens and splice in visual encoder features."""
-        embeds = self.vlm.model.embed_tokens(input_ids)
+        # Qwen3.5 hierarchy: vlm.model (Qwen3_5ForConditionalGeneration)
+        #   → .model (Qwen3_5Model) → .language_model.embed_tokens
+        inner_model = self.vlm.model.model  # Qwen3_5Model
+        embeds = inner_model.language_model.embed_tokens(input_ids)
         if pixel_values is not None:
             with torch.no_grad():
-                img_feats = self.vlm.visual(pixel_values, grid_thw=image_grid_thw)
+                img_feats = inner_model.visual(pixel_values, grid_thw=image_grid_thw)
             mask = (input_ids == self.vlm.config.image_token_id)
             embeds = embeds.clone()
             embeds[mask] = img_feats.to(embeds.dtype)
@@ -425,13 +432,12 @@ class GRPOTeacher(nn.Module):
             inputs_embeds = self._build_input_embeds(
                 ids, pixel_values, image_grid_thw
             )
-            out = self.vlm.model(
+            out = self.vlm.model.model(
                 inputs_embeds=inputs_embeds,
                 attention_mask=attn,
-                use_cache=False,
                 return_dict=True,
             )
-            logits = self.vlm.lm_head(out.last_hidden_state)  # [batch, seq, vocab]
+            logits = self.vlm.model.lm_head(out.last_hidden_state)  # [batch, seq, vocab]
 
             # Per-token log-probs
             log_probs = F.log_softmax(logits[:, :-1, :], dim=-1)  # [batch, seq-1, vocab]
@@ -449,13 +455,12 @@ class GRPOTeacher(nn.Module):
             kl_term = torch.zeros_like(mean_log_p)
             if self.kl_coef > 0:
                 with torch.no_grad():
-                    ref_out = self._ref_model.model(
+                    ref_out = self._ref_model.model.model(
                         inputs_embeds=inputs_embeds.detach(),
                         attention_mask=attn,
-                        use_cache=False,
                         return_dict=True,
                     )
-                    ref_logits  = self._ref_model.lm_head(ref_out.last_hidden_state)
+                    ref_logits  = self._ref_model.model.lm_head(ref_out.last_hidden_state)
                     ref_log_p   = F.log_softmax(ref_logits[:, :-1, :], dim=-1)
                     ref_token_p = ref_log_p.gather(
                         dim=-1, index=target_ids.unsqueeze(-1)
@@ -559,10 +564,9 @@ class GRPOTeacher(nn.Module):
             tau_pos_ids, pixel_values, image_grid_thw
         )
 
-        out = self.vlm.model(
+        out = self.vlm.model.model(
             inputs_embeds=inputs_embeds,
             attention_mask=tau_pos_mask,
-            use_cache=False,
             output_hidden_states=False,
             return_dict=True,
         )

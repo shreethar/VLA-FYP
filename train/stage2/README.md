@@ -6,9 +6,9 @@ Three models train jointly:
 
 | Model | Base | Role |
 |---|---|---|
-| Teacher (F_θT) | Qwen2.5-VL-4B + LoRA r=64 | GRPO policy, generates CoT text traces |
-| Student (F_θ)  | Qwen2.5-VL-4B + LoRA r=64 | Generates M=6 continuous latent vectors + K=5 spatial tokens |
-| Verbalizer (Vψ)| Qwen3-0.6B + LoRA r=32 + per-layer CA | Translates Student latents → text for DPO gradient signal |
+| Teacher (F_θT) | Qwen3.5-4B + LoRA r=64 | GRPO policy, generates CoT text traces |
+| Student (F_θ)  | Qwen3.5-4B + LoRA r=64 | Generates M=6 continuous latent vectors + K=5 spatial tokens |
+| Verbalizer (Vψ)| Qwen3.5-0.8B + LoRA r=32 + per-layer CA | Translates Student latents → text for DPO gradient signal |
 
 Teacher and Student are initialised from the **same Stage 1 checkpoint**.
 
@@ -66,8 +66,8 @@ r_format = 1.0 (exact structure) | ROUGE avg (QA tasks)
 stage2/
 ├── models/
 │   ├── latent_student.py   — Student VLM: latent loop + spatial tokens + SpatialMLP
-│   ├── verbalizer.py       — 0.6B LM with per-layer CA blocks + DPO/LM losses
-│   └── spatial_forcing.py  — Frozen DINOv2/VGGT extractor + ProjectionMLP
+│   ├── verbalizer.py       — 0.8B LM with per-layer CA blocks + DPO/LM losses
+│   └── spatial_forcing.py  — Frozen VGGT/DINOv2 extractor + ProjectionMLP
 ├── training/
 │   ├── grpo_teacher.py     — Teacher: rollouts, scoring, GRPO update, h_T extraction
 │   ├── student_losses.py   — All four Student loss terms, phase-aware
@@ -108,7 +108,9 @@ python training/train_stage2.py \
 ## Key Implementation Notes
 
 **Latent loop** — Student bypasses the vocabulary entirely for M=6 steps.
-`z_m = last_hidden_state[:, 0, :]` fed directly as `inputs_embeds` for step m+1.
+Each step's hidden state `z_m` is concatenated to the growing sequence and
+fed back through the model. This concat-based approach (rather than KV caching)
+is required because Qwen3.5's Gated DeltaNet layers use recurrent state.
 
 **h_T extraction timing** — Teacher's `<ans>` hidden state is extracted in a
 SEPARATE forward pass AFTER the GRPO optimizer step. This matches Algorithm 1's

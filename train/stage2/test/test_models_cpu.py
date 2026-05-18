@@ -3,7 +3,7 @@ test_models_cpu.py
 ------------------
 Shape / logic tests for all model components using TINY random models.
 
-Instead of loading Qwen2.5-VL-4B (8+ GB), we mock the heavy HuggingFace
+Instead of loading Qwen3.5-4B (8+ GB), we mock the heavy HuggingFace
 loading and test the custom logic (latent loop, CA injection, spatial MLP,
 gradient flow, freeze/unfreeze) with small random weights.
 
@@ -88,7 +88,7 @@ class MockBaseTransformer(nn.Module):
 class _SpatialMLP(nn.Module):
     """
     Inline copy of SpatialMLP from latent_student.py.
-    We duplicate it here so tests don't trigger the heavy Qwen2.5-VL import
+    We duplicate it here so tests don't trigger the heavy Qwen3.5 import
     chain at module load time. The GPU smoke test validates the real class.
     """
     def __init__(self, hidden_dim: int):
@@ -277,14 +277,15 @@ class TestVerbalizerLogic:
         mock_lm.config.hidden_size = d_verb
         mock_lm.config.num_hidden_layers = num_layers
 
-        # Inner transformer model
-        mock_model = MockBaseTransformer(
+        # Inner transformer model — mock Qwen3.5 hierarchy:
+        # self.lm.model.model = Qwen3_5TextModel (embed_tokens, layers, norm)
+        # self.lm.model.lm_head = Linear
+        mock_inner = nn.Module()  # stands in for Qwen3_5ForCausalLM
+        mock_inner.model = MockBaseTransformer(
             hidden_dim=d_verb, num_layers=num_layers, vocab_size=vocab_size
         )
-        mock_lm.model = mock_model
-
-        # LM head
-        mock_lm.lm_head = nn.Linear(d_verb, vocab_size, bias=False)
+        mock_inner.lm_head = nn.Linear(d_verb, vocab_size, bias=False)
+        mock_lm.model = mock_inner
 
         # named_parameters for LoRA check
         mock_lm.named_parameters = lambda: iter([])

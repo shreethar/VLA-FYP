@@ -58,15 +58,15 @@ logging.basicConfig(
 @dataclass
 class Stage2Config:
     # Paths
-    base_model_name:     str  = "Qwen/Qwen2.5-VL-4B-Instruct"
-    verbalizer_name:     str  = "Qwen/Qwen3-0.6B"
+    base_model_name:     str  = "Qwen/Qwen3.5-4B"
+    verbalizer_name:     str  = "Qwen/Qwen3.5-0.8B"
     stage1_ckpt_dir:     str  = "checkpoints/stage1"           # shared Teacher/Student init
     output_dir:          str  = "checkpoints/stage2"
 
     # Spatial Forcing extractor
-    extractor_type:      str  = "dinov2"
-    extractor_ckpt:      str  = "facebook/dinov2-large"
-    extractor_dim:       int  = 1024                            # DINOv2-large output dim
+    extractor_type:      str  = "vggt"
+    extractor_ckpt:      str  = "facebook/VGGT-1B"
+    extractor_dim:       int  = 1024                            # VGGT-1B output dim
 
     # Training schedule
     total_steps:         int  = 4500

@@ -33,7 +33,7 @@ Usage
 -----
     # Once, before any training:
     python tokenizer_setup.py \
-        --model_name Qwen/Qwen2.5-VL-4B-Instruct \
+        --model_name Qwen/Qwen3.5-4B \
         --save_dir   tokenizer/
 
     # The script prints the answer_token_id — use it in train_stage2.py:
@@ -58,7 +58,7 @@ ANS_CLOSE_TOKEN = "</ans>"
 
 
 def setup_tokenizer(
-    model_name: str = "Qwen/Qwen2.5-VL-4B-Instruct",
+    model_name: str = "Qwen/Qwen3.5-4B",
     save_dir: str   = "tokenizer/",
 ) -> tuple:
     """
@@ -139,7 +139,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument(
         "--model_name", type=str,
-        default="Qwen/Qwen2.5-VL-4B-Instruct",
+        default="Qwen/Qwen3.5-4B",
         help="HuggingFace model name to load tokenizer from",
     )
     parser.add_argument(

@@ -123,7 +123,7 @@ class VGGTExtractor(FrozenExtractor):
         VGGTExtractor(checkpoint="<user-confirmed-repo>", output_dim=1024)
     """
 
-    def __init__(self, checkpoint: str, output_dim: int = 1024):
+    def __init__(self, checkpoint: str = "facebook/VGGT-1B", output_dim: int = 1024):
         super().__init__()
         self.model = AutoModel.from_pretrained(
             checkpoint, torch_dtype=torch.bfloat16, trust_remote_code=True
@@ -207,8 +207,8 @@ class SpatialForcingLoss(nn.Module):
 
     def __init__(
         self,
-        extractor_type: str = "dinov2",
-        extractor_ckpt: str = "facebook/dinov2-large",
+        extractor_type: str = "vggt",
+        extractor_ckpt: str = "facebook/VGGT-1B",
         student_dim: int = 2560,
         extractor_dim: Optional[int] = None,
         lambda_sf: float = 0.1,

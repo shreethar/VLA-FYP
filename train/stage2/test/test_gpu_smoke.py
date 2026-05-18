@@ -7,12 +7,12 @@ These actually load the real models and verify end-to-end shapes.
 Run:  python test/test_gpu_smoke.py
 
 This script:
-  1. Loads Qwen2.5-VL-4B with LoRA (LatentStudent)
+  1. Loads Qwen3.5-4B with LoRA (LatentStudent)
   2. Runs the latent loop → checks output shapes
-  3. Loads the Verbalizer (Qwen3-0.6B + CA blocks)
+  3. Loads the Verbalizer (Qwen3.5-0.8B + CA blocks)
   4. Tests forward pass with latents
   5. Tests freeze + gradient flow through CA
-  6. Loads DINOv2 extractor → tests spatial forcing
+  6. Loads VGGT extractor → tests spatial forcing
   7. Estimates peak VRAM usage
 
 Expected VRAM: ~18-20 GB for all three models simultaneously.
@@ -52,7 +52,7 @@ def test_latent_student():
 
     t0 = time.time()
     student = LatentStudent(
-        model_name="Qwen/Qwen2.5-VL-4B-Instruct",
+        model_name="Qwen/Qwen3.5-4B",
         M=6, K=5, lora_rank=64, lora_alpha=128,
     ).to(device)
     print(f"  ✅ Loaded in {time.time()-t0:.1f}s, VRAM: {fmt_mem(torch.cuda.memory_allocated())}")
@@ -70,7 +70,6 @@ def test_latent_student():
             input_ids=input_ids,
             pixel_values=None,
             image_grid_thw=None,
-            attention_mask=attention_mask,
         )
 
     print(f"  ✅ generate_latents succeeded")
@@ -90,7 +89,6 @@ def test_latent_student():
             input_ids=input_ids,
             pixel_values=None,
             image_grid_thw=None,
-            attention_mask=attention_mask,
             answer_token_positions=answer_positions,
         )
     print(f"  ✅ get_answer_hidden_state: {h_ans.shape}")
@@ -119,8 +117,8 @@ def test_verbalizer():
 
     t0 = time.time()
     verbalizer = Verbalizer(
-        model_name="Qwen/Qwen3-0.6B",
-        student_hidden=2048,  # must match Student's hidden_dim
+        model_name="Qwen/Qwen3.5-0.8B",
+        student_hidden=2560,  # must match Student's hidden_dim (Qwen3.5-4B)
         lora_rank=32,
         lora_alpha=64,
     ).to(device)
@@ -128,7 +126,7 @@ def test_verbalizer():
     verbalizer.print_trainable_parameters()
 
     batch, seq, M = 2, 20, 6
-    d_student = 2048
+    d_student = 2560
     vocab_size = verbalizer.lm.config.vocab_size
 
     input_ids = torch.randint(0, vocab_size, (batch, seq), device=device)
@@ -200,9 +198,9 @@ def test_spatial_forcing():
 
     t0 = time.time()
     sf = SpatialForcingLoss(
-        extractor_type="dinov2",
-        extractor_ckpt="facebook/dinov2-large",
-        student_dim=2048,
+        extractor_type="vggt",
+        extractor_ckpt="facebook/VGGT-1B",
+        student_dim=2560,
         extractor_dim=1024,
         lambda_sf=0.1,
     ).to(device)
@@ -219,7 +217,7 @@ def test_spatial_forcing():
     assert ref_feats.shape == (batch, 1024)
 
     # Compute loss
-    x_V = torch.randn(batch, 50, 2048, device=device)  # student visual features
+    x_V = torch.randn(batch, 50, 2560, device=device)  # student visual features
     loss = sf.compute_loss(x_V, ref_feats)
     print(f"  ✅ Spatial forcing loss: {loss.item():.4f}")
     assert loss.shape == ()
@@ -253,7 +251,7 @@ def test_grpo_teacher():
 
     t0 = time.time()
     teacher = GRPOTeacher(
-        model_name="Qwen/Qwen2.5-VL-4B-Instruct",
+        model_name="Qwen/Qwen3.5-4B",
         G=5,
         answer_token_id=99999,  # dummy
         lora_rank=64,
@@ -314,7 +312,7 @@ def test_tokenizer_setup():
     save_dir = os.path.join(os.path.dirname(__file__), "..", "_test_tokenizer_tmp")
     try:
         tokenizer, answer_token_id = setup_tokenizer(
-            model_name="Qwen/Qwen2.5-VL-4B-Instruct",
+            model_name="Qwen/Qwen3.5-4B",
             save_dir=save_dir,
         )
         print(f"  ✅ answer_token_id = {answer_token_id}")
