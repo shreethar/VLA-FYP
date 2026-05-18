@@ -91,7 +91,7 @@ def dtw_distance(seq_a: np.ndarray, seq_b: np.ndarray) -> float:
 # ---------------------------------------------------------------------------
 
 _ANS_PATTERN = re.compile(
-    r"<ans>\s*([\d.]+,[\d.]+(?:;[\d.]+,[\d.]+)*)\s*</ans>",
+    r"<ans>\s*([\d.]+\s*,\s*[\d.]+(?:\s*;\s*[\d.]+\s*,\s*[\d.]+)*)\s*</ans>",
     re.IGNORECASE,
 )
 
