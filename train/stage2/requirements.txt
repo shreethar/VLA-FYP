@@ -1,0 +1,29 @@
+# ThinkFlow-VLA Stage 2 — Teacher-Student Distillation
+# Tested on: RTX 5090 (24GB), CUDA 12.4, Python 3.11
+
+# Core
+torch>=2.4.0
+torchvision>=0.19.0
+transformers>=4.51.0
+peft>=0.14.0
+accelerate>=0.34.0
+
+# Flash Attention (compile from source for Blackwell/Ada on Vast.ai)
+# pip install flash-attn --no-build-isolation
+flash-attn>=2.6.0
+
+# Safetensors (checkpoint I/O)
+safetensors>=0.4.3
+
+# Format reward
+rouge-score>=0.1.2
+
+# Data
+datasets>=2.20.0
+lerobot>=0.1.0
+
+# Numerical
+numpy>=1.26.0
+
+# Logging (optional but recommended)
+wandb>=0.17.0

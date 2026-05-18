@@ -34,3 +34,6 @@ data/stage1_unsloth/
 data/wandb/
 
 .ipynb_checkpoints/
+
+# Zip
+train/stage2_gemini.zip
