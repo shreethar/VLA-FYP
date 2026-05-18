@@ -41,6 +41,7 @@ from models.verbalizer       import Verbalizer
 from models.spatial_forcing  import SpatialForcingLoss
 from training.grpo_teacher   import GRPOTeacher, RolloutBuffer
 from training.student_losses import StudentLossComputer, build_student_loss_computer
+from tokenizer_setup         import load_answer_token_id
 
 
 logger = logging.getLogger(__name__)
@@ -554,16 +555,18 @@ def train_stage2(
 
 if __name__ == "__main__":
     import argparse
-    from rewards.action_reward import ActionAlignedReward
-    from rewards.qa_reward     import QAReward
-
     parser = argparse.ArgumentParser()
-    parser.add_argument("--stage1_ckpt",  type=str, required=True)
-    parser.add_argument("--output_dir",   type=str, default="checkpoints/stage2")
-    parser.add_argument("--resume_from",  type=str, default=None)
-    parser.add_argument("--total_steps",  type=int, default=4500)
-    parser.add_argument("--answer_token_id", type=int, required=True)
+    parser.add_argument("--stage1_ckpt",   type=str, required=True)
+    parser.add_argument("--tokenizer_dir", type=str, default="tokenizer/",
+                        help="Dir produced by tokenizer_setup.py")
+    parser.add_argument("--output_dir",    type=str, default="checkpoints/stage2")
+    parser.add_argument("--resume_from",   type=str, default=None)
+    parser.add_argument("--total_steps",   type=int, default=4500)
     args = parser.parse_args()
+
+    # Auto-load answer_token_id from tokenizer config
+    answer_token_id = load_answer_token_id(args.tokenizer_dir)
+    logger.info(f"answer_token_id = {answer_token_id}")
 
     cfg = Stage2Config(
         stage1_ckpt_dir=args.stage1_ckpt,
@@ -571,9 +574,10 @@ if __name__ == "__main__":
         total_steps=args.total_steps,
     )
 
-    # Build reward functions (concrete implementations injected here)
-    reward_fns     = [ActionAlignedReward(), QAReward()]
-    reward_weights = [0.7, 0.3]
+    from rewards.action_reward import ActionAlignedReward, CombinedActionReward
+    from rewards.qa_reward     import FormatReward
+    reward_fns     = [CombinedActionReward(ActionAlignedReward(), FormatReward())]
+    reward_weights = [1.0]   # 0.9/0.1 split baked into CombinedActionReward
 
     # Dataloader is user-provided — plug your LeRobot StreamingDataset here
     # dataloader = build_stage2_dataloader(cfg)
