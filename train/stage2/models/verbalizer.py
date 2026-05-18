@@ -3,16 +3,30 @@ verbalizer.py
 -------------
 Verbalizer (Vψ) for ThinkFlow-VLA Stage 2.
 
+Base model: Qwen3.5-0.8B (hybrid Gated DeltaNet + Attention architecture)
+
 Architecture
 ------------
-Base: Qwen/Qwen3-0.6B with LoRA rank=32 on attention layers.
-
 At EVERY transformer layer, a new CrossAttentionBlock is inserted:
-    h_l  = OriginalTransformerLayer_l(h_{l-1})          ← untouched SA + FFN
+    h_l  = OriginalTransformerLayer_l(h_{l-1})          ← untouched SA/DeltaNet + FFN
     h_l  = CrossAttentionBlock_l(Q=h_l, K=z, V=z)      ← new CA reads Student latents
 
 z = stack of Student's M=6 latent vectors, shape [batch, M, d_student].
-Since d_student (2048) ≠ d_verbalizer, each CA block has its own K/V projection.
+Since d_student (2560) ≠ d_verbalizer (1024), each CA block has its own K/V projection.
+
+Qwen3.5-0.8B architecture:
+  - 24 transformer layers (3:1 Gated DeltaNet : standard Attention)
+  - Hidden dim: 1024
+  - Vocab: 248,320
+
+Model hierarchy (after PEFT wrapping):
+  self.lm                              → PeftModel
+  self.lm.model                        → Qwen3_5ForCausalLM
+  self.lm.model.model                  → Qwen3_5TextModel (.embed_tokens, .layers, .norm)
+  self.lm.model.lm_head                → Linear
+
+Because DeltaNet layers use recurrent state (not KV cache), the manual
+layer-by-layer forward does NOT use KV caching.
 
 Training schedule (controlled externally by train_stage2.py):
   Steps 0 – 3000  : warm-up  — CA blocks + LoRA trainable, LM loss on τ+
@@ -29,8 +43,8 @@ import torch.nn as nn
 import torch.nn.functional as F
 from typing import List, Optional, Tuple
 
-from transformers import AutoModelForCausalLM, AutoTokenizer
-from peft import LoraConfig, TaskType, get_peft_model
+from transformers import AutoModelForCausalLM
+from peft import LoraConfig, get_peft_model
 
 
 # ---------------------------------------------------------------------------
@@ -50,8 +64,8 @@ class CrossAttentionBlock(nn.Module):
 
     def __init__(
         self,
-        query_dim: int,   # Verbalizer hidden size  (d_verb)
-        kv_dim: int,      # Student hidden size     (d_student = 2048)
+        query_dim: int,   # Verbalizer hidden size  (d_verb = 1024)
+        kv_dim: int,      # Student hidden size     (d_student = 2560)
         num_heads: int,
         dropout: float = 0.0,
     ):
@@ -104,12 +118,12 @@ class CrossAttentionBlock(nn.Module):
 
 class Verbalizer(nn.Module):
     """
-    Qwen3-0.6B with per-layer cross-attention blocks conditioned on Student latents.
+    Qwen3.5-0.8B with per-layer cross-attention blocks conditioned on Student latents.
 
     Parameters
     ----------
-    model_name     : HuggingFace repo ID for the 0.6B base model
-    student_hidden : hidden size of the Student VLM (d_student = 2048)
+    model_name     : HuggingFace repo ID for the 0.8B base model
+    student_hidden : hidden size of the Student VLM (d_student = 2560)
     lora_rank      : LoRA rank for the base attention layers
     lora_alpha     : LoRA scaling
     ca_num_heads   : attention heads inside each CrossAttentionBlock
@@ -119,8 +133,8 @@ class Verbalizer(nn.Module):
 
     def __init__(
         self,
-        model_name: str = "Qwen/Qwen3-0.6B",
-        student_hidden: int = 2048,
+        model_name: str = "Qwen/Qwen3.5-0.8B",
+        student_hidden: int = 2560,
         lora_rank: int = 32,
         lora_alpha: int = 64,
         ca_num_heads: int = 8,
@@ -131,30 +145,36 @@ class Verbalizer(nn.Module):
         self.dpo_beta = dpo_beta
 
         # ------------------------------------------------------------------
-        # 1. Load Qwen3-0.6B
+        # 1. Load Qwen3.5-0.8B
         # ------------------------------------------------------------------
         base = AutoModelForCausalLM.from_pretrained(
             model_name,
             torch_dtype=torch.bfloat16,
-            attn_implementation="flash_attention_2",
         )
 
         # ------------------------------------------------------------------
-        # 2. Wrap with LoRA (rank=32, attention layers only)
+        # 2. Wrap with LoRA
         # ------------------------------------------------------------------
+        # Target modules span both layer types in the hybrid architecture:
+        #   - Standard Attention: q_proj, k_proj, v_proj, o_proj
+        #   - Gated DeltaNet:     out_proj, in_proj_qkv, in_proj_z
         lora_cfg = LoraConfig(
-            task_type=TaskType.CAUSAL_LM,
             r=lora_rank,
             lora_alpha=lora_alpha,
             lora_dropout=0.05,
-            target_modules=["q_proj", "k_proj", "v_proj", "o_proj"],
+            target_modules=[
+                # Standard attention projections
+                "q_proj", "k_proj", "v_proj", "o_proj",
+                # Gated DeltaNet main projections
+                "out_proj", "in_proj_qkv", "in_proj_z",
+            ],
             bias="none",
         )
         self.lm = get_peft_model(base, lora_cfg)
 
         # Infer verbalizer hidden dim and layer count from config
-        self.hidden_dim: int = self.lm.config.hidden_size
-        self.num_layers: int = self.lm.config.num_hidden_layers
+        self.hidden_dim: int = self.lm.config.hidden_size        # 1024 for 0.8B
+        self.num_layers: int = self.lm.config.num_hidden_layers  # 24 for 0.8B
 
         # ------------------------------------------------------------------
         # 3. Insert one CrossAttentionBlock per transformer layer
@@ -173,46 +193,64 @@ class Verbalizer(nn.Module):
         self._frozen: bool = False
 
     # -----------------------------------------------------------------------
+    # Internal: access helpers for the Qwen3.5 model hierarchy
+    # -----------------------------------------------------------------------
+
+    @property
+    def _transformer(self):
+        """
+        Returns the Qwen3_5TextModel (the actual transformer stack).
+
+        Hierarchy after PEFT wrapping:
+          self.lm (PeftModel) → .model (Qwen3_5ForCausalLM)
+          → .model (Qwen3_5TextModel: .embed_tokens, .layers, .norm)
+        """
+        return self.lm.model.model
+
+    @property
+    def _lm_head(self):
+        """Returns the LM head (Linear layer for logit projection)."""
+        return self.lm.model.lm_head
+
+    # -----------------------------------------------------------------------
     # Internal: manual layer-by-layer forward with CA injection
     # -----------------------------------------------------------------------
 
     def _forward_with_latents(
         self,
         input_ids: torch.Tensor,        # [batch, seq]
-        attention_mask: torch.Tensor,   # [batch, seq]
-        latents: torch.Tensor,          # [batch, M, d_student]  — stacked z_1…z_M
+        attention_mask: torch.Tensor,    # [batch, seq]
+        latents: torch.Tensor,           # [batch, M, d_student]  — stacked z_1…z_M
         labels: Optional[torch.Tensor] = None,  # [batch, seq] for LM loss
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
         """
         Manual transformer forward that injects CA after every layer.
+
+        Because Qwen3.5 uses a hybrid architecture (Gated DeltaNet + standard
+        Attention), we iterate through the layers and handle both types.
+        Neither type uses KV caching in this forward path.
 
         Returns
         -------
         logits : [batch, seq, vocab_size]
         loss   : scalar CE loss if labels provided, else None
         """
-        # Access the inner model layers
-        # Qwen3 structure: lm.model.model.embed_tokens / .layers / .norm
-        transformer = self.lm.model   # the base LlamaModel-style stack
+        transformer = self._transformer
 
         # --- Embedding layer ---
         hidden = transformer.embed_tokens(input_ids)  # [batch, seq, d_verb]
 
-        # --- Build causal attention mask for manual iteration ---
-        # HuggingFace models accept the 2D bool mask and handle causal internally,
-        # but for manual iteration we pass it through each layer directly.
-        # We'll build a 4D mask matching what the layers expect.
+        # --- Build causal mask and position IDs ---
         batch_size, seq_len = input_ids.shape
         device = input_ids.device
 
-        # Rotary position embeddings (Qwen3 uses RoPE)
-        position_ids = torch.arange(seq_len, device=device).unsqueeze(0).expand(batch_size, -1)
-        position_ids = position_ids.long()
+        position_ids = torch.arange(
+            seq_len, device=device
+        ).unsqueeze(0).expand(batch_size, -1)
 
-        # Cache for RoPE cos/sin (shared across layers)
         cache_position = torch.arange(seq_len, device=device)
-        
-        # Build the 4D causal mask Qwen3 layers expect
+
+        # Build the 4D causal mask the layers expect
         causal_mask = transformer._update_causal_mask(
             attention_mask,
             hidden,
@@ -223,7 +261,8 @@ class Verbalizer(nn.Module):
 
         # --- Layer-by-layer forward with CA injection ---
         for layer_idx, layer in enumerate(transformer.layers):
-            # Standard transformer layer (SA + FFN)
+            # Standard transformer layer (DeltaNet or Attention + FFN)
+            # Both layer types accept the same interface
             layer_out = layer(
                 hidden,
                 attention_mask=causal_mask,
@@ -243,7 +282,7 @@ class Verbalizer(nn.Module):
         hidden = transformer.norm(hidden)  # [batch, seq, d_verb]
 
         # --- LM head ---
-        logits = self.lm.lm_head(hidden)  # [batch, seq, vocab_size]
+        logits = self._lm_head(hidden)  # [batch, seq, vocab_size]
 
         # --- Optional LM loss ---
         loss = None
@@ -262,9 +301,9 @@ class Verbalizer(nn.Module):
     def _compute_sequence_log_probs(
         self,
         input_ids: torch.Tensor,       # [batch, seq]
-        attention_mask: torch.Tensor,  # [batch, seq]
-        latents: torch.Tensor,         # [batch, M, d_student]
-        response_mask: torch.Tensor,   # [batch, seq] — 1 on response tokens only
+        attention_mask: torch.Tensor,   # [batch, seq]
+        latents: torch.Tensor,          # [batch, M, d_student]
+        response_mask: torch.Tensor,    # [batch, seq] — 1 on response tokens only
     ) -> torch.Tensor:
         """
         Compute per-sequence sum of log-probabilities over response tokens.
@@ -328,12 +367,12 @@ class Verbalizer(nn.Module):
     def compute_dpo_loss(
         self,
         pos_input_ids: torch.Tensor,   # [batch, seq] — τ+ tokenized
-        neg_input_ids: torch.Tensor,   # [batch, seq] — τ− tokenized
+        neg_input_ids: torch.Tensor,    # [batch, seq] — τ− tokenized
         pos_attention_mask: torch.Tensor,
         neg_attention_mask: torch.Tensor,
-        latents: torch.Tensor,         # [batch, M, d_student] — Student z (NO detach here)
-        pos_response_mask: torch.Tensor,  # [batch, seq] — 1 on τ+ response tokens
-        neg_response_mask: torch.Tensor,  # [batch, seq] — 1 on τ− response tokens
+        latents: torch.Tensor,          # [batch, M, d_student] — Student z (NO detach here)
+        pos_response_mask: torch.Tensor,   # [batch, seq] — 1 on τ+ response tokens
+        neg_response_mask: torch.Tensor,   # [batch, seq] — 1 on τ− response tokens
         ref_pos_log_probs: Optional[torch.Tensor] = None,  # [batch] reference model log-probs
         ref_neg_log_probs: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, dict]:

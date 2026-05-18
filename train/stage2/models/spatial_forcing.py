@@ -9,7 +9,7 @@ Loss:
 Where:
     x_V        — mid-layer (L/2) visual token hidden states from the Student
                  already extracted via LatentStudent.get_mid_layer_visual_features()
-                 shape: [batch, num_visual_tokens, d_student=2048]
+                 shape: [batch, num_visual_tokens, d_student=2560]
     Extractor  — frozen VGGT or DINOv2 feature extractor; zero inference overhead
                  at deployment because it is training-only
     pool(·)    — mean pool over spatial/patch dimension → [batch, d]
@@ -200,7 +200,7 @@ class SpatialForcingLoss(nn.Module):
     ----------
     extractor_type  : "dinov2" or "vggt"
     extractor_ckpt  : HuggingFace repo ID for the chosen extractor
-    student_dim     : Student hidden size (d_student = 2048)
+    student_dim     : Student hidden size (d_student = 2560 for Qwen3.5-4B)
     extractor_dim   : Output dim of the extractor (pass explicitly for VGGT)
     lambda_sf       : Loss scale λ (default 0.1 per the FYP spec)
     """
@@ -209,7 +209,7 @@ class SpatialForcingLoss(nn.Module):
         self,
         extractor_type: str = "dinov2",
         extractor_ckpt: str = "facebook/dinov2-large",
-        student_dim: int = 2048,
+        student_dim: int = 2560,
         extractor_dim: Optional[int] = None,
         lambda_sf: float = 0.1,
     ):

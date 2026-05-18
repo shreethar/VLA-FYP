@@ -3,14 +3,23 @@ latent_student.py
 -----------------
 Latent Student (Fθ) for ThinkFlow-VLA Stage 2.
 
+Base model: Qwen3.5-4B (hybrid Gated DeltaNet + Attention architecture)
+
 Key mechanics:
-  1. Encode visual+instruction prefix → KV cache + hidden states
+  1. Build input embeddings with visual token injection
   2. Autoregressive latent loop (M=6 steps):
-       - Feed previous hidden state directly as next input embedding (NO vocab lookup)
-       - Extract final-layer hidden state → this IS z_m ∈ R^d (NO projection head)
-       - Repeat, accumulating z_1 ... z_M
+       - Feed full growing sequence through the model
+       - Extract final-position hidden state → this IS z_m ∈ R^d (NO projection head)
+       - Concatenate z_m to the sequence, repeat
+       - Accumulate z_1 ... z_M
   3. Append K=5 learnable spatial tokens → process in one parallel forward pass
   4. Spatial token output hidden states → SpatialMLP → 2D waypoints
+
+Architecture note:
+  Qwen3.5 uses a hybrid 3:1 pattern of Gated DeltaNet (linear attention)
+  and standard Gated Attention layers.  DeltaNet layers use recurrent state
+  instead of KV cache, so we use concat-based sequence growth for the
+  latent loop (matching the validated notebook pattern) rather than KV caching.
 
 Separate utility methods for:
   - <answer> token hidden state extraction  (L_distill)
@@ -21,8 +30,8 @@ import torch
 import torch.nn as nn
 from typing import List, Optional, Tuple
 
-from transformers import Qwen2_5_VLForConditionalGeneration
-from peft import LoraConfig, TaskType, get_peft_model
+from transformers import AutoModelForImageTextToText
+from peft import LoraConfig, get_peft_model
 
 
 # ---------------------------------------------------------------------------
@@ -57,11 +66,30 @@ class SpatialMLP(nn.Module):
 
 class LatentStudent(nn.Module):
     """
-    Wraps Qwen2.5-VL-4B with LoRA to act as the Latent Student (Fθ).
+    Wraps Qwen3.5-4B with LoRA to act as the Latent Student (Fθ).
+
+    Architecture
+    ------------
+    Qwen3.5-4B is a hybrid VLM with:
+      - 32 transformer layers (3:1 Gated DeltaNet : standard Attention)
+      - Hidden dim: 2560
+      - Vocab: 248,320
+      - Vision encoder: Qwen3_5VisionModel with patch merger → d=2560
+
+    Model hierarchy (after PEFT wrapping):
+      self.vlm                          → PeftModel
+      self.vlm.model                    → Qwen3_5ForConditionalGeneration
+      self.vlm.model.model              → Qwen3_5Model  (.visual, .language_model)
+      self.vlm.model.model.language_model → Qwen3_5TextModel (.embed_tokens, .layers, .norm)
+      self.vlm.model.lm_head            → Linear
+
+    Because DeltaNet layers use recurrent state (not KV cache), the latent
+    loop uses concat-based sequence growth following the validated notebook
+    pattern rather than KV caching.
 
     Parameters
     ----------
-    model_name   : HuggingFace repo ID for the base VLM checkpoint
+    model_name   : HuggingFace repo ID or local path for the VLM checkpoint
     M            : number of continuous reasoning latent vectors to generate
     K            : number of learnable spatial tokens
     lora_rank    : LoRA rank r
@@ -71,7 +99,7 @@ class LatentStudent(nn.Module):
 
     def __init__(
         self,
-        model_name: str = "Qwen/Qwen2.5-VL-4B-Instruct",
+        model_name: str = "Qwen/Qwen3.5-4B",
         M: int = 6,
         K: int = 5,
         lora_rank: int = 64,
@@ -85,22 +113,28 @@ class LatentStudent(nn.Module):
         # ------------------------------------------------------------------
         # 1. Load base VLM in bf16
         # ------------------------------------------------------------------
-        base = Qwen2_5_VLForConditionalGeneration.from_pretrained(
+        base = AutoModelForImageTextToText.from_pretrained(
             model_name,
             torch_dtype=torch.bfloat16,
-            attn_implementation="flash_attention_2",
         )
 
         # ------------------------------------------------------------------
-        # 2. Wrap with LoRA (language transformer layers only)
+        # 2. Wrap with LoRA
         # ------------------------------------------------------------------
+        # Target modules span both layer types in the hybrid architecture:
+        #   - Standard Attention (every 4th layer): q_proj, k_proj, v_proj, o_proj
+        #   - Gated DeltaNet (other layers):        out_proj, in_proj_qkv, in_proj_z
+        #   - MLP (all layers):                     gate_proj, up_proj, down_proj
         lora_cfg = LoraConfig(
-            task_type=TaskType.CAUSAL_LM,
             r=lora_rank,
             lora_alpha=lora_alpha,
             lora_dropout=lora_dropout,
             target_modules=[
+                # Standard attention projections
                 "q_proj", "k_proj", "v_proj", "o_proj",
+                # Gated DeltaNet main projections
+                "out_proj", "in_proj_qkv", "in_proj_z",
+                # Feed-forward network
                 "gate_proj", "up_proj", "down_proj",
             ],
             bias="none",
@@ -108,9 +142,11 @@ class LatentStudent(nn.Module):
         self.vlm = get_peft_model(base, lora_cfg)
 
         # Convenience references
-        self.hidden_dim: int = self.vlm.config.hidden_size       # 2048 for 4B
-        self.num_layers: int = self.vlm.config.num_hidden_layers  # 28 for 4B
-        self.mid_layer_idx: int = self.num_layers // 2            # 14
+        # Qwen3.5 stores LM config under text_config
+        text_cfg = self.vlm.config.text_config
+        self.hidden_dim: int = text_cfg.hidden_size        # 2560 for 4B
+        self.num_layers: int = text_cfg.num_hidden_layers  # 32 for 4B
+        self.mid_layer_idx: int = self.num_layers // 2     # 16
 
         # ------------------------------------------------------------------
         # 3. K learnable spatial tokens  [K, d]
@@ -133,24 +169,32 @@ class LatentStudent(nn.Module):
     # -----------------------------------------------------------------------
 
     @property
-    def _base_transformer(self):
-        """Returns the underlying base LM (no LM head, no visual encoder)."""
-        # Qwen2.5-VL: vlm.model is the LlamaModel-style transformer stack
-        return self.vlm.model
+    def _inner_model(self):
+        """
+        Returns the Qwen3_5Model (contains .visual and .language_model).
+
+        Hierarchy: self.vlm (PeftModel) → .model (Qwen3_5ForConditionalGeneration)
+                   → .model (Qwen3_5Model)
+
+        Calling _inner_model(inputs_embeds=...) routes through .language_model
+        which has LoRA layers physically injected by PEFT.
+        """
+        return self.vlm.model.model
 
     @property
     def _embed_tokens(self):
-        return self._base_transformer.embed_tokens
+        """Returns the token embedding layer."""
+        return self._inner_model.language_model.embed_tokens
 
     def _build_input_embeds(
         self,
-        input_ids: torch.Tensor,           # [batch, seq]
-        pixel_values: Optional[torch.Tensor],   # [total_patches, C, H, W]
+        input_ids: torch.Tensor,                # [batch, seq]
+        pixel_values: Optional[torch.Tensor],    # preprocessed image tensor
         image_grid_thw: Optional[torch.Tensor],
     ) -> torch.Tensor:
         """
         Convert input_ids → embeddings, replacing <image_pad> positions
-        with visual encoder output (same logic as Qwen2.5-VL's own forward).
+        with visual encoder output (same logic as Qwen3.5's own forward).
 
         Returns: inputs_embeds [batch, seq, d]
         """
@@ -159,7 +203,7 @@ class LatentStudent(nn.Module):
         if pixel_values is not None:
             # Visual encoder is frozen; run in no_grad to save memory
             with torch.no_grad():
-                image_embeds = self.vlm.visual(
+                image_embeds = self._inner_model.visual(
                     pixel_values, grid_thw=image_grid_thw
                 )  # [total_visual_tokens, d]
 
@@ -169,46 +213,22 @@ class LatentStudent(nn.Module):
 
         return inputs_embeds  # [batch, seq, d]
 
-    # -----------------------------------------------------------------------
-    # Core: prefix encoding
-    # -----------------------------------------------------------------------
-
-    def encode_prefix(
+    def _forward_inner(
         self,
-        input_ids: torch.Tensor,
-        pixel_values: Optional[torch.Tensor],
-        image_grid_thw: Optional[torch.Tensor],
-        attention_mask: torch.Tensor,
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        inputs_embeds: torch.Tensor,
+        output_hidden_states: bool = False,
+    ):
         """
-        Full forward pass over the visual+instruction prefix.
-        Stores KV cache for efficient continuation in the latent loop.
+        Run inputs_embeds through the inner model (Qwen3_5Model).
+        This routes to the language_model (Qwen3_5TextModel) internally.
 
-        Returns
-        -------
-        prefix_last_hidden : [batch, d]
-            Hidden state of the last prefix token.
-            This is the seed embedding fed into latent step 1.
-        past_key_values : tuple
-            KV cache covering all prefix positions.
+        Matches the notebook pattern: model.model(inputs_embeds=..., ...)
         """
-        inputs_embeds = self._build_input_embeds(
-            input_ids, pixel_values, image_grid_thw
-        )
-
-        outputs = self._base_transformer(
+        return self._inner_model(
             inputs_embeds=inputs_embeds,
-            attention_mask=attention_mask,
-            use_cache=True,
-            output_hidden_states=False,
+            output_hidden_states=output_hidden_states,
             return_dict=True,
         )
-
-        # Last token hidden state is the seed for the latent loop
-        prefix_last_hidden = outputs.last_hidden_state[:, -1, :]  # [batch, d]
-        past_key_values = outputs.past_key_values
-
-        return prefix_last_hidden, past_key_values
 
     # -----------------------------------------------------------------------
     # Core: latent + spatial generation
@@ -219,19 +239,22 @@ class LatentStudent(nn.Module):
         input_ids: torch.Tensor,
         pixel_values: Optional[torch.Tensor],
         image_grid_thw: Optional[torch.Tensor],
-        attention_mask: torch.Tensor,
     ) -> Tuple[List[torch.Tensor], torch.Tensor, torch.Tensor]:
         """
         Autoregressive latent generation followed by parallel spatial decoding.
 
+        Uses concat-based sequence growth (NOT KV cache) because Qwen3.5's
+        Gated DeltaNet layers use recurrent state instead of KV cache.
+        This matches the validated notebook pattern.
+
         Loop logic
         ----------
-        Seed  : last prefix hidden state h_{prefix} → input to step 1
-        Step m: transformer(current_embed) → h_m = z_m  ← this IS the latent
-                z_m fed directly as input_embed to step m+1 (NO vocab lookup)
-        Total : M=6 continuous latent vectors z_1 … z_M
-
-        Then  : K=5 spatial tokens processed in one parallel step → MLP → waypoints
+        1. Build prefix embeddings (with visual tokens injected)
+        2. For m = 1..M:
+             forward(full_sequence) → z_m = last_hidden_state[:, -1, :]
+             concat z_m to sequence
+        3. Concat K spatial token embeddings
+        4. forward(full_sequence) → spatial hidden states → MLP → waypoints
 
         Returns
         -------
@@ -239,80 +262,45 @@ class LatentStudent(nn.Module):
         spatial_hidden: [batch, K, d]
         waypoints     : [batch, K, 2]  (values in [0,1])
         """
-        batch_size = input_ids.shape[0]
-        prefix_len  = input_ids.shape[1]
-        device      = input_ids.device
+        device = input_ids.device
 
-        # ---- Encode prefix ------------------------------------------------
-        seed_hidden, past_kv = self.encode_prefix(
-            input_ids, pixel_values, image_grid_thw, attention_mask
-        )
-
-        # Attention mask starts at prefix length; we'll extend it each step
-        # Shape: [batch, prefix_len]
-        current_attn = attention_mask
-
-        # The seed is the last prefix hidden state.
-        # It becomes the input_embed for the FIRST latent step.
-        current_embed = seed_hidden.unsqueeze(1)  # [batch, 1, d]
+        # ---- Build prefix embeddings (with visual token injection) --------
+        current_embeds = self._build_input_embeds(
+            input_ids, pixel_values, image_grid_thw
+        )  # [batch, prefix_len, d]
 
         # ---- Autoregressive latent loop -----------------------------------
+        # Concat-based: each step feeds the full growing sequence
         latents: List[torch.Tensor] = []
 
         for _ in range(self.M):
-            # Extend attention mask by one position for this latent token
-            new_col = torch.ones(
-                batch_size, 1, device=device, dtype=current_attn.dtype
-            )
-            current_attn = torch.cat([current_attn, new_col], dim=1)
-            # current_attn shape: [batch, prefix_len + step_index]
+            outputs = self._forward_inner(current_embeds)
+            # z_m = final-position hidden state
+            z_m = outputs.last_hidden_state[:, -1:, :]  # [batch, 1, d]
+            latents.append(z_m.squeeze(1))               # [batch, d]
 
-            # Single-step transformer forward (KV cache covers all prior positions)
-            step_out = self._base_transformer(
-                inputs_embeds=current_embed,    # [batch, 1, d]
-                attention_mask=current_attn,
-                past_key_values=past_kv,
-                use_cache=True,
-                output_hidden_states=False,
-                return_dict=True,
-            )
-
-            # z_m = final-layer hidden state at this position
-            z_m = step_out.last_hidden_state[:, 0, :]  # [batch, d]
-            past_kv = step_out.past_key_values
-
-            latents.append(z_m)
-
-            # Feed z_m directly as next input embedding — bypasses vocabulary
-            current_embed = z_m.unsqueeze(1)  # [batch, 1, d]
+            # Grow the sequence by concatenating z_m
+            current_embeds = torch.cat([current_embeds, z_m], dim=1)
 
         # ---- Spatial tokens (parallel) ------------------------------------
+        batch_size = input_ids.shape[0]
         # Expand [K, d] → [batch, K, d]
         spatial_embeds = (
             self.spatial_tokens
             .unsqueeze(0)
             .expand(batch_size, -1, -1)
-            .to(dtype=current_embed.dtype, device=device)
+            .to(dtype=current_embeds.dtype, device=device)
         )
 
-        # Extend attention mask for K spatial positions at once
-        spatial_attn = torch.ones(
-            batch_size, self.K, device=device, dtype=current_attn.dtype
-        )
-        current_attn = torch.cat([current_attn, spatial_attn], dim=1)
+        # Concat spatial tokens to the full sequence
+        full_embeds = torch.cat([current_embeds, spatial_embeds], dim=1)
 
-        # One parallel forward pass over all K spatial tokens
-        spatial_out = self._base_transformer(
-            inputs_embeds=spatial_embeds,   # [batch, K, d]
-            attention_mask=current_attn,
-            past_key_values=past_kv,
-            use_cache=False,
-            output_hidden_states=False,
-            return_dict=True,
-        )
+        # One forward pass over the entire sequence including spatial tokens
+        spatial_out = self._forward_inner(full_embeds)
 
-        spatial_hidden = spatial_out.last_hidden_state  # [batch, K, d]
-        waypoints = self.spatial_mlp(spatial_hidden)    # [batch, K, 2]
+        # Extract spatial token hidden states (last K positions)
+        spatial_hidden = spatial_out.last_hidden_state[:, -self.K:, :]  # [batch, K, d]
+        waypoints = self.spatial_mlp(spatial_hidden)                     # [batch, K, 2]
 
         return latents, spatial_hidden, waypoints
 
@@ -325,7 +313,6 @@ class LatentStudent(nn.Module):
         input_ids: torch.Tensor,
         pixel_values: Optional[torch.Tensor],
         image_grid_thw: Optional[torch.Tensor],
-        attention_mask: torch.Tensor,
         answer_token_positions: torch.Tensor,   # [batch] — int64 token indices
     ) -> torch.Tensor:
         """
@@ -343,18 +330,12 @@ class LatentStudent(nn.Module):
             input_ids, pixel_values, image_grid_thw
         )
 
-        outputs = self._base_transformer(
-            inputs_embeds=inputs_embeds,
-            attention_mask=attention_mask,
-            use_cache=False,
-            output_hidden_states=False,
-            return_dict=True,
-        )
+        outputs = self._forward_inner(inputs_embeds)
 
         h_all = outputs.last_hidden_state  # [batch, seq, d]
 
         # Index per-sample answer position
-        batch_idx = torch.arange(batch_size := h_all.shape[0], device=h_all.device)
+        batch_idx = torch.arange(h_all.shape[0], device=h_all.device)
         h_answer = h_all[batch_idx, answer_token_positions]  # [batch, d]
 
         return h_answer
@@ -368,11 +349,10 @@ class LatentStudent(nn.Module):
         input_ids: torch.Tensor,
         pixel_values: Optional[torch.Tensor],
         image_grid_thw: Optional[torch.Tensor],
-        attention_mask: torch.Tensor,
     ) -> torch.Tensor:
         """
         Forward pass with output_hidden_states=True.
-        Extracts hidden states at layer L/2 (layer 14 for the 28-layer 4B model)
+        Extracts hidden states at layer L/2 (layer 16 for the 32-layer 4B model)
         at visual token positions only.
 
         This is the x_V used in:
@@ -386,13 +366,7 @@ class LatentStudent(nn.Module):
             input_ids, pixel_values, image_grid_thw
         )
 
-        outputs = self._base_transformer(
-            inputs_embeds=inputs_embeds,
-            attention_mask=attention_mask,
-            use_cache=False,
-            output_hidden_states=True,  # Need all layers to index L/2
-            return_dict=True,
-        )
+        outputs = self._forward_inner(inputs_embeds, output_hidden_states=True)
 
         # hidden_states is a tuple of length (num_layers + 1):
         #   index 0  = embedding layer output
