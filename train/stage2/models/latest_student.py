@@ -91,10 +91,6 @@ class LatentStudent(nn.Module):
             attn_implementation="flash_attention_2",
         )
 
-        # Freeze vision encoder — only language layers train
-        for param in base.visual.parameters():
-            param.requires_grad = False
-
         # ------------------------------------------------------------------
         # 2. Wrap with LoRA (language transformer layers only)
         # ------------------------------------------------------------------
