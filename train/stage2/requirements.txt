@@ -1,18 +1,16 @@
-# ThinkFlow-VLA Stage 2 — Teacher-Student Distillation
-# Tested on: RTX 5090 (24GB), CUDA 12.4, Python 3.11
+# ThinkFlow-VLA Stage 2 — Qwen3.5 + VGGT
+# Tested on: RTX Pro 6000 (48GB) / RTX 5090 (32GB), CUDA 12.4, Python 3.11
 
-# Core
-torch>=2.4.0
-torchvision>=0.19.0
-transformers>=4.51.0
+# Core — bleeding-edge required for Qwen3.5 qwen3_5 architecture
+git+https://github.com/huggingface/transformers.git@main
 peft>=0.14.0
 accelerate>=0.34.0
 
-# Flash Attention (compile from source for Blackwell/Ada on Vast.ai)
+# Flash Attention (compile from source for Blackwell/Ada)
 # pip install flash-attn --no-build-isolation
 flash-attn>=2.6.0
 
-# Safetensors (checkpoint I/O)
+# Safetensors
 safetensors>=0.4.3
 
 # Format reward
@@ -25,5 +23,12 @@ lerobot>=0.1.0
 # Numerical
 numpy>=1.26.0
 
-# Logging (optional but recommended)
+# VGGT — installed separately via install_vggt.sh (git-based, not pip)
+# DO NOT add facebook/vggt here; use the shell script instead.
+
+# Logging
 wandb>=0.17.0
+
+# Pillow + torchvision (needed by Qwen3.5 vision processing)
+Pillow>=10.0.0
+torchvision>=0.19.0
