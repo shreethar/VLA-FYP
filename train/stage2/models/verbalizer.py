@@ -25,8 +25,10 @@ Model hierarchy (after PEFT wrapping):
   self.lm.model.model                  → Qwen3_5TextModel (.embed_tokens, .layers, .norm)
   self.lm.model.lm_head                → Linear
 
-Because DeltaNet layers use recurrent state (not KV cache), the manual
-layer-by-layer forward does NOT use KV caching.
+CA injection uses forward hooks on each decoder layer rather than manual
+layer-by-layer forward.  This avoids replicating the complex mask/position
+logic (4D position_ids, separate masks for linear_attention vs full_attention
+layers, rotary embeddings) that Qwen3.5's TextModel.forward() handles internally.
 
 Training schedule (controlled externally by train_stage2.py):
   Steps 0 – 3000  : warm-up  — CA blocks + LoRA trainable, LM loss on τ+
@@ -120,6 +122,17 @@ class Verbalizer(nn.Module):
     """
     Qwen3.5-0.8B with per-layer cross-attention blocks conditioned on Student latents.
 
+    CA injection uses forward hooks on each decoder layer.  This avoids
+    replicating the complex internal logic of Qwen3.5's TextModel.forward()
+    (4D position_ids, create_causal_mask, separate masks for linear_attention
+    vs full_attention layers, rotary embeddings, etc.).
+
+    Hook mechanism:
+        After each decoder_layer returns hidden_states, a registered
+        post-forward hook applies the corresponding CrossAttentionBlock.
+        The hooks read latents from self._current_latents (set before each
+        forward call).
+
     Parameters
     ----------
     model_name     : HuggingFace repo ID for the 0.8B base model
@@ -189,8 +202,50 @@ class Verbalizer(nn.Module):
             for _ in range(self.num_layers)
         ])
 
+        # ------------------------------------------------------------------
+        # 4. Register forward hooks on each decoder layer
+        # ------------------------------------------------------------------
+        # _current_latents is set before each forward call and read by hooks
+        self._current_latents: Optional[torch.Tensor] = None
+        self._hooks: List = []
+        self._register_ca_hooks()
+
         # Freeze tracking
         self._frozen: bool = False
+
+    def _register_ca_hooks(self):
+        """
+        Register a post-forward hook on each decoder layer that applies
+        the corresponding CrossAttentionBlock.
+
+        The hook reads latents from self._current_latents, which must be
+        set before calling the model's forward.
+        """
+        transformer = self._transformer
+
+        for layer_idx, layer in enumerate(transformer.layers):
+            ca_block = self.ca_blocks[layer_idx]
+
+            def make_hook(ca_blk, idx):
+                def hook_fn(module, args, output):
+                    # Decoder layers return hidden_states directly (not a tuple)
+                    # in newer transformers versions
+                    if isinstance(output, tuple):
+                        hidden = output[0]
+                    else:
+                        hidden = output
+
+                    if self._current_latents is not None:
+                        hidden = ca_blk(hidden, self._current_latents)
+
+                    if isinstance(output, tuple):
+                        return (hidden,) + output[1:]
+                    else:
+                        return hidden
+                return hook_fn
+
+            handle = layer.register_forward_hook(make_hook(ca_block, layer_idx))
+            self._hooks.append(handle)
 
     # -----------------------------------------------------------------------
     # Internal: access helpers for the Qwen3.5 model hierarchy
@@ -213,7 +268,7 @@ class Verbalizer(nn.Module):
         return self.lm.model.lm_head
 
     # -----------------------------------------------------------------------
-    # Internal: manual layer-by-layer forward with CA injection
+    # Forward with latent injection
     # -----------------------------------------------------------------------
 
     def _forward_with_latents(
@@ -224,65 +279,41 @@ class Verbalizer(nn.Module):
         labels: Optional[torch.Tensor] = None,  # [batch, seq] for LM loss
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
         """
-        Manual transformer forward that injects CA after every layer.
+        Forward pass with CA injection via hooks.
 
-        Because Qwen3.5 uses a hybrid architecture (Gated DeltaNet + standard
-        Attention), we iterate through the layers and handle both types.
-        Neither type uses KV caching in this forward path.
+        The hooks read from self._current_latents which is set here before
+        calling the model and cleared after.  This lets the model's own
+        forward() handle all the complex mask/position/rotary logic while
+        we inject CA at each layer boundary.
 
         Returns
         -------
         logits : [batch, seq, vocab_size]
         loss   : scalar CE loss if labels provided, else None
         """
-        transformer = self._transformer
+        # Set latents for hooks to read
+        self._current_latents = latents
 
-        # --- Embedding layer ---
-        hidden = transformer.embed_tokens(input_ids)  # [batch, seq, d_verb]
-
-        # --- Build causal mask and position IDs ---
-        batch_size, seq_len = input_ids.shape
-        device = input_ids.device
-
-        position_ids = torch.arange(
-            seq_len, device=device
-        ).unsqueeze(0).expand(batch_size, -1)
-
-        cache_position = torch.arange(seq_len, device=device)
-
-        # Build the 4D causal mask the layers expect
-        causal_mask = transformer._update_causal_mask(
-            attention_mask,
-            hidden,
-            cache_position,
-            past_key_values=None,
-            output_attentions=False,
-        )
-
-        # --- Layer-by-layer forward with CA injection ---
-        for layer_idx, layer in enumerate(transformer.layers):
-            # Standard transformer layer (DeltaNet or Attention + FFN)
-            # Both layer types accept the same interface
-            layer_out = layer(
-                hidden,
-                attention_mask=causal_mask,
-                position_ids=position_ids,
-                past_key_value=None,
-                output_attentions=False,
+        try:
+            # Use the model's native forward — this handles:
+            #   - 4D position_ids computation
+            #   - create_causal_mask for full_attention layers
+            #   - _update_linear_attn_mask for linear_attention layers
+            #   - rotary embeddings
+            #   - layer iteration with correct mask selection
+            # The registered hooks inject CA after each layer
+            outputs = self._transformer(
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                output_hidden_states=False,
                 use_cache=False,
-                cache_position=cache_position,
             )
-            hidden = layer_out[0]  # [batch, seq, d_verb]
+        finally:
+            # Clear latents reference to avoid holding memory
+            self._current_latents = None
 
-            # Cross-attention: read Student latents
-            # Gradient flows through latents back to Student when not detached
-            hidden = self.ca_blocks[layer_idx](hidden, latents)
-
-        # --- Final norm ---
-        hidden = transformer.norm(hidden)  # [batch, seq, d_verb]
-
-        # --- LM head ---
-        logits = self._lm_head(hidden)  # [batch, seq, vocab_size]
+        hidden = outputs.last_hidden_state  # [batch, seq, d_verb]
+        logits = self._lm_head(hidden)      # [batch, seq, vocab_size]
 
         # --- Optional LM loss ---
         loss = None
