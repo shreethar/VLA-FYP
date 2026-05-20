@@ -1,0 +1,15 @@
+out_proj
+in_proj_qkv
+in_proj_z
+in_proj_b
+in_proj_a
+
+q_proj
+k_proj
+v_proj
+o_proj
+
+# Do not include for now
+gate_proj
+down_proj
+up_proj
