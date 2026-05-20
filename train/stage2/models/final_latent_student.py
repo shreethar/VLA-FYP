@@ -145,7 +145,7 @@ class LatentStudent(nn.Module):
 
     def __init__(
         self,
-        model_name: str = "Qwen/Qwen3.5-4B",
+        model_name: str = "unsloth/Qwen3.5-4B",
         M: int = 6,
         K: int = 5,
         lora_rank: int = 64,
@@ -173,7 +173,7 @@ class LatentStudent(nn.Module):
         # ------------------------------------------------------------------
         base = AutoModelForImageTextToText.from_pretrained(
             model_name,
-            torch_dtype=torch.bfloat16,
+            dtype=torch.bfloat16,
             attn_implementation="flash_attention_2",
             device_map="cuda",
             trust_remote_code=True,
@@ -203,7 +203,7 @@ class LatentStudent(nn.Module):
         #    Fall back to known 4B defaults if the attribute is missing
         #    (e.g. when running with mocked config in tests).
         # ------------------------------------------------------------------
-        text_cfg = getattr(self.vlm.model.config, "text_config", self.vlm.model.config)
+        text_cfg = getattr(self.vlm.model.model.config, "text_config", self.vlm.model.model.config)
 
         self.hidden_dim: int    = getattr(text_cfg, "hidden_size",       QWEN35_4B_HIDDEN_DIM)
         self.num_layers: int    = getattr(text_cfg, "num_hidden_layers",  QWEN35_4B_NUM_LAYERS)
@@ -211,7 +211,7 @@ class LatentStudent(nn.Module):
 
         # Image/visual token id — used to locate visual token positions in x_V
         self._image_token_id: Optional[int] = getattr(
-            self.vlm.model.config, "image_token_id", None
+            self.vlm.model.model.config, "image_token_id", None
         )
 
         # ------------------------------------------------------------------
@@ -240,17 +240,17 @@ class LatentStudent(nn.Module):
         The transformer stack inside the Qwen3.5 model.
         vlm.model.language_model contains embed_tokens and layers.
         """
-        return self.vlm.model.language_model
+        return self.vlm.model.model.language_model
 
     @property
     def _embed_tokens(self) -> nn.Embedding:
         """Token embedding table for building input embeddings."""
-        return self._language_model.embed_tokens
+        return self._language_model.model.embed_tokens
 
     @property
     def _visual_encoder(self) -> nn.Module:
         """Vision encoder — trains via LoRA (NOT frozen for Student)."""
-        return self.vlm.model.visual
+        return self.vlm.model.model.visual
 
     # -----------------------------------------------------------------------
     # Input embedding construction

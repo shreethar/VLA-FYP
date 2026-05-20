@@ -37,3 +37,6 @@ data/wandb/
 
 # Zip
 train/stage2_gemini.zip
+
+# Wheels
+*.whl
