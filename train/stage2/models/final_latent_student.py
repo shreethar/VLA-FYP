@@ -245,7 +245,7 @@ class LatentStudent(nn.Module):
     @property
     def _embed_tokens(self) -> nn.Embedding:
         """Token embedding table for building input embeddings."""
-        return self._language_model.model.embed_tokens
+        return self._language_model.embed_tokens
 
     @property
     def _visual_encoder(self) -> nn.Module:
