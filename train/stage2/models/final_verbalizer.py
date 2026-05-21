@@ -106,6 +106,8 @@ class CrossAttentionBlock(nn.Module):
         self.q_norm   = nn.LayerNorm(query_dim, eps=1e-6)
         self.out_norm = nn.LayerNorm(query_dim, eps=1e-6)
 
+        self.gate = nn.Parameter(torch.tensor(-5.0))
+
     def forward(
         self,
         hidden: torch.Tensor,    # [batch, seq, d_verb]
@@ -115,7 +117,11 @@ class CrossAttentionBlock(nn.Module):
         v = self.v_proj(latents)                  # [batch, M, d_verb]
         q = self.q_norm(hidden)                   # [batch, seq, d_verb]
         ca_out, _ = self.attn(q, k, v)            # [batch, seq, d_verb]
-        return self.out_norm(hidden + ca_out)      # residual + post-norm
+        # return self.out_norm(hidden + ca_out)      # residual + post-norm
+        return hidden  + torch.sigmoid(self.gate) * self.out_norm(ca_out)   # residual + learned gate * CA + post-norm
+        # --> if gate = 0, output becomes hidden (base model's raw state). if i keep our_norm outside, i'd get out_norm(hidden)
+        # which instroduces a subtl normalization shift at step 0. the gated form preserves the base distribution perfectly
+        
 
 
 # ---------------------------------------------------------------------------
@@ -198,6 +204,7 @@ class Verbalizer(nn.Module):
             CrossAttentionBlock(self.hidden_dim, student_hidden, ca_num_heads, ca_dropout)
             for _ in range(self.num_layers)
         ])
+        self.ca_blocks.to(self.lm.device)
         self.ca_blocks.to(torch.bfloat16)
 
         # ------------------------------------------------------------------
@@ -490,6 +497,8 @@ class Verbalizer(nn.Module):
         Re-enables CA blocks and LoRA weights for gradient flow.
         Used when resuming from a warm-up checkpoint.
         """
+        if not self._frozen:
+            return
         for p in self.ca_blocks.parameters():
             p.requires_grad = True
         for n, p in self.lm.named_parameters():
