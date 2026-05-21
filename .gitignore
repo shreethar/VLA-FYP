@@ -40,3 +40,6 @@ train/stage2_gemini.zip
 
 # Wheels
 *.whl
+
+# Libraries
+vggt/

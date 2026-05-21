@@ -28,7 +28,7 @@ import torch.nn.functional as F
 from dataclasses import dataclass, field
 from typing import List, Optional, Tuple, Protocol
 
-from transformers import AutoModelForCausalLM, GenerationConfig
+from transformers import AutoModelForImageTextToText, GenerationConfig
 from peft import LoraConfig, TaskType, get_peft_model, get_peft_model_state_dict
 
 
@@ -97,7 +97,7 @@ class RolloutBuffer:
 
 class GRPOTeacher(nn.Module):
     """
-    Textual Teacher (F_θT): Qwen2.5-VL-4B with LoRA.
+    Textual Teacher (F_θT): Qwen3.5-4B with LoRA.
     Identical base architecture to the Latent Student; diverges through training.
 
     Parameters
@@ -113,7 +113,7 @@ class GRPOTeacher(nn.Module):
 
     def __init__(
         self,
-        model_name: str = "Qwen/Qwen3.5-4B",
+        pretrained_model_name_or_path: str = "unsloth/Qwen3.5-4B",
         G: int = 5,
         answer_token_id: int = -1,          # set after tokenizer extension
         lora_rank: int = 64,
@@ -133,16 +133,16 @@ class GRPOTeacher(nn.Module):
         # ------------------------------------------------------------------
         # 1. Base VLM
         # ------------------------------------------------------------------
-        base = AutoModelForCausalLM.from_pretrained(
-            model_name,
-            torch_dtype=torch.bfloat16,
+        base = AutoModelForImageTextToText.from_pretrained(
+            pretrained_model_name_or_path,
+            dtype=torch.bfloat16,
             attn_implementation="flash_attention_2",
             trust_remote_code=True,
         )
 
         # Freeze vision encoder (if present)
-        if hasattr(base, "visual"):
-            for param in base.visual.parameters():
+        if hasattr(base.model, "visual"):
+            for param in base.model.visual.parameters():
                 param.requires_grad = False
 
         # ------------------------------------------------------------------
@@ -160,7 +160,7 @@ class GRPOTeacher(nn.Module):
             bias="none",
         )
         self.vlm = get_peft_model(base, lora_cfg)
-        self.hidden_dim: int = self.vlm.config.hidden_size   # 2048
+        self.hidden_dim: int = self.vlm.config.text_config.hidden_size   # 2048
 
         # ------------------------------------------------------------------
         # 3. Optional frozen reference snapshot for KL penalty
@@ -193,10 +193,10 @@ class GRPOTeacher(nn.Module):
         image_grid_thw: Optional[torch.Tensor],
     ) -> torch.Tensor:
         """Embed tokens and splice in visual encoder features."""
-        embeds = self.vlm.model.embed_tokens(input_ids)
+        embeds = self.vlm.model.model.language_model.embed_tokens(input_ids)
         if pixel_values is not None:
             with torch.no_grad():
-                img_feats = (self.vlm.visual(pixel_values, grid_thw=image_grid_thw) if image_grid_thw is not None else self.vlm.visual(pixel_values))
+                img_feats = (self.vlm.model.model.visual(pixel_values, grid_thw=image_grid_thw) if image_grid_thw is not None else self.vlm.model.model.visual(pixel_values))
             mask = (input_ids == self.vlm.config.image_token_id)
             embeds = embeds.clone()
             embeds[mask] = img_feats.to(embeds.dtype)
