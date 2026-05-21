@@ -230,6 +230,9 @@ class LatentStudent(nn.Module):
         # ------------------------------------------------------------------
         self.spatial_mlp = SpatialMLP(self.hidden_dim)
 
+        self.spatial_tokens.data = self.spatial_tokens.data.to(torch.bfloat16)
+        self.spatial_mlp.to(torch.bfloat16)
+
     # -----------------------------------------------------------------------
     # Internal property shortcuts
     # -----------------------------------------------------------------------
