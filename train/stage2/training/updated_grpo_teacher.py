@@ -384,7 +384,7 @@ class GRPOTeacher(nn.Module):
         std  = rewards.std(dim=0, keepdim=True)    # [1, batch]
 
         # Warning for near-zero variance
-        low_var_mask = stf.squeeze(0) < (eps * 10)
+        low_var_mask = std.squeeze(0) < (eps * 10)
         if low_var_mask.any():
             n = low_var_mask.sum().item()
             warnings.warn(
@@ -457,9 +457,17 @@ class GRPOTeacher(nn.Module):
         resp_lens = resp_mask.sum(dim=-1).clamp(min=1)      # [G*B]
 
         # ── Step C: ONE forward pass ──────────────────────────────────────
+
+        if pixel_values is not None:
+            pv_flat = pixel_values.repeat_interleave(G, dim=0)
+            thw_flat = image_grid_thw.repeat_interleave(G, dim=0) if image_grid_thw is not None else None
+        else:
+            pv_flat, thw_flat = None, None
+            
         inputs_embeds = self._build_input_embeds(
-            flat_ids, pixel_values, image_grid_thw
+            flat_ids, pv_flat, thw_flat
         )
+        
         out = self.vlm(
             inputs_embeds=inputs_embeds,
             attention_mask=flat_masks,
@@ -601,15 +609,15 @@ class GRPOTeacher(nn.Module):
             tau_pos_ids, pixel_values, image_grid_thw
         )
 
-        out = self.vlm.model(
+        out = self.vlm(
             inputs_embeds=inputs_embeds,
             attention_mask=tau_pos_mask,
             use_cache=False,
-            output_hidden_states=False,
+            output_hidden_states=True,
             return_dict=True,
         )
 
-        h_all = out.last_hidden_state   # [batch, seq, d]
+        h_all = out.hidden_states[-1]   # [batch, seq, d]
         batch  = h_all.shape[0]
 
         h_T = h_all[
