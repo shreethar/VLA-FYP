@@ -31,6 +31,7 @@ from typing import List, Optional, Tuple, Protocol
 from transformers import AutoModelForImageTextToText, GenerationConfig
 from peft import LoraConfig, TaskType, get_peft_model, get_peft_model_state_dict
 
+import warnings
 
 # ---------------------------------------------------------------------------
 # Reward function interface  (concrete implementations in rewards/)
@@ -89,6 +90,7 @@ class RolloutBuffer:
 
     # Teacher's <answer> hidden state from the post-update forward pass
     h_T: Optional[torch.Tensor] = None   # [batch, d_teacher]; filled after update
+    grpo_loss: Optional[float] = None    # for logging
 
 
 # ---------------------------------------------------------------------------
@@ -122,6 +124,7 @@ class GRPOTeacher(nn.Module):
         gen_temperature: float = 0.9,
         gen_max_new_tokens: int = 512,
         kl_coef: float = 0.0,
+        use_gradient_checkpointing: bool = True,
     ):
         super().__init__()
         self.G = G
@@ -156,8 +159,7 @@ class GRPOTeacher(nn.Module):
             target_modules=[
                 "q_proj", "k_proj", "v_proj", "o_proj",
                 "gate_proj", "up_proj", "down_proj",
-                "out_proj", "in_proj_qkv", "in_proj_z", "in_proj_b", "in_proj_a"
-            ],
+                "out_proj", "in_proj_qkv", "in_proj_z", "in_proj_b", "in_proj_a"],
             bias="none",
         )
         self.vlm = get_peft_model(base, lora_cfg)
@@ -168,6 +170,12 @@ class GRPOTeacher(nn.Module):
         #    Created lazily on first call when kl_coef > 0
         # ------------------------------------------------------------------
         self._ref_model: Optional[nn.Module] = None
+
+        if use_gradient_checkpointing:
+            self.vlm.gradient_checkpointing_enable(
+                gradient_checkpointing_kwargs={"use_reentrant": False}
+            )
+            self.vlm.config.use_cache = False
 
     # -----------------------------------------------------------------------
     # Reference model for KL (lazy init, frozen copy of initial Teacher)
@@ -374,6 +382,18 @@ class GRPOTeacher(nn.Module):
         # Compute mean and std over the G dimension for each batch item
         mean = rewards.mean(dim=0, keepdim=True)   # [1, batch]
         std  = rewards.std(dim=0, keepdim=True)    # [1, batch]
+
+        # Warning for near-zero variance
+        low_var_mask = stf.squeeze(0) < (eps * 10)
+        if low_var_mask.any():
+            n = low_var_mask.sum().item()
+            warnings.warn(
+                f"{n}/{low_var_mask.shape[0]} batch items have near-zero reward "
+                f"variance across G rollouts. Advantages will be ~0 for these items "
+                f"(no learning signal). Consider increasing gen_temperature or "
+                f"checking your reward function.",
+                stacklevel=2,
+            )
         return (rewards - mean) / (std + eps)      # [G, batch]
 
     # -----------------------------------------------------------------------
@@ -382,8 +402,8 @@ class GRPOTeacher(nn.Module):
 
     def compute_grpo_loss(
         self,
-        all_ids: List[torch.Tensor],
-        all_masks: List[torch.Tensor],
+        all_ids: List[torch.Tensor],        # List[G], each [batch, seq_g]
+        all_masks: List[torch.Tensor],      # List[G], each [batch, seq_g]
         advantages: torch.Tensor,           # [G, batch]
         pixel_values: Optional[torch.Tensor],
         image_grid_thw: Optional[torch.Tensor],
@@ -408,70 +428,89 @@ class GRPOTeacher(nn.Module):
             self._ensure_ref_model()
 
         G     = len(all_ids)
+        B     = all_ids[0].shape[0]
         device = all_ids[0].device
-        total_loss = torch.tensor(0.0, device=device)
+        # total_loss = torch.tensor(0.0, device=device)
+
+        # Step A: Pad all GxB sequences to the same lenght
+        max_len = max(ids.shape[1] for ids in all_ids)
+
+        padded_ids = torch.zeros(G, B, max_len, dtype=torch.long, device=device)
+        padded_masks = torch.zeros(G, B, max_len, dtype=torch.long, device=device)
 
         for g in range(G):
-            ids      = all_ids[g]         # [batch, seq]
-            attn     = all_masks[g]       # [batch, seq]
-            adv_g    = advantages[g]      # [batch]
+            L = all_ids[g].shape[1]
+            padded_ids[g, :, :L]   = all_ids[g]
+            padded_masks[g, :, :L] = all_masks[g]
 
-            # Build labels: -100 on prompt tokens, real ids on response tokens
-            labels = ids.clone()
-            labels[:, :prompt_len] = -100
+        # Step B: Flatten G and B into one big batch
+        flat_ids   = padded_ids.reshape(G * B, max_len)     # [G*B, seq]
+        flat_masks = padded_masks.reshape(G * B, max_len)   # [G*B, seq]
+        
+        # Build labels: -100 on prompt tokens
+        flat_labels = flat_ids.clone()
+        flat_labels[:, :prompt_len] = -100
 
-            # Pad mask for response positions only
-            response_mask = self._compute_response_mask(ids, prompt_len)
-            response_lens = response_mask.sum(dim=-1).clamp(min=1)  # [batch]
+        # Response mask & lengths
+        resp_mask = torch.zeros_like(flat_ids, dtype=torch.float)
+        resp_mask[:, prompt_len:] = (flat_ids[:, prompt_len:] != 0).float()
+        resp_lens = resp_mask.sum(dim=-1).clamp(min=1)      # [G*B]
 
-            # Forward pass through Teacher
-            inputs_embeds = self._build_input_embeds(
-                ids, pixel_values, image_grid_thw
-            )
-            out = self.vlm.model(
-                inputs_embeds=inputs_embeds,
-                attention_mask=attn,
-                use_cache=False,
-                return_dict=True,
-            )
-            logits = self.vlm.lm_head(out.last_hidden_state)  # [batch, seq, vocab]
+        # ── Step C: ONE forward pass ──────────────────────────────────────
+        inputs_embeds = self._build_input_embeds(
+            flat_ids, pixel_values, image_grid_thw
+        )
+        out = self.vlm(
+            inputs_embeds=inputs_embeds,
+            attention_mask=flat_masks,
+            use_cache=False,
+            return_dict=True,
+        )
+        logits = out.logits                                   # [G*B, seq, vocab]
 
-            # Per-token log-probs
-            log_probs = F.log_softmax(logits[:, :-1, :], dim=-1)  # [batch, seq-1, vocab]
-            target_ids = ids[:, 1:]                                # [batch, seq-1]
-            token_log_p = log_probs.gather(
-                dim=-1, index=target_ids.unsqueeze(-1)
-            ).squeeze(-1)                                          # [batch, seq-1]
+        # Per-token log-probs
+        log_probs  = F.log_softmax(logits[:, :-1, :], dim=-1) # [G*B, seq-1, vocab]
+        target_ids = flat_ids[:, 1:]                           # [G*B, seq-1]
+        token_log_p = log_probs.gather(
+            dim=-1, index=target_ids.unsqueeze(-1)
+        ).squeeze(-1)                                          # [G*B, seq-1]
 
-            # Mask to response tokens and average over response length
-            resp_mask_shifted = response_mask[:, 1:]              # [batch, seq-1]
-            mean_log_p = (token_log_p * resp_mask_shifted).sum(dim=-1) / response_lens
-            # [batch]
+        # Mask to response tokens, average over response length
+        resp_mask_shifted = resp_mask[:, 1:]                   # [G*B, seq-1]
+        mean_log_p = (token_log_p * resp_mask_shifted).sum(dim=-1) / resp_lens
+        # [G*B]
 
-            # Optional KL term per rollout
-            kl_term = torch.zeros_like(mean_log_p)
-            if self.kl_coef > 0:
-                with torch.no_grad():
-                    ref_out = self._ref_model.model(
-                        inputs_embeds=inputs_embeds.detach(),
-                        attention_mask=attn,
-                        use_cache=False,
-                        return_dict=True,
-                    )
-                    ref_logits  = self._ref_model.lm_head(ref_out.last_hidden_state)
-                    ref_log_p   = F.log_softmax(ref_logits[:, :-1, :], dim=-1)
-                    ref_token_p = ref_log_p.gather(
-                        dim=-1, index=target_ids.unsqueeze(-1)
-                    ).squeeze(-1)
-                    kl = (token_log_p - ref_token_p) * resp_mask_shifted
-                    kl_term = kl.sum(dim=-1) / response_lens      # [batch]
+        # Reshape back to [G, B]
+        mean_log_p = mean_log_p.reshape(G, B)
 
-            # GRPO contribution for rollout g
-            rollout_loss = -(adv_g * mean_log_p).mean()
-            kl_loss      = self.kl_coef * kl_term.mean()
-            total_loss   = total_loss + (rollout_loss + kl_loss)
 
-        return total_loss / G   # average over rollouts
+       # ── Step D: GRPO loss (vectorised over G and B) ───────────────────
+        rollout_loss = -(advantages * mean_log_p).mean()       # scalar
+
+        # ── Optional KL (also batched) ────────────────────────────────────
+        kl_loss = torch.tensor(0.0, device=device)
+        if self.kl_coef > 0:
+            self._ref_model.to(device)                          # move to GPU
+            with torch.no_grad(), torch.cuda.amp.autocast(dtype=torch.float16):
+                ref_out = self._ref_model(
+                    inputs_embeds=inputs_embeds.detach(),
+                    attention_mask=flat_masks,
+                    use_cache=False,
+                    return_dict=True,
+                )
+                ref_logits  = ref_out.logits
+                ref_log_p   = F.log_softmax(ref_logits[:, :-1, :], dim=-1)
+                ref_token_p = ref_log_p.gather(
+                    dim=-1, index=target_ids.unsqueeze(-1)
+                ).squeeze(-1)
+                kl = (token_log_p.detach() - ref_token_p) * resp_mask_shifted
+                kl_per_token = kl.sum(dim=-1) / resp_lens      # [G*B]
+                kl_loss = self.kl_coef * kl_per_token.mean()
+
+            self._ref_model.cpu()
+            torch.cuda.empty_cache()
+
+        return rollout_loss + kl_loss
 
     # -----------------------------------------------------------------------
     # Step 5 + 6: Identify τ+/τ- and extract h_T
@@ -612,6 +651,11 @@ class GRPOTeacher(nn.Module):
         -------
         buffer : RolloutBuffer  (h_T is set and ready for L_distill)
         """
+
+        assert self.answer_token_id > 0, (
+            "answer_token_id. Register <ans> as a special token first"
+        )
+
         prompt_len = input_ids.shape[1]
 
         # --- Step 1: Generate G rollouts (no_grad) -------------------------
@@ -674,6 +718,7 @@ class GRPOTeacher(nn.Module):
             tau_neg_response_mask=tau_neg_response,
             answer_token_pos=answer_pos,
             h_T=h_T,
+            grpo_loss=grpo_loss.item(),
         )
 
         return buffer
