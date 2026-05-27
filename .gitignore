@@ -29,6 +29,7 @@ dataset_recovery_guide.md
 # Model output
 data/outputs/
 data/stage1_unsloth/
+model.pt
 
 # Logs
 data/wandb/
@@ -43,3 +44,7 @@ train/stage2_gemini.zip
 
 # Libraries
 vggt/
+Spatial-Forcing/
+
+# Test images
+train/stage2/test/images/
