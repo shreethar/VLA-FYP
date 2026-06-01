@@ -47,23 +47,62 @@ class ProjectionMLP(nn.Module):
     [batch, N, d_student] → [batch, N, d_ext]  (L2-normalised)
     Works on both token-level (N>1) and pooled (N=1) inputs.
     """
-    def __init__(self, in_dim: int, out_dim: int):
+    def __init__(self, llm_dim: int, vggt_dim: int, align_loss_type: str = "cosine", use_vlm_norm: bool = False) -> None:
         super().__init__()
-        mid = (in_dim + out_dim) // 2
-        self.net = nn.Sequential(
-            nn.Linear(in_dim, mid, bias=False),
-            nn.LayerNorm(mid),
-            nn.GELU(),
-            nn.Linear(mid, out_dim, bias=False),
-            nn.LayerNorm(out_dim),
-            nn.GELU(),
-            nn.Linear(out_dim, out_dim, bias=False),
-        )
+        self.llm_dim = llm_dim
+        self.vggt_dim = vggt_dim
+        self.align_loss_type = align_loss_type
+        
+        hidden_dim = (vggt_dim + llm_dim) // 2
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # x: [batch, N, d] or [batch, d]
-        projected = self.net(x)
-        return F.normalize(projected.float(), dim=-1)
+        self.fc1 = nn.Linear(self.llm_dim, hidden_dim, bias=True)
+        self.fc2 = nn.Linear(hidden_dim, self.vggt_dim, bias=True)
+        self.act_fn1 = nn.GELU()
+
+        self.vlm_norm = nn.LayerNorm(self.llm_dim, eps=1e-6) if use_vlm_norm else None
+        self.initialize_weights()
+
+    def initialize_weights(self):
+        def _basic_init(module):
+            if isinstance(module, nn.Linear):
+                torch.nn.init.xavier_uniform(module.weight, std=0.02)
+                if module.bias is not None:
+                    nn.init.constant_(module.bias, 0)
+        self.apply(_basic_init)
+
+    def align_dimension(self, LLM_embedding: torch.Tensor) -> torch.Tensor:
+        if self.vlm_norm is not None:
+            LLM_embedding = self.vlm_norm(LLM_embedding)
+        projected_features = self.fc1(LLM_embedding)
+        projected_features = self.act_fn1(projected_features)
+        projected_features = self.fc2(projected_features)
+        return projected_features
+
+    def compute_align_loss_cosine(self, vision_hidden: torch.Tensor, VGGT_hidden: torch.Tensor):
+        align_loss = 0.0
+        bsz = vision_hidden.shape[0]
+
+        for _vision, _VGGT in zip(vision_hidden, VGGT_hidden):
+            _vision = torch.nn.functional.normalize(_vision, dim=-1)
+            _VGGT = torch.nn.functional.normalize(_VGGT, dim=-1)
+            
+            cosine_sim = (_vision * _VGGT).sum(dim=-1)
+            align_loss += 1.0 - cosine_sim.mean()
+
+        align_loss /= bsz
+        return align_loss
+
+    def forward(self, LLM_emb, target_emb):
+        if self.align_loss_type == "cosine":
+            # Project in bf16 to save VRAM
+            with torch.amp.autocast("cuda", dtype=torch.bfloat16):
+                LLM_emb = self.align_dimension(LLM_emb)
+                
+            # CRITICAL: Cast to fp32 for cosine similarity to avoid underflow/NaNs in bf16
+            align_loss = self.compute_align_loss_cosine(LLM_emb.float(), target_emb.float())
+            return align_loss
+        else:
+            raise NotImplementedError(f"Align loss type {self.align_loss_type} is not implemented.")
 
 
 # ---------------------------------------------------------------------------
@@ -91,31 +130,6 @@ class FrozenExtractor(ABC, nn.Module):
     @torch.no_grad()
     def forward(self, pixel_values: torch.Tensor) -> torch.Tensor:
         return self.extract(pixel_values)
-
-
-# ---------------------------------------------------------------------------
-# DINOv2 (fallback extractor)
-# ---------------------------------------------------------------------------
-
-class DINOv2Extractor(FrozenExtractor):
-    _DIM_MAP = {
-        "facebook/dinov2-large": 1024,
-        "facebook/dinov2-base":  768,
-        "facebook/dinov2-small": 384,
-        "facebook/dinov2-giant": 1536,
-    }
-
-    def __init__(self, checkpoint: str = "facebook/dinov2-large"):
-        super().__init__()
-        from transformers import AutoModel
-        self.model = AutoModel.from_pretrained(checkpoint, torch_dtype=torch.bfloat16)
-        self.output_dim = self._DIM_MAP.get(checkpoint, 1024)
-        self._freeze_all()
-
-    def extract(self, pixel_values: torch.Tensor) -> torch.Tensor:
-        """Returns patch tokens [batch, num_patches, d]  (skips CLS token)."""
-        out = self.model(pixel_values=pixel_values, return_dict=True)
-        return out.last_hidden_state[:, 1:, :]   # [batch, N_patches, d]
 
 
 # ---------------------------------------------------------------------------
