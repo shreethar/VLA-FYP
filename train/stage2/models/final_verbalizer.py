@@ -106,7 +106,7 @@ class CrossAttentionBlock(nn.Module):
         self.q_norm   = nn.LayerNorm(query_dim, eps=1e-6)
         self.out_norm = nn.LayerNorm(query_dim, eps=1e-6)
 
-        self.gate = nn.Parameter(torch.tensor(-5.0))
+        self.gate = nn.Parameter(torch.tensor(-2.0))
 
     def forward(
         self,
