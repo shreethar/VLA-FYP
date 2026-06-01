@@ -38,7 +38,6 @@ from transformers import AutoTokenizer, get_cosine_schedule_with_warmup
 
 from models.latent_student  import LatentStudent
 from models.verbalizer       import Verbalizer
-from models.spatial_forcing  import SpatialForcingLoss
 from training.grpo_teacher   import GRPOTeacher, RolloutBuffer
 from training.student_losses import StudentLossComputer, build_student_loss_computer
 from tokenizer_setup         import load_answer_token_id
@@ -62,11 +61,6 @@ class Stage2Config:
     verbalizer_name:     str  = "Qwen/Qwen3.5-0.8B"
     stage1_ckpt_dir:     str  = "checkpoints/stage1"           # shared Teacher/Student init
     output_dir:          str  = "checkpoints/stage2"
-
-    # Spatial Forcing extractor
-    extractor_type:      str  = "vggt"
-    extractor_ckpt:      str  = "facebook/VGGT-1B"
-    extractor_dim:       int  = 1024                            # VGGT-1B output dim
 
     # Training schedule
     total_steps:         int  = 4500
@@ -100,7 +94,6 @@ class Stage2Config:
     # Loss weights
     lambda_distill:      float = 1.0
     lambda_ans:          float = 1.0
-    lambda_sf:           float = 0.1
 
     # Misc
     seed:                int  = 42
@@ -176,7 +169,6 @@ def save_checkpoint(
     teacher: GRPOTeacher,
     student: LatentStudent,
     verbalizer: Verbalizer,
-    spatial_forcing: SpatialForcingLoss,
     teacher_opt, student_opt, verbalizer_opt,
     teacher_sched, student_sched, verbalizer_sched,
     output_dir: str,
@@ -198,8 +190,6 @@ def save_checkpoint(
             "spatial_mlp":    student.spatial_mlp.state_dict(),
             # Verbalizer CA blocks
             "ca_blocks":      verbalizer.ca_blocks.state_dict(),
-            # Spatial Forcing projection MLP
-            "proj_mlp":       spatial_forcing.proj_mlp.state_dict(),
             # Optimizers
             "teacher_opt":    teacher_opt.state_dict(),
             "student_opt":    student_opt.state_dict(),
@@ -219,7 +209,6 @@ def load_checkpoint(
     teacher: GRPOTeacher,
     student: LatentStudent,
     verbalizer: Verbalizer,
-    spatial_forcing: SpatialForcingLoss,
     teacher_opt, student_opt, verbalizer_opt,
     teacher_sched, student_sched, verbalizer_sched,
     device: torch.device,
@@ -236,7 +225,6 @@ def load_checkpoint(
     student.spatial_tokens.data.copy_(state["spatial_tokens"])
     student.spatial_mlp.load_state_dict(state["spatial_mlp"])
     verbalizer.ca_blocks.load_state_dict(state["ca_blocks"])
-    spatial_forcing.proj_mlp.load_state_dict(state["proj_mlp"])
 
     # Restore optimizer and scheduler states
     teacher_opt.load_state_dict(state["teacher_opt"])
@@ -318,15 +306,6 @@ def train_stage2(
         lora_alpha=cfg.verbalizer_lora_rank * 2,
     ).to(device)
 
-    logger.info("Building Spatial Forcing …")
-    spatial_forcing = SpatialForcingLoss(
-        extractor_type=cfg.extractor_type,
-        extractor_ckpt=cfg.extractor_ckpt,
-        student_dim=student.hidden_dim,
-        extractor_dim=cfg.extractor_dim,
-        lambda_sf=cfg.lambda_sf,
-    ).to(device)
-
     # Load Stage 1 checkpoint into both Teacher and Student
     # (identical init — they diverge from here via their respective objectives)
     if cfg.stage1_ckpt_dir and os.path.isdir(cfg.stage1_ckpt_dir):
@@ -369,7 +348,7 @@ def train_stage2(
     if resume_from and os.path.isdir(resume_from):
         start_step = load_checkpoint(
             resume_from,
-            teacher, student, verbalizer, spatial_forcing,
+            teacher, student, verbalizer,
             teacher_opt, student_opt, verbalizer_opt,
             teacher_sched, student_sched, verbalizer_sched,
             device,
@@ -385,7 +364,6 @@ def train_stage2(
     teacher.train()
     student.train()
     verbalizer.train()
-    spatial_forcing.proj_mlp.train()
 
     # Infinite dataloader iterator
     data_iter = iter(dataloader)
@@ -409,16 +387,7 @@ def train_stage2(
             image_grid_thw = image_grid_thw.to(device)
         attention_mask = batch["attention_mask"].to(device)
         gt_waypoints   = batch["gt_waypoints"].to(device)          # [batch, K, 2]
-        pv_extractor   = batch["pixel_values_extractor"].to(device) # [batch, C, H, W]
         ground_truth   = batch["ground_truth"]                      # dict (stays on CPU)
-
-        # ----------------------------------------------------------------
-        # A. Pre-extract frozen reference features (once per batch)
-        #    Done BEFORE the Student forward to avoid redundant extraction
-        # ----------------------------------------------------------------
-        with torch.no_grad():
-            ref_feats = spatial_forcing.extract_reference_features(pv_extractor)
-        # ref_feats: [batch, d_ext]  unit-norm, fp32
 
         # ----------------------------------------------------------------
         # B. Teacher GRPO step
@@ -451,14 +420,12 @@ def train_stage2(
         loss_out = loss_computer.compute(
             student=student,
             verbalizer=verbalizer,
-            spatial_forcing=spatial_forcing,
             input_ids=input_ids,
             pixel_values=pixel_values,
             image_grid_thw=image_grid_thw,
             attention_mask=attention_mask,
             buffer=buffer,
             gt_waypoints=gt_waypoints,
-            ref_feats=ref_feats,
             global_step=step,
         )
 
@@ -507,7 +474,6 @@ def train_stage2(
                 f"student={loss_out.metrics['loss/student_total']:.4f} | "
                 f"distill={loss_out.metrics['loss/l_distill']:.4f} | "
                 f"ans={loss_out.metrics['loss/l_ans']:.4f} | "
-                f"spatial={loss_out.metrics['loss/l_spatial']:.4f} | "
                 f"reward_mean={teacher_stats['grpo/reward_mean']:.4f} | "
                 f"phase={'warmup' if is_warmup else 'frozen'}"
             )
@@ -535,7 +501,6 @@ def train_stage2(
                 teacher=teacher,
                 student=student,
                 verbalizer=verbalizer,
-                spatial_forcing=spatial_forcing,
                 teacher_opt=teacher_opt,
                 student_opt=student_opt,
                 verbalizer_opt=verbalizer_opt,

@@ -6,14 +6,13 @@ Computes all Student loss terms for ThinkFlow-VLA Stage 2.
 Phase-aware behaviour:
     Warm-up (step < warmup_steps):
         - Verbalizer LM loss on τ+ (latents DETACHED)        → lm_loss
-        - L_distill + L_ans + L_spatial                       → student_total
+        - L_distill + L_ans                                  → student_total
     Frozen Verbalizer (step >= warmup_steps):
-        - L_verb (DPO through frozen Verbalizer) + L_distill + L_ans + L_spatial → student_total
+        - L_verb (DPO through frozen Verbalizer) + L_distill + L_ans → student_total
 
 Loss breakdown:
     L_distill  = MSE(h_S_answer, h_T)               — hidden state alignment
     L_ans      = MSE(pred_waypoints, gt_waypoints)   — physical waypoint grounding
-    L_spatial  = SpatialForcingLoss.compute_loss()   — visual feature alignment
     L_verb     = DPO(τ+, τ−) via frozen Verbalizer   — reasoning alignment (frozen phase only)
     lm_loss    = Verbalizer CE on τ+ (warm-up only)
 
@@ -40,7 +39,6 @@ from typing import Optional
 #   loss_out.metrics['loss/student_total']
 #   loss_out.metrics['loss/l_distill']
 #   loss_out.metrics['loss/l_ans']
-#   loss_out.metrics['loss/l_spatial']
 #   loss_out.metrics.get('loss/lm_loss', 0)
 #   loss_out.metrics.get('loss/l_verb', 0)
 # ---------------------------------------------------------------------------
@@ -167,7 +165,6 @@ class StudentLossComputer(nn.Module):
         # Models (duck-typed — no concrete imports needed)
         student,           # LatentStudent
         verbalizer,        # Verbalizer
-        spatial_forcing,   # SpatialForcingLoss
         # Input batch (prompt only, NOT the full rollout)
         input_ids: torch.Tensor,            # [batch, prompt_len]
         pixel_values,
@@ -177,7 +174,6 @@ class StudentLossComputer(nn.Module):
         buffer,            # RolloutBuffer
         # Spatial supervision
         gt_waypoints: torch.Tensor,         # [batch, K, 2]  normalised [0,1]
-        ref_feats: torch.Tensor,            # [batch, d_ext]  pre-extracted, unit-norm
         # Verbalizer schedule
         global_step: int,
     ) -> LossOutput:
@@ -189,7 +185,6 @@ class StudentLossComputer(nn.Module):
         input_ids       : prompt tokens fed to the Student (vision + instruction)
         buffer          : populated RolloutBuffer from GRPOTeacher.training_step()
         gt_waypoints    : normalised 2D ground-truth waypoints for L_ans
-        ref_feats       : pre-extracted frozen extractor features for L_spatial
         global_step     : used to switch between warm-up and frozen-verbalizer phases
 
         Returns
@@ -220,18 +215,10 @@ class StudentLossComputer(nn.Module):
         )   # [batch, d_student]
 
         # ==================================================================
-        # 3. Mid-layer visual features for L_spatial
-        # ==================================================================
-        x_V = student.get_mid_layer_visual_features(
-            input_ids, pixel_values, image_grid_thw, attention_mask
-        )   # [batch, num_visual_tokens, d_student]
-
-        # ==================================================================
-        # 4. Loss computations — always present
+        # 3. Loss computations — always present
         # ==================================================================
         l_distill = self._compute_l_distill(h_S, buffer.h_T)
         l_ans = self._compute_l_ans(pred_waypoints, gt_waypoints)
-        l_spatial = spatial_forcing.compute_loss(x_V, ref_feats)
 
         # ==================================================================
         # 5. Phase-specific losses
@@ -247,8 +234,8 @@ class StudentLossComputer(nn.Module):
                 labels=self._make_lm_labels(buffer.tau_pos_ids, prompt_len),
             )
 
-            # Student total = L_distill + L_ans + L_spatial (no L_verb)
-            student_total = l_distill + l_ans + l_spatial
+            # Student total = L_distill + L_ans (no L_verb)
+            student_total = l_distill + l_ans
 
         else:
             # -- Frozen phase: DPO through frozen Verbalizer ----------------
@@ -262,8 +249,8 @@ class StudentLossComputer(nn.Module):
                 neg_response_mask=buffer.tau_neg_response_mask,
             )
 
-            # Student total = L_verb + L_distill + L_ans + L_spatial
-            student_total = l_verb + l_distill + l_ans + l_spatial
+            # Student total = L_verb + L_distill + L_ans
+            student_total = l_verb + l_distill + l_ans
 
         # ==================================================================
         # 6. Metrics — always include ALL expected keys (for logging)
@@ -272,7 +259,6 @@ class StudentLossComputer(nn.Module):
             metrics = {
                 "loss/l_distill":       l_distill.item(),
                 "loss/l_ans":           l_ans.item(),
-                "loss/l_spatial":       l_spatial.item(),
                 "loss/student_total":   student_total.item(),
                 "phase/is_warmup":      float(is_warmup),
                 "waypoints/pred_mean":  pred_waypoints.mean().item(),
