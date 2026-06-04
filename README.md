@@ -64,7 +64,14 @@ A general-purpose VLM has limited understanding of robot-specific concepts: end-
 
 ---
 
+> **Stage 1 Checkpoint** — The fine-tuned model is publicly available on HuggingFace:
+> [`shreethar/stage1_unsloth`](https://huggingface.co/shreethar/stage1_unsloth)
+> This checkpoint serves as the shared initialisation point for both the Teacher and Student in Stage 2.
+
+---
+
 ## Stage 2 — GRPO Teacher · Student Distillation 🔄
+
 
 Three models train jointly from the same **Stage 1 checkpoint**:
 
