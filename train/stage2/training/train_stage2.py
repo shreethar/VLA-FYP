@@ -36,6 +36,12 @@ import torch.nn as nn
 from torch.utils.data import DataLoader
 from transformers import AutoTokenizer, get_cosine_schedule_with_warmup
 
+try:
+    import wandb
+    _WANDB_AVAILABLE = True
+except ImportError:
+    _WANDB_AVAILABLE = False
+
 from models.latent_student  import LatentStudent
 from models.verbalizer       import Verbalizer
 from training.grpo_teacher   import GRPOTeacher, RolloutBuffer
@@ -57,8 +63,8 @@ logging.basicConfig(
 @dataclass
 class Stage2Config:
     # Paths
-    base_model_name:     str  = "Qwen/Qwen3.5-4B"
-    verbalizer_name:     str  = "Qwen/Qwen3.5-0.8B"
+    base_model_name:     str  = "shreethar/stage1_unsloth"
+    verbalizer_name:     str  = "unsloth/Qwen3.5-0.8B"
     stage1_ckpt_dir:     str  = "checkpoints/stage1"           # shared Teacher/Student init
     output_dir:          str  = "checkpoints/stage2"
 
@@ -99,6 +105,13 @@ class Stage2Config:
     seed:                int  = 42
     bf16:                bool = True
     grad_log_steps:      int  = 100   # how often to log gradient norms
+
+    # WandB
+    wandb_project:       str  = "reasonflow-vla"
+    wandb_run_name:      str  = "stage2-distillation"
+    wandb_tags:          List[str] = field(default_factory=lambda: ["stage2", "grpo", "distillation"])
+    wandb_log_steps:     int  = 10   # same as log_steps by default
+    use_wandb:           bool = True
 
 
 # ---------------------------------------------------------------------------
@@ -268,6 +281,50 @@ def train_stage2(
     torch.manual_seed(cfg.seed)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     os.makedirs(cfg.output_dir, exist_ok=True)
+
+    # ------------------------------------------------------------------
+    # 0. WandB initialisation
+    # ------------------------------------------------------------------
+    use_wandb = cfg.use_wandb and _WANDB_AVAILABLE
+    if use_wandb:
+        wandb.init(
+            project=cfg.wandb_project,
+            name=cfg.wandb_run_name,
+            tags=cfg.wandb_tags,
+            config={
+                # Model
+                "base_model":        cfg.base_model_name,
+                "verbalizer_model":  cfg.verbalizer_name,
+                # Schedule
+                "total_steps":       cfg.total_steps,
+                "warmup_steps":      cfg.warmup_steps,
+                "save_steps":        cfg.save_steps,
+                # LR
+                "teacher_lr":        cfg.teacher_lr,
+                "student_lr":        cfg.student_lr,
+                "verbalizer_lr":     cfg.verbalizer_lr,
+                "weight_decay":      cfg.weight_decay,
+                # LoRA
+                "lora_rank":         cfg.lora_rank,
+                "lora_alpha":        cfg.lora_alpha,
+                "verb_lora_rank":    cfg.verbalizer_lora_rank,
+                # GRPO
+                "G":                 cfg.G,
+                "gen_temperature":   cfg.gen_temperature,
+                "gen_max_tokens":    cfg.gen_max_new_tokens,
+                "kl_coef":           cfg.kl_coef,
+                # Architecture
+                "M_latents":         cfg.M,
+                "K_spatial":         cfg.K,
+                # Loss weights
+                "lambda_distill":    cfg.lambda_distill,
+                "lambda_ans":        cfg.lambda_ans,
+            },
+            resume="allow",
+        )
+        logger.info(f"WandB run: {wandb.run.url}")
+    elif cfg.use_wandb and not _WANDB_AVAILABLE:
+        logger.warning("WandB requested but not installed. Run: pip install wandb")
 
     # ------------------------------------------------------------------
     # 1. Load tokenizer
@@ -465,23 +522,69 @@ def train_stage2(
             student_sched.step()
 
         # ----------------------------------------------------------------
-        # F. Logging
+        # F. Logging  (console + WandB)
         # ----------------------------------------------------------------
         if step % cfg.log_steps == 0:
             teacher_stats = GRPOTeacher.log_rollout_stats(buffer)
+            m = loss_out.metrics   # shorthand
+
             log_msg = (
                 f"Step {step:>5d}/{cfg.total_steps} | "
-                f"student={loss_out.metrics['loss/student_total']:.4f} | "
-                f"distill={loss_out.metrics['loss/l_distill']:.4f} | "
-                f"ans={loss_out.metrics['loss/l_ans']:.4f} | "
+                f"student={m['loss/student_total']:.4f} | "
+                f"distill={m['loss/l_distill']:.4f} | "
+                f"ans={m['loss/l_ans']:.4f} | "
                 f"reward_mean={teacher_stats['grpo/reward_mean']:.4f} | "
                 f"phase={'warmup' if is_warmup else 'frozen'}"
             )
             if is_warmup:
-                log_msg += f" | lm={loss_out.metrics.get('loss/lm_loss', 0):.4f}"
+                log_msg += f" | lm={m.get('loss/lm_loss', 0):.4f}"
             else:
-                log_msg += f" | verb={loss_out.metrics.get('loss/l_verb', 0):.4f}"
+                log_msg += f" | verb={m.get('loss/l_verb', 0):.4f}"
             logger.info(log_msg)
+
+            if use_wandb:
+                wandb_payload = {
+                    # ── Phase ───────────────────────────────────────────
+                    "phase/is_warmup":          float(is_warmup),
+                    "phase/step":               step,
+
+                    # ── Student losses ───────────────────────────────────
+                    "loss/student_total":        m["loss/student_total"],
+                    "loss/l_distill":            m["loss/l_distill"],
+                    "loss/l_ans":               m["loss/l_ans"],
+                    "loss/lm_loss":             m.get("loss/lm_loss", 0.0),
+                    "loss/l_verb":              m.get("loss/l_verb", 0.0),
+
+                    # ── Teacher / GRPO ───────────────────────────────────
+                    "teacher/reward_mean":       teacher_stats["grpo/reward_mean"],
+                    "teacher/reward_max":        teacher_stats["grpo/reward_max"],
+                    "teacher/reward_min":        teacher_stats["grpo/reward_min"],
+                    "teacher/reward_std":        teacher_stats["grpo/reward_std"],
+                    "teacher/advantage_mean":    teacher_stats["grpo/advantage_mean"],
+
+                    # ── DPO (frozen phase only) ──────────────────────────
+                    "dpo/loss":                 m.get("dpo/dpo_loss",      0.0),
+                    "dpo/reward_margin":        m.get("dpo/reward_margin", 0.0),
+                    "dpo/accuracy":             m.get("dpo/dpo_accuracy",  0.0),
+                    "dpo/log_pi_pos":           m.get("dpo/log_pi_pos",    0.0),
+                    "dpo/log_pi_neg":           m.get("dpo/log_pi_neg",    0.0),
+
+                    # ── Distillation alignment ───────────────────────────
+                    "distill/h_S_norm":         m.get("distill/h_S_norm",    0.0),
+                    "distill/h_T_norm":         m.get("distill/h_T_norm",    0.0),
+                    "distill/cosine_sim":       m.get("distill/cosine_sim",  0.0),
+
+                    # ── Waypoints ────────────────────────────────────────
+                    "waypoints/pred_mean":      m.get("waypoints/pred_mean", 0.0),
+                    "waypoints/pred_std":       m.get("waypoints/pred_std",  0.0),
+
+                    # ── Learning rates ───────────────────────────────────
+                    "lr/teacher":               teacher_sched.get_last_lr()[0],
+                    "lr/student":               student_sched.get_last_lr()[0],
+                    "lr/verbalizer":            (verbalizer_sched.get_last_lr()[0]
+                                                 if not verbalizer.is_frozen() else 0.0),
+                }
+                wandb.log(wandb_payload, step=step)
 
         # Gradient norm logging (less frequent)
         if step % cfg.grad_log_steps == 0:
@@ -491,11 +594,17 @@ def train_stage2(
                 f"  grad_norm/lora={grad_norms.get('grad_norm/lora_total', 0):.4f} | "
                 f"  grad_norm/spatial={grad_norms.get('grad_norm/spatial_total', 0):.4f}"
             )
+            if use_wandb:
+                wandb.log({
+                    "grad/lora_total":    grad_norms.get("grad_norm/lora_total",    0.0),
+                    "grad/spatial_total": grad_norms.get("grad_norm/spatial_total", 0.0),
+                }, step=step)
 
         # ----------------------------------------------------------------
         # G. Checkpointing
         # ----------------------------------------------------------------
-        if (step > 0 and step % cfg.save_steps == 0) or step == cfg.total_steps - 1:
+        is_ckpt_step = (step > 0 and step % cfg.save_steps == 0) or step == cfg.total_steps - 1
+        if is_ckpt_step:
             save_checkpoint(
                 step=step,
                 teacher=teacher,
@@ -509,8 +618,21 @@ def train_stage2(
                 verbalizer_sched=verbalizer_sched,
                 output_dir=cfg.output_dir,
             )
+            if use_wandb:
+                # Log checkpoint as a WandB artifact so you can restore any step
+                ckpt_dir = os.path.join(cfg.output_dir, f"step_{step:06d}")
+                artifact = wandb.Artifact(
+                    name=f"stage2-ckpt-step{step}",
+                    type="model-checkpoint",
+                    description=f"Stage 2 checkpoint at step {step}",
+                    metadata={"step": step, "phase": "warmup" if is_warmup else "frozen"},
+                )
+                artifact.add_dir(ckpt_dir)
+                wandb.log_artifact(artifact)
 
     logger.info("Stage 2 training complete.")
+    if use_wandb:
+        wandb.finish()
     return student, teacher, verbalizer
 
 
@@ -520,38 +642,79 @@ def train_stage2(
 
 if __name__ == "__main__":
     import argparse
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--stage1_ckpt",   type=str, required=True)
+    parser = argparse.ArgumentParser(description="Train Stage 2: GRPO Teacher + Latent Student + Verbalizer")
+    # Paths
+    parser.add_argument("--stage1_ckpt",   type=str, required=True,
+                        help="Path to Stage 1 LoRA adapter dir (adapter_model.safetensors)")
     parser.add_argument("--tokenizer_dir", type=str, default="tokenizer/",
-                        help="Dir produced by tokenizer_setup.py")
+                        help="Dir produced by tokenizer_setup.py (contains thinkflow_token_ids.txt)")
     parser.add_argument("--output_dir",    type=str, default="checkpoints/stage2")
-    parser.add_argument("--resume_from",   type=str, default=None)
+    parser.add_argument("--resume_from",   type=str, default=None,
+                        help="Checkpoint dir to resume from (e.g. checkpoints/stage2/step_001000)")
+    # Data
+    parser.add_argument("--hf_repo",       type=str, default="shreethar/FYP-Stage2-dataset",
+                        help="HuggingFace dataset repo with pre-materialised Stage 1 subset")
+    parser.add_argument("--batch_size",    type=int, default=4)
+    parser.add_argument("--num_workers",   type=int, default=2)
+    parser.add_argument("--max_seq_len",   type=int, default=1024)
+    # Training schedule
     parser.add_argument("--total_steps",   type=int, default=4500)
+    parser.add_argument("--warmup_steps",  type=int, default=3000)
+    parser.add_argument("--save_steps",    type=int, default=500)
+    # WandB
+    parser.add_argument("--wandb_project", type=str, default="reasonflow-vla")
+    parser.add_argument("--wandb_run",     type=str, default="stage2-distillation")
+    parser.add_argument("--no_wandb",      action="store_true", help="Disable WandB logging")
     args = parser.parse_args()
 
-    # Auto-load answer_token_id from tokenizer config
+    # ── Tokenizer ──────────────────────────────────────────────────────────
     answer_token_id = load_answer_token_id(args.tokenizer_dir)
     logger.info(f"answer_token_id = {answer_token_id}")
 
+    # ── Config ─────────────────────────────────────────────────────────────
     cfg = Stage2Config(
         stage1_ckpt_dir=args.stage1_ckpt,
         output_dir=args.output_dir,
         total_steps=args.total_steps,
+        warmup_steps=args.warmup_steps,
+        save_steps=args.save_steps,
+        wandb_project=args.wandb_project,
+        wandb_run_name=args.wandb_run,
+        use_wandb=not args.no_wandb,
     )
 
+    # ── Processor & Dataloader ─────────────────────────────────────────────
+    # Import here so the module can be used without these heavy deps
+    import sys, os
+    sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+    from transformers import AutoProcessor
+    from stage2_dataloader import build_stage2_dataloader
+
+    logger.info(f"Loading processor from {cfg.base_model_name} …")
+    processor = AutoProcessor.from_pretrained(cfg.base_model_name, trust_remote_code=True)
+
+    dataloader = build_stage2_dataloader(
+        processor=processor,
+        hf_repo=args.hf_repo,
+        split="train",
+        batch_size=args.batch_size,
+        num_workers=args.num_workers,
+        max_length=args.max_seq_len,
+    )
+    logger.info(f"DataLoader ready: {len(dataloader.dataset):,} samples.")
+
+    # ── Reward functions ───────────────────────────────────────────────────
     from rewards.action_reward import ActionAlignedReward, CombinedActionReward
     from rewards.qa_reward     import FormatReward
     reward_fns     = [CombinedActionReward(ActionAlignedReward(), FormatReward())]
     reward_weights = [1.0]   # 0.9/0.1 split baked into CombinedActionReward
 
-    # Dataloader is user-provided — plug your LeRobot StreamingDataset here
-    # dataloader = build_stage2_dataloader(cfg)
-
-    # train_stage2(
-    #     cfg=cfg,
-    #     dataloader=dataloader,
-    #     reward_fns=reward_fns,
-    #     reward_weights=reward_weights,
-    #     resume_from=args.resume_from,
-    #     answer_token_id=args.answer_token_id,
-    # )
+    # ── Train ──────────────────────────────────────────────────────────────
+    train_stage2(
+        cfg=cfg,
+        dataloader=dataloader,
+        reward_fns=reward_fns,
+        reward_weights=reward_weights,
+        resume_from=args.resume_from,
+        answer_token_id=answer_token_id,
+    )

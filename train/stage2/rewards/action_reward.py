@@ -90,42 +90,58 @@ def dtw_distance(seq_a: np.ndarray, seq_b: np.ndarray) -> float:
 # Waypoint parser
 # ---------------------------------------------------------------------------
 
-_ANS_PATTERN = re.compile(
-    r"<ans>\s*([\d.]+\s*,\s*[\d.]+(?:\s*;\s*[\d.]+\s*,\s*[\d.]+)*)\s*</ans>",
-    re.IGNORECASE,
-)
-
+# </think> marks the end of Qwen3's native reasoning block.
+# Waypoints appear in the answer section that follows, in Stage-1-trained
+# [[x1,y1],[x2,y2],...] format.
+_THINK_END      = re.compile(r'</think>', re.IGNORECASE)
+_BRACKET_PAIR   = re.compile(r'\[\s*(\d+(?:\.\d+)?)\s*,\s*(\d+(?:\.\d+)?)\s*\]')
+_BRACKET_LIST   = re.compile(r'\[\s*\[.*?\]\s*\]', re.DOTALL)
 
 def parse_waypoints(text: str, K: int = 5) -> Optional[np.ndarray]:
     """
     Parse K waypoints from a Teacher rollout string.
 
-    Expected format inside <ans>...</ans>:
-        x1,y1;x2,y2;...;xK,yK
-    Coordinates assumed to be in [0, 1] normalised space.
+    The model generates:
+        <think>...reasoning...</think>
+        [[x1,y1],[x2,y2],[x3,y3],[x4,y4],[x5,y5]]
+
+    We find the LAST </think> token, then extract the first [[...]] list
+    that appears after it.
+
+    Scale auto-detection (same as before):
+        if any coordinate > 1.0  →  0-1000 scale → divide by 1000
+        otherwise                →  already [0, 1]
+    Returned array is always in [0, 1].
 
     Returns
     -------
-    waypoints : [K, 2] float32 ndarray, or None if parsing fails.
+    waypoints : [K, 2] float32 ndarray in [0, 1], or None if parsing fails.
     """
-    match = _ANS_PATTERN.search(text)
-    if not match:
+    # Step 1: find the end of the last </think> block
+    think_matches = list(_THINK_END.finditer(text))
+    if not think_matches:
+        return None
+    answer_start = think_matches[-1].end()   # text position after last </think>
+    answer_text  = text[answer_start:]
+
+    # Step 2: find the [[...]] waypoint list in the answer section
+    list_match = _BRACKET_LIST.search(answer_text)
+    if not list_match:
         return None
 
+    # Step 3: extract individual [x, y] pairs from the matched list
     try:
-        pairs = match.group(1).strip().split(";")
+        pairs = _BRACKET_PAIR.findall(list_match.group(0))
         if len(pairs) != K:
             return None
-        waypoints = []
-        for pair in pairs:
-            xy = pair.strip().split(",")
-            if len(xy) != 2:
-                return None
-            x, y = float(xy[0]), float(xy[1])
-            if not (0.0 <= x <= 1.0 and 0.0 <= y <= 1.0):
-                return None         # out-of-range coordinate
-            waypoints.append([x, y])
-        return np.array(waypoints, dtype=np.float32)  # [K, 2]
+        waypoints = [[float(x), float(y)] for x, y in pairs]
+        arr = np.array(waypoints, dtype=np.float32)   # [K, 2]
+
+        # Auto-normalise: if model used 0-1000 scale, bring to [0, 1]
+        if arr.max() > 1.0:
+            arr = arr / 1000.0
+        arr = np.clip(arr, 0.0, 1.0)
+        return arr
 
     except (ValueError, IndexError):
         return None

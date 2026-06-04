@@ -135,7 +135,7 @@ class LatentStudent(nn.Module):
 
     Parameters
     ----------
-    model_name   : HuggingFace repo ID   (default: Qwen/Qwen3.5-4B)
+    model_name   : HuggingFace repo ID   (default: shreethar/stage1_unsloth)
     M            : number of continuous reasoning latents  (default: 6)
     K            : number of learnable spatial tokens       (default: 5)
     lora_rank    : LoRA rank r                              (default: 64)
@@ -145,7 +145,7 @@ class LatentStudent(nn.Module):
 
     def __init__(
         self,
-        model_name: str = "unsloth/Qwen3.5-4B",
+        model_name: str = "shreethar/stage1_unsloth",
         M: int = 6,
         K: int = 5,
         lora_rank: int = 64,

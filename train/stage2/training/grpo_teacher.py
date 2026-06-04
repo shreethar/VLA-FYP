@@ -102,20 +102,22 @@ class GRPOTeacher(nn.Module):
 
     Parameters
     ----------
-    model_name        : HuggingFace checkpoint (same as Student init)
-    G                 : number of rollouts per input
-    answer_token_id   : token id of <ans> (registered as a special token)
-    lora_rank / alpha : LoRA hyperparameters
-    gen_temperature   : sampling temperature for diverse rollouts
-    gen_max_new_tokens: max tokens to generate per rollout
-    kl_coef           : KL penalty coefficient (0 = disabled)
+    model_name          : HuggingFace checkpoint (same as Student init)
+    G                   : number of rollouts per input
+    think_end_token_id  : token id of </think> — the native Qwen3 end-of-reasoning
+                          token. Used as the h_T extraction anchor for L_distill.
+                          No need to register it; Qwen3 includes it natively.
+    lora_rank / alpha   : LoRA hyperparameters
+    gen_temperature     : sampling temperature for diverse rollouts
+    gen_max_new_tokens  : max tokens to generate per rollout
+    kl_coef             : KL penalty coefficient (0 = disabled)
     """
 
     def __init__(
         self,
-        model_name: str = "Qwen/Qwen3.5-4B",
+        model_name: str = "shreethar/stage1_unsloth",
         G: int = 5,
-        answer_token_id: int = -1,          # set after tokenizer extension
+        think_end_token_id: int = -1,       # </think> token id (native Qwen3 token)
         lora_rank: int = 64,
         lora_alpha: int = 128,
         lora_dropout: float = 0.05,
@@ -125,7 +127,7 @@ class GRPOTeacher(nn.Module):
     ):
         super().__init__()
         self.G = G
-        self.answer_token_id = answer_token_id
+        self.think_end_token_id = think_end_token_id
         self.gen_temperature  = gen_temperature
         self.gen_max_new_tokens = gen_max_new_tokens
         self.kl_coef = kl_coef
@@ -209,9 +211,15 @@ class GRPOTeacher(nn.Module):
 
     def _find_answer_positions(self, token_ids: torch.Tensor) -> torch.Tensor:
         """
-        Locate the <ans> token position in each sequence.
-        Falls back to the last non-padding position if <ans> is not found
-        (should not happen after SFT, but guards against edge cases).
+        Locate the LAST </think> token position in each sequence.
+
+        WHY </think> instead of <ans>:
+            </think> is a native Qwen3 single token — no special registration
+            needed. It marks the exact transition from reasoning to answer, which
+            is the correct h_T extraction point for L_distill.
+            We use the LAST occurrence in case the model emits multiple think
+            blocks (rare but possible during early GRPO training).
+            Falls back to the last non-padding position if </think> is absent.
 
         Parameters
         ----------
@@ -225,9 +233,9 @@ class GRPOTeacher(nn.Module):
         positions  = torch.zeros(batch_size, dtype=torch.long, device=token_ids.device)
 
         for i in range(batch_size):
-            matches = (token_ids[i] == self.answer_token_id).nonzero(as_tuple=False)
+            matches = (token_ids[i] == self.think_end_token_id).nonzero(as_tuple=False)
             if matches.numel() > 0:
-                positions[i] = matches[0, 0]           # first occurrence
+                positions[i] = matches[-1, 0]          # LAST </think> occurrence
             else:
                 # Fallback: last non-pad token
                 non_pad = (token_ids[i] != 0).nonzero(as_tuple=False)
