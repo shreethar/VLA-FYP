@@ -175,10 +175,10 @@ This project draws from the following works:
 | Paper | Relevance |
 |-------|-----------|
 | [Fast Think, Then Act](https://arxiv.org/abs/2601.09708) — NVIDIA | Primary architectural inspiration |
-| [SmolVLA](https://arxiv.org/abs/2506.01844) — HuggingFace | Compact VLA design; Verbalizer distillation concept |
-| [RememVLA](https://arxiv.org/abs/2505.07218) | Recurrent memory module (N=8 query vectors) |
+| [SmolVLA](https://arxiv.org/abs/2506.01844) — HuggingFace | CFM VLA design |
+| [RememVLA](https://arxiv.org/abs/2603.12942) | Dual-Level Recurrent Queries |
 | [Spatial Forcing](https://arxiv.org/abs/2501.09808) | Spatial grounding via frozen visual encoder supervision |
-| [RLInf](https://arxiv.org/abs/2505.01821) | Inference-time RL feedback (Stage 5) |
+| [RLInf](https://arxiv.org/abs/2509.15965) | Macro-to-Micro Flow Transformation |
 | [GRPO](https://arxiv.org/abs/2402.03300) — DeepSeek | Group Relative Policy Optimisation for Teacher training |
 | [DPO](https://arxiv.org/abs/2305.18290) | Verbalizer preference optimisation |
 | [Flow Matching](https://arxiv.org/abs/2210.02747) | CFM Action Expert (Stage 3) |
