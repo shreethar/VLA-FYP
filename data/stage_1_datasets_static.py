@@ -57,14 +57,12 @@ def _keep(idx: int, total: int, n_keep: int) -> bool:
 
 def _get_split(record: dict) -> str:
     """
-    Assigns a deterministic train/val/test split based on record content.
-    Always produces the same split for the same record — 80/10/10.
+    Assigns a deterministic train/test split based on record content.
+    Always produces the same split for the same record — 85/15.
     """
     key = f"{record['dataset']}|{record['human'][:80]}|{record['assistant'][:40]}"
     h = int(hashlib.md5(key.encode()).hexdigest(), 16) % 100
-    if h < 80:  return "train"
-    elif h < 90: return "val"
-    else:        return "test"
+    return "train" if h < 85 else "test"
 
 def resample_waypoints(coords, k=5):
     if len(coords) == k:
@@ -568,7 +566,7 @@ def build_static_dataset(
     all_records += build_robofac_records()
 
     # ── Deterministic 80/10/10 split ────────────────────────────────────────
-    split_buckets: dict[str, list] = {"train": [], "val": [], "test": []}
+    split_buckets: dict[str, list] = {"train": [], "test": []}
     for rec in all_records:
         split_buckets[_get_split(rec)].append(rec)
 
