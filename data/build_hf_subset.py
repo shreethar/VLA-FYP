@@ -126,45 +126,57 @@ def _build_subset_records(molmoact_ds=None, pixmocap_ds=None,
 # ── Phase 2: Eagerly materialize media via generator ─────────────────────────
 
 def _sample_generator(records, hf_cache):
-    """Yield dicts with materialized PIL images for HF Dataset construction."""
+    """
+    Pure yielder — no prints here.
+    HF calls this function multiple times internally (sharding/checkpointing),
+    so any stateful printing inside would fire repeatedly. Stats are computed
+    from the finished flat_ds after from_generator() returns.
+    """
     loader = VLAStaticDataset(records, hf_cache)
-    success = 0
-    failed  = 0
-
-    for idx in range(len(records)):
-        rec   = records[idx]
+    for rec in records:
         media = loader._load_media(rec)
         if media is None:
-            failed += 1
             continue
-
-        frames = media if isinstance(media, list) else [media]
+        frames     = media if isinstance(media, list) else [media]
+        media_type = "image" if len(frames) == 1 else "video"
         yield {
-            "dataset":   rec["dataset"],
-            "type":      rec["type"],
-            "human":     rec["human"],
-            "assistant": rec["assistant"],
-            "split":     _get_split(rec),
-            "frames":    frames,
+            "dataset":    rec["dataset"],
+            "type":       rec["type"],
+            "human":      rec["human"],
+            "assistant":  rec["assistant"],
+            "split":      _get_split(rec),
+            "frames":     frames,
+            "media_type": media_type,
         }
-        success += 1
 
-        if (success + failed) % 2000 == 0:
-            print(f"  progress: {success + failed:,}/{len(records):,}  "
-                  f"(ok={success:,}  fail={failed:,})")
 
-    print(f"\n  Materialization done: {success:,} ok, {failed:,} failed")
+def _print_materialization_stats(flat_ds, records):
+    """Print per-dataset ok/fail summary using fast HF column reads."""
+    from collections import Counter
+    ok_counts    = Counter(flat_ds["dataset"])          # yielded (successful) rows
+    total_counts = Counter(rec["dataset"] for rec in records)  # all attempted
+
+    for ds_name in total_counts:   # preserve insertion order
+        ok   = ok_counts.get(ds_name, 0)
+        fail = total_counts[ds_name] - ok
+        print(f"  ✓ {ds_name:<28s}  ok={ok:>6,}  fail={fail:>5,}  "
+              f"total={total_counts[ds_name]:>6,}")
+
+    total_ok   = len(flat_ds)
+    total_fail = len(records) - total_ok
+    print(f"\n  Materialization done: {total_ok:,} ok, {total_fail:,} failed")
 
 
 # ── Phase 3 & 4: Build DatasetDict and push ─────────────────────────────────
 
 HF_FEATURES = Features({
-    "dataset":   Value("string"),
-    "type":      Value("string"),
-    "human":     Value("string"),
-    "assistant": Value("string"),
-    "split":     Value("string"),
-    "frames":    Sequence(HFImage()),
+    "dataset":    Value("string"),
+    "type":       Value("string"),
+    "human":      Value("string"),
+    "assistant":  Value("string"),
+    "split":      Value("string"),
+    "frames":     Sequence(HFImage()),
+    "media_type": Value("string"),   # "image" (1 frame) | "video" (>1 frames)
 })
 
 
@@ -194,18 +206,25 @@ def build_and_push(
         gen_kwargs={"records": records, "hf_cache": hf_cache},
         features=HF_FEATURES,
     )
-    print(f"  Flat dataset size: {len(flat_ds):,} rows\n")
+    _print_materialization_stats(flat_ds, records)
+    print(f"\n  Flat dataset size: {len(flat_ds):,} rows\n")
 
-    # 3. Split into train / val / test
-    print("📊  Phase 3 — Splitting dataset (80 / 10 / 10)")
+    # 3. Split into train / test
+    print("📊  Phase 3 — Splitting dataset (85 / 15)")
     splits = {}
-    for split_name in ("train", "val", "test"):
+    for split_name in ("train", "test"):
         split_ds = flat_ds.filter(
-            lambda rows: [s == split_name for s in rows["split"]],
+            lambda rows, s=split_name: [x == s for x in rows["split"]],
             batched=True,
         )
-        splits[split_name] = split_ds.remove_columns("split")
-        print(f"  {split_name:5s}: {len(splits[split_name]):>8,}")
+        split_ds = split_ds.remove_columns("split")
+        splits[split_name] = split_ds
+        # Use column-level access — avoids decoding the image bytes entirely
+        media_types = split_ds["media_type"]   # plain list[str], no PIL involved
+        n_img = media_types.count("image")
+        n_vid = len(media_types) - n_img
+        print(f"  {split_name:5s}: {len(split_ds):>8,}  "
+              f"(image={n_img:,}  video={n_vid:,})")
 
     dataset_dict = DatasetDict(splits)
 
