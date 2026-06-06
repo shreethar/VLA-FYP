@@ -48,3 +48,10 @@ Spatial-Forcing/
 
 # Test images
 train/stage2/test/images/
+
+
+# Checkpoints
+checkpoints/
+
+# WandB
+wandb/

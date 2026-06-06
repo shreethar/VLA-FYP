@@ -152,6 +152,7 @@ class Verbalizer(nn.Module):
         ca_num_heads: int = 8,
         ca_dropout: float = 0.0,
         dpo_beta: float = 0.1,
+        new_vocab_size: int = -1,           # vocab size after <answer> registration
     ):
         super().__init__()
         self.dpo_beta = dpo_beta
@@ -186,6 +187,10 @@ class Verbalizer(nn.Module):
             bias="none",
         )
         self.lm = get_peft_model(base, lora_cfg)
+
+        # Resize embedding table to match extended tokenizer (<answer> token)
+        if new_vocab_size > 0:
+            self.lm.resize_token_embeddings(new_vocab_size)
 
         # ------------------------------------------------------------------
         # 4. Read architecture constants

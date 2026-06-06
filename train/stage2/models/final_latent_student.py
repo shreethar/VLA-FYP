@@ -151,6 +151,7 @@ class LatentStudent(nn.Module):
         lora_rank: int = 64,
         lora_alpha: int = 128,
         lora_dropout: float = 0.05,
+        new_vocab_size: int = -1,           # set to len(tokenizer) after <answer> registration
     ):
         super().__init__()
         self.M = M
@@ -195,6 +196,10 @@ class LatentStudent(nn.Module):
             bias="none",
         )
         self.vlm = get_peft_model(base, lora_cfg)
+
+        # Resize embedding table to match extended tokenizer (<answer> token)
+        if new_vocab_size > 0:
+            self.vlm.resize_token_embeddings(new_vocab_size)
 
         # ------------------------------------------------------------------
         # 3. Read architecture constants from config

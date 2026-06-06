@@ -51,9 +51,12 @@ import argparse
 from transformers import AutoTokenizer
 
 
-# These are the ONLY tokens we register as special.
-# <think> / </think> are already in Qwen3's vocabulary.
-THINK_END_TOKEN = "</think>"   # native Qwen3 token, already in vocab
+# <answer> / </answer> are registered as special tokens so each becomes a
+# single, stable token ID — required for exact position-based h_T extraction.
+# NOTE: after registration, call model.resize_token_embeddings(new_vocab_size)
+#       in every script that loads a model (stage1_5 SFT, train_stage2, etc.)
+ANSWER_OPEN_TOKEN  = "<answer>"
+ANSWER_CLOSE_TOKEN = "</answer>"
 
 
 def setup_tokenizer(
@@ -61,61 +64,74 @@ def setup_tokenizer(
     save_dir: str   = "tokenizer/",
 ) -> tuple:
     """
-    Load and save the tokenizer, then record the </think> token ID.
+    Load the tokenizer, register <answer> / </answer> as special tokens,
+    and save everything so other scripts can load without re-registering.
 
-    WHY </think> instead of <ans>:
-        <ans> was needed as a single-token position anchor for h_T extraction.
-        </think> serves the exact same role — it is Qwen3's native end-of-reasoning
-        token (always a single token), and it marks the exact transition from
-        thinking to answer, which is the correct h_T alignment point.
-        No vocabulary extension needed → model embedding table is unchanged.
+    WHY <answer> as the h_T anchor:
+        <answer> marks the START of the answer section.  The hidden state at
+        this position represents "I am about to give the answer", which is the
+        most semantically meaningful point for Teacher→Student distillation.
+        </think> marks end-of-reasoning, which is less precise.
+
+        Because <answer> is NOT in Qwen3's native vocabulary, registering it
+        adds a new row to the embedding table.  Every script that loads any of
+        the three models MUST call:
+            model.resize_token_embeddings(new_vocab_size)
+        after loading.  The new_vocab_size is saved to thinkflow_token_ids.txt.
 
     Returns
     -------
-    tokenizer         : AutoTokenizer (unchanged from base model)
-    think_end_token_id: int — the single token ID for </think>
-                        Pass this to GRPOTeacher(think_end_token_id=...) and
-                        train_stage2(think_end_token_id=...)
+    tokenizer        : AutoTokenizer with <answer> / </answer> registered
+    answer_token_id  : int — single token ID for <answer>
+                       Pass this to GRPOTeacher(answer_token_id=...) and
+                       train_stage2(answer_token_id=...)
     """
     tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
 
-    # Verify </think> is already in the vocabulary as a single token
-    test_ids = tokenizer.encode(THINK_END_TOKEN, add_special_tokens=False)
+    # Register tokens only if not already in vocab
+    tokens_to_add = [
+        tok for tok in [ANSWER_OPEN_TOKEN, ANSWER_CLOSE_TOKEN]
+        if tok not in tokenizer.get_vocab()
+    ]
+    if tokens_to_add:
+        n = tokenizer.add_special_tokens(
+            {"additional_special_tokens": tokens_to_add}
+        )
+        print(f"Added {n} special token(s): {tokens_to_add}")
+    else:
+        print(f"Tokens already present: {[ANSWER_OPEN_TOKEN, ANSWER_CLOSE_TOKEN]}")
+
+    # Verify <answer> is exactly one token
+    test_ids = tokenizer.encode(ANSWER_OPEN_TOKEN, add_special_tokens=False)
     assert len(test_ids) == 1, (
-        f"</think> tokenised to {len(test_ids)} tokens instead of 1. "
-        f"IDs: {test_ids}. This model may not natively support Qwen3 thinking mode."
+        f"<answer> tokenised to {len(test_ids)} tokens instead of 1. "
+        f"IDs: {test_ids}. Special token registration failed."
     )
 
-    think_end_token_id = tokenizer.convert_tokens_to_ids(THINK_END_TOKEN)
-    print(f"think_end_token_id (</think>) = {think_end_token_id}")
-    print(f"Vocabulary size (unchanged):   {len(tokenizer)}")
+    answer_token_id = tokenizer.convert_tokens_to_ids(ANSWER_OPEN_TOKEN)
+    new_vocab_size  = len(tokenizer)
+    print(f"answer_token_id (<answer>) = {answer_token_id}")
+    print(f"New vocabulary size        = {new_vocab_size}")
 
-    # Save tokenizer (no structural changes, but save for reproducibility)
+    # Save extended tokenizer
     os.makedirs(save_dir, exist_ok=True)
     tokenizer.save_pretrained(save_dir)
     print(f"Tokenizer saved to: {save_dir}")
 
-    # Write token ID config so other scripts don't need to re-import
+    # Write config so other scripts can read IDs without re-importing
     config_path = os.path.join(save_dir, "thinkflow_token_ids.txt")
     with open(config_path, "w") as f:
-        f.write(f"think_end_token_id={think_end_token_id}\n")
-        f.write(f"think_end_token={THINK_END_TOKEN}\n")
+        f.write(f"answer_token_id={answer_token_id}\n")
+        f.write(f"answer_open_token={ANSWER_OPEN_TOKEN}\n")
+        f.write(f"answer_close_token={ANSWER_CLOSE_TOKEN}\n")
+        f.write(f"new_vocab_size={new_vocab_size}\n")
     print(f"Token IDs written to: {config_path}")
 
-    return tokenizer, think_end_token_id
+    return tokenizer, answer_token_id
 
 
 def load_answer_token_id(tokenizer_dir: str) -> int:
-    """
-    Read the think_end_token_id from the saved config file.
-
-    Named 'load_answer_token_id' for backward compatibility with train_stage2.py.
-    Returns the </think> token ID which is used as the h_T extraction anchor.
-
-    Example
-    -------
-    think_end_token_id = load_answer_token_id("tokenizer/")
-    """
+    """Read the <answer> token ID from the saved config."""
     config_path = os.path.join(tokenizer_dir, "thinkflow_token_ids.txt")
     if not os.path.exists(config_path):
         raise FileNotFoundError(
@@ -124,27 +140,31 @@ def load_answer_token_id(tokenizer_dir: str) -> int:
         )
     with open(config_path) as f:
         for line in f:
-            if line.startswith("think_end_token_id="):
-                return int(line.strip().split("=")[1])
-            # Backward compat: old files used 'answer_token_id'
             if line.startswith("answer_token_id="):
                 return int(line.strip().split("=")[1])
-    raise ValueError("think_end_token_id not found in config file.")
+            if line.startswith("think_end_token_id="):   # backward compat
+                return int(line.strip().split("=")[1])
+    raise ValueError("answer_token_id not found in config file.")
+
+
+def load_new_vocab_size(tokenizer_dir: str):
+    """Return the vocab size after <answer> registration, for resize_token_embeddings()."""
+    config_path = os.path.join(tokenizer_dir, "thinkflow_token_ids.txt")
+    if not os.path.exists(config_path):
+        return None
+    with open(config_path) as f:
+        for line in f:
+            if line.startswith("new_vocab_size="):
+                return int(line.strip().split("=")[1])
+    return None
 
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument(
-        "--model_name", type=str,
-        default="Qwen/Qwen3.5-4B",
-        help="HuggingFace model name to load tokenizer from",
-    )
-    parser.add_argument(
-        "--save_dir", type=str,
-        default="tokenizer/",
-        help="Directory to save the tokenizer and token ID config",
-    )
+    parser.add_argument("--model_name", type=str, default="shreethar/stage1_unsloth")
+    parser.add_argument("--save_dir",   type=str, default="tokenizer/")
     args = parser.parse_args()
 
-    _, think_end_token_id = setup_tokenizer(args.model_name, args.save_dir)
-    print(f"\nPass this to train_stage2.py: --answer_token_id {think_end_token_id}")
+    _, answer_token_id = setup_tokenizer(args.model_name, args.save_dir)
+    print(f"\nPass to train_stage2.py: --answer_token_id {answer_token_id}")
+    print("IMPORTANT: call model.resize_token_embeddings(new_vocab_size) after loading each model.")

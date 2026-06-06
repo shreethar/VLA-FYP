@@ -117,7 +117,8 @@ class GRPOTeacher(nn.Module):
         self,
         model_name: str = "shreethar/stage1_unsloth",
         G: int = 5,
-        think_end_token_id: int = -1,       # </think> token id (native Qwen3 token)
+        answer_token_id: int = -1,          # <answer> special token ID
+        new_vocab_size:  int = -1,          # vocab size after tokenizer extension
         lora_rank: int = 64,
         lora_alpha: int = 128,
         lora_dropout: float = 0.05,
@@ -127,8 +128,8 @@ class GRPOTeacher(nn.Module):
     ):
         super().__init__()
         self.G = G
-        self.think_end_token_id = think_end_token_id
-        self.gen_temperature  = gen_temperature
+        self.answer_token_id = answer_token_id
+        self.gen_temperature   = gen_temperature
         self.gen_max_new_tokens = gen_max_new_tokens
         self.kl_coef = kl_coef
 
@@ -163,6 +164,11 @@ class GRPOTeacher(nn.Module):
             bias="none",
         )
         self.vlm = get_peft_model(base, lora_cfg)
+
+        # Resize embedding table to match extended tokenizer (<answer> token)
+        if new_vocab_size > 0 and new_vocab_size != self.vlm.config.vocab_size:
+            self.vlm.resize_token_embeddings(new_vocab_size)
+
         # Qwen3.5 config: hidden_size is under text_config
         self.hidden_dim: int = self.vlm.config.text_config.hidden_size   # 2560
 
@@ -211,15 +217,12 @@ class GRPOTeacher(nn.Module):
 
     def _find_answer_positions(self, token_ids: torch.Tensor) -> torch.Tensor:
         """
-        Locate the LAST </think> token position in each sequence.
+        Locate the FIRST <answer> token position in each sequence.
 
-        WHY </think> instead of <ans>:
-            </think> is a native Qwen3 single token — no special registration
-            needed. It marks the exact transition from reasoning to answer, which
-            is the correct h_T extraction point for L_distill.
-            We use the LAST occurrence in case the model emits multiple think
-            blocks (rare but possible during early GRPO training).
-            Falls back to the last non-padding position if </think> is absent.
+        <answer> is registered as a special single token and marks the START
+        of the answer section — the most semantically meaningful h_T anchor.
+        Falls back to the last non-padding position if <answer> is absent
+        (handles early training steps before the format is learned).
 
         Parameters
         ----------
@@ -233,9 +236,9 @@ class GRPOTeacher(nn.Module):
         positions  = torch.zeros(batch_size, dtype=torch.long, device=token_ids.device)
 
         for i in range(batch_size):
-            matches = (token_ids[i] == self.think_end_token_id).nonzero(as_tuple=False)
+            matches = (token_ids[i] == self.answer_token_id).nonzero(as_tuple=False)
             if matches.numel() > 0:
-                positions[i] = matches[-1, 0]          # LAST </think> occurrence
+                positions[i] = matches[0, 0]           # FIRST <answer> occurrence
             else:
                 # Fallback: last non-pad token
                 non_pad = (token_ids[i] != 0).nonzero(as_tuple=False)

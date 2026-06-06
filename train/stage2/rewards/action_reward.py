@@ -90,48 +90,41 @@ def dtw_distance(seq_a: np.ndarray, seq_b: np.ndarray) -> float:
 # Waypoint parser
 # ---------------------------------------------------------------------------
 
-# </think> marks the end of Qwen3's native reasoning block.
-# Waypoints appear in the answer section that follows, in Stage-1-trained
-# [[x1,y1],[x2,y2],...] format.
-_THINK_END      = re.compile(r'</think>', re.IGNORECASE)
+# <answer>...</answer> wraps the waypoint list taught in Stage 1.5 SFT.
+# </think> is still used in grpo_teacher.py for h_T extraction (unchanged).
+_ANSWER_PATTERN = re.compile(
+    r'<answer>\s*(.*?)\s*</answer>',
+    re.DOTALL | re.IGNORECASE,
+)
 _BRACKET_PAIR   = re.compile(r'\[\s*(\d+(?:\.\d+)?)\s*,\s*(\d+(?:\.\d+)?)\s*\]')
-_BRACKET_LIST   = re.compile(r'\[\s*\[.*?\]\s*\]', re.DOTALL)
 
 def parse_waypoints(text: str, K: int = 5) -> Optional[np.ndarray]:
     """
     Parse K waypoints from a Teacher rollout string.
 
-    The model generates:
+    Expected format after Stage 1.5 SFT:
         <think>...reasoning...</think>
-        [[x1,y1],[x2,y2],[x3,y3],[x4,y4],[x5,y5]]
+        <answer>[[x1,y1],[x2,y2],[x3,y3],[x4,y4],[x5,y5]]</answer>
 
-    We find the LAST </think> token, then extract the first [[...]] list
-    that appears after it.
+    Primary:  extract from <answer>...</answer> (clean boundary).
+    Fallback: search full text for K [x,y] pairs if <answer> tag absent
+              (handles early GRPO steps before format is fully learned).
 
-    Scale auto-detection (same as before):
-        if any coordinate > 1.0  →  0-1000 scale → divide by 1000
-        otherwise                →  already [0, 1]
+    Scale auto-detection:
+        if any coordinate > 1.0  ->  0-1000 scale  ->  divide by 1000
+        otherwise                ->  already [0, 1]
     Returned array is always in [0, 1].
 
     Returns
     -------
     waypoints : [K, 2] float32 ndarray in [0, 1], or None if parsing fails.
     """
-    # Step 1: find the end of the last </think> block
-    think_matches = list(_THINK_END.finditer(text))
-    if not think_matches:
-        return None
-    answer_start = think_matches[-1].end()   # text position after last </think>
-    answer_text  = text[answer_start:]
+    # Primary: extract content from <answer>...</answer>
+    ans_match   = _ANSWER_PATTERN.search(text)
+    search_text = ans_match.group(1) if ans_match else text
 
-    # Step 2: find the [[...]] waypoint list in the answer section
-    list_match = _BRACKET_LIST.search(answer_text)
-    if not list_match:
-        return None
-
-    # Step 3: extract individual [x, y] pairs from the matched list
     try:
-        pairs = _BRACKET_PAIR.findall(list_match.group(0))
+        pairs = _BRACKET_PAIR.findall(search_text)
         if len(pairs) != K:
             return None
         waypoints = [[float(x), float(y)] for x, y in pairs]

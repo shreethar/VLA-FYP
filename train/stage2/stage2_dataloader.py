@@ -70,13 +70,11 @@ _STAGE1_PREFIX_RE = re.compile(
 
 STAGE2_TRAJ_SYSTEM = (
     "You are a robot manipulation assistant. "
-    "Given an observation image and a task instruction, reason step-by-step "
-    "about the manipulation, then predict the end-effector's 2D trajectory "
-    f"as exactly {K_WAYPOINTS} waypoints.\n\n"
-    "Think through the scene carefully, then output ONLY the coordinate list "
-    "in this exact format after your reasoning:\n"
-    f"[[x1,y1],[x2,y2],[x3,y3],[x4,y4],[x5,y5]]\n\n"
-    "Coordinates are in the same 0-1000 integer scale as your training data."
+    "Given an observation image and a task instruction, predict the "
+    f"end-effector's 2D trajectory as {K_WAYPOINTS} waypoints.\n\n"
+    "Think through the task, then output the coordinate list inside answer tags:\n"
+    "<answer>[[x1,y1],[x2,y2],[x3,y3],[x4,y4],[x5,y5]]</answer>\n\n"
+    "Coordinates are 0-1000 integers (0=top-left, 1000=bottom-right)."
 )
 
 
