@@ -128,7 +128,7 @@ class GRPOTeacher(nn.Module):
     ):
         super().__init__()
         self.G = G
-        self.answer_token_id = answer_token_id
+        self.end_think_token_id = answer_token_id  # Rename variable internally
         self.gen_temperature  = gen_temperature
         self.gen_max_new_tokens = gen_max_new_tokens
         self.kl_coef = kl_coef
@@ -211,10 +211,10 @@ class GRPOTeacher(nn.Module):
             embeds[mask] = img_feats.to(embeds.dtype)
         return embeds
 
-    def _find_answer_positions(self, token_ids: torch.Tensor) -> torch.Tensor:
+    def _find_think_end_positions(self, token_ids: torch.Tensor) -> torch.Tensor:
         """
-        Locate the <ans> token position in each sequence.
-        Falls back to the last non-padding position if <ans> is not found
+        Locate the </think> token position in each sequence.
+        Falls back to the last non-padding position if </think> is not found
         (should not happen after SFT, but guards against edge cases).
 
         Parameters
@@ -229,7 +229,7 @@ class GRPOTeacher(nn.Module):
         positions  = torch.zeros(batch_size, dtype=torch.long, device=token_ids.device)
 
         for i in range(batch_size):
-            matches = (token_ids[i] == self.answer_token_id).nonzero(as_tuple=False)
+            matches = (token_ids[i] == self.end_think_token_id).nonzero(as_tuple=False)
             if matches.numel() > 0:
                 positions[i] = matches[0, 0]           # first occurrence
             else:
@@ -574,29 +574,29 @@ class GRPOTeacher(nn.Module):
         tau_pos_response = self._compute_response_mask(tau_pos_ids, prompt_len)
         tau_neg_response = self._compute_response_mask(tau_neg_ids, prompt_len)
 
-        # <answer> token positions in τ+
-        answer_pos = self._find_answer_positions(tau_pos_ids)
+        # </think> token positions in τ+
+        think_end_pos = self._find_think_end_positions(tau_pos_ids)
 
         return (
             tau_pos_ids, tau_pos_mask,
             tau_neg_ids, tau_neg_mask,
             tau_pos_texts, tau_neg_texts,
             tau_pos_response, tau_neg_response,
-            answer_pos,
+            think_end_pos,
         )
 
     @torch.no_grad()
-    def extract_answer_hidden_state(
+    def extract_think_end_hidden_state(
         self,
         tau_pos_ids: torch.Tensor,      # [batch, seq_pos]
         tau_pos_mask: torch.Tensor,
         pixel_values: Optional[torch.Tensor],
         image_grid_thw: Optional[torch.Tensor],
-        answer_token_pos: torch.Tensor, # [batch]
+        think_end_token_pos: torch.Tensor, # [batch]
     ) -> torch.Tensor:
         """
         Separate forward pass through the UPDATED Teacher on τ+.
-        Extracts the hidden state at the <answer> token position.
+        Extracts the hidden state at the </think> token position.
 
         Called AFTER the Teacher's GRPO optimizer step so that h_T reflects
         the post-update weights — matching Algorithm 1's sequential ordering.
@@ -622,7 +622,7 @@ class GRPOTeacher(nn.Module):
 
         h_T = h_all[
             torch.arange(batch, device=h_all.device),
-            answer_token_pos,
+            think_end_token_pos,
         ]   # [batch, d]
 
         return h_T
@@ -660,8 +660,8 @@ class GRPOTeacher(nn.Module):
         buffer : RolloutBuffer  (h_T is set and ready for L_distill)
         """
 
-        assert self.answer_token_id > 0, (
-            "answer_token_id. Register <ans> as a special token first"
+        assert self.end_think_token_id > 0, (
+            "end_think_token_id not provided properly"
         )
 
         prompt_len = input_ids.shape[1]
@@ -697,16 +697,16 @@ class GRPOTeacher(nn.Module):
             tau_neg_ids, tau_neg_mask,
             tau_pos_texts, tau_neg_texts,
             tau_pos_response, tau_neg_response,
-            answer_pos,
+            think_end_pos,
         ) = self.select_best_worst(
             all_ids, all_masks, all_texts, advantages, prompt_len
         )
 
         # --- Step 6: Extract h_T from UPDATED Teacher ----------------------
-        h_T = self.extract_answer_hidden_state(
+        h_T = self.extract_think_end_hidden_state(
             tau_pos_ids, tau_pos_mask,
             pixel_values, image_grid_thw,
-            answer_pos,
+            think_end_pos,
         )
 
         # --- Pack into RolloutBuffer ---------------------------------------
@@ -724,7 +724,7 @@ class GRPOTeacher(nn.Module):
             tau_neg_mask=tau_neg_mask,
             tau_pos_response_mask=tau_pos_response,
             tau_neg_response_mask=tau_neg_response,
-            answer_token_pos=answer_pos,
+            answer_token_pos=think_end_pos,
             h_T=h_T,
             grpo_loss=grpo_loss.item(),
         )

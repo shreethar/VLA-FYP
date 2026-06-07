@@ -98,35 +98,6 @@ class StudentLossComputer(nn.Module):
     # Internal helpers
     # -----------------------------------------------------------------------
 
-    def _get_student_answer_hidden(
-        self,
-        student,           # LatentStudent (duck-typed)
-        input_ids: torch.Tensor,
-        pixel_values,
-        image_grid_thw,
-        attention_mask: torch.Tensor,
-        prompt_len: int,
-    ) -> torch.Tensor:
-        """
-        The Student's structural <answer> equivalent is the hidden state at the
-        LAST PROMPT TOKEN (position = prompt_len - 1).
-
-        This is the exact point where the model has consumed the full context
-        and is about to transition to latent generation — mirroring the Teacher's
-        <ans> token which marks the transition to coordinate output.
-
-        Returns: h_S  [batch, d_student]
-        """
-        answer_pos = torch.full(
-            (input_ids.shape[0],),
-            fill_value=prompt_len - 1,
-            dtype=torch.long,
-            device=input_ids.device,
-        )
-        return student.get_answer_hidden_state(
-            input_ids, pixel_values, image_grid_thw, attention_mask, answer_pos
-        )   # [batch, d_student]
-
     # -----------------------------------------------------------------------
     # Individual loss computations
     # -----------------------------------------------------------------------
@@ -195,24 +166,18 @@ class StudentLossComputer(nn.Module):
         is_warmup = (global_step < self.warmup_steps)
 
         # ==================================================================
-        # 1. Student forward: generate latents + spatial tokens + waypoints
+        # 1. Student forward: generate latents + h_S + spatial tokens + waypoints
         # ==================================================================
-        latents, spatial_hidden, pred_waypoints = student.generate_latents(
+        latents, h_S, spatial_hidden, pred_waypoints = student.generate_latents(
             input_ids, pixel_values, image_grid_thw, attention_mask
         )
         # latents      : List[M tensors, each [batch, d_student]]
+        # h_S          : [batch, d_student] (hidden state at </think>)
         # spatial_hidden: [batch, K, d_student]
         # pred_waypoints: [batch, K, 2]  in [0, 1]
 
         # Stack latents for Verbalizer  →  [batch, M, d_student]
         z = verbalizer.stack_latents(latents)
-
-        # ==================================================================
-        # 2. Student <answer> hidden state for L_distill
-        # ==================================================================
-        h_S = self._get_student_answer_hidden(
-            student, input_ids, pixel_values, image_grid_thw, attention_mask, prompt_len
-        )   # [batch, d_student]
 
         # ==================================================================
         # 3. Loss computations — always present

@@ -338,7 +338,7 @@ def train_stage2(
     teacher = GRPOTeacher(
         model_name=cfg.base_model_name,
         G=cfg.G,
-        answer_token_id=answer_token_id,
+        answer_token_id=answer_token_id, # This is now the think_end_token_id under the hood
         lora_rank=cfg.lora_rank,
         lora_alpha=cfg.lora_alpha,
         gen_temperature=cfg.gen_temperature,
@@ -353,6 +353,7 @@ def train_stage2(
         K=cfg.K,
         lora_rank=cfg.lora_rank,
         lora_alpha=cfg.lora_alpha,
+        end_think_token_id=answer_token_id,
     ).to(device)
 
     logger.info("Building Verbalizer …")
@@ -657,6 +658,8 @@ if __name__ == "__main__":
     parser.add_argument("--batch_size",    type=int, default=4)
     parser.add_argument("--num_workers",   type=int, default=2)
     parser.add_argument("--max_seq_len",   type=int, default=1024)
+    parser.add_argument("--subset_ratio",  type=float, default=1.0,
+                        help="Train on a smaller percentage of the dataset (e.g. 0.15 for 15%)")
     # Training schedule
     parser.add_argument("--total_steps",   type=int, default=4500)
     parser.add_argument("--warmup_steps",  type=int, default=3000)
@@ -668,8 +671,16 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     # ── Tokenizer ──────────────────────────────────────────────────────────
-    answer_token_id = load_answer_token_id(args.tokenizer_dir)
-    logger.info(f"answer_token_id = {answer_token_id}")
+    from transformers import AutoTokenizer
+    # Automatically fetch end_think_token_id directly from the tokenizer
+    # Since </think> is already in the Qwen3 register as the user specified
+    tok = AutoTokenizer.from_pretrained(args.hf_repo if "hf_repo" in args else "shreethar/stage1_unsloth", trust_remote_code=True)
+    think_end_token_id = tok.convert_tokens_to_ids("</think>")
+    if think_end_token_id is None or think_end_token_id == tok.unk_token_id:
+        think_end_token_id = tok.encode("</think>", add_special_tokens=False)[-1]
+    
+    answer_token_id = think_end_token_id
+    logger.info(f"Dynamically fetched </think> token ID for distillation target: {answer_token_id}")
 
     # ── Config ─────────────────────────────────────────────────────────────
     cfg = Stage2Config(
@@ -700,6 +711,7 @@ if __name__ == "__main__":
         batch_size=args.batch_size,
         num_workers=args.num_workers,
         max_length=args.max_seq_len,
+        subset_ratio=args.subset_ratio,
     )
     logger.info(f"DataLoader ready: {len(dataloader.dataset):,} samples.")
 
