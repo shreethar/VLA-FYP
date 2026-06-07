@@ -288,6 +288,7 @@ def build_stage2_dataloader(
     max_length:   int = 1024,
     shuffle:      bool = True,
     hf_split=None,        # pass a pre-loaded split to skip download
+    subset_ratio: float = 1.0, # Optionally use a percentage of the dataset (e.g. 0.15 for 15%)
 ) -> DataLoader:
     """
     Build the Stage 2 DataLoader.
@@ -325,6 +326,13 @@ def build_stage2_dataloader(
         from datasets import load_dataset
         logger.info(f"Loading HF dataset: {hf_repo} [{split}] …")
         hf_split = load_dataset(hf_repo, split=split)
+
+    if subset_ratio < 1.0:
+        subset_size = int(len(hf_split) * subset_ratio)
+        logger.info(f"Subsetting dataset to {subset_ratio*100:.1f}% ({subset_size} samples)")
+        # Make sure to shuffle the subset selection so we don't just take the first N
+        # Seed ensures reproducibility if needed, but here we just take a random slice
+        hf_split = hf_split.shuffle(seed=42).select(range(subset_size))
 
     dataset = Stage2Dataset(hf_split, processor=processor, max_length=max_length)
 
