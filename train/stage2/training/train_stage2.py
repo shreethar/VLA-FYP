@@ -339,7 +339,7 @@ def train_stage2(
     # ------------------------------------------------------------------
     logger.info("Building Teacher …")
     teacher = GRPOTeacher(
-        model_name=cfg.base_model_name,
+        pretrained_model_name_or_path=cfg.base_model_name,
         G=cfg.G,
         answer_token_id=answer_token_id, # This is now the think_end_token_id under the hood
         lora_rank=cfg.lora_rank,
