@@ -324,14 +324,14 @@ def build_stage2_dataloader(
     """
     if hf_split is None:
         from datasets import load_dataset
-        logger.info(f"Loading HF dataset: {hf_repo} [{split}] …")
+        logger.info(f"Loading HF dataset directly via Parquet: {hf_repo} [{split}] …")
         try:
-            # Explicitly specify data_files so HF datasets doesn't download the massive train split
-            # just to give us the test split.
-            data_files = {split: f"data/{split}-*.parquet"}
-            hf_split = load_dataset(hf_repo, data_files=data_files, split=split)
+            # Explicitly load just the parquet files for this split, ignoring dataset metadata
+            # which might complain if other splits (e.g. 'train') are missing.
+            data_files = {split: f"hf://datasets/{hf_repo}/data/{split}-*.parquet"}
+            hf_split = load_dataset("parquet", data_files=data_files, split=split)
         except Exception as e:
-            logger.warning(f"Failed to load with specific data_files: {e}. Falling back to default load_dataset...")
+            logger.warning(f"Failed to load via parquet explicitly: {e}. Falling back to default load_dataset...")
             hf_split = load_dataset(hf_repo, split=split)
 
     if subset_ratio < 1.0:
