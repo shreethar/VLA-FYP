@@ -658,6 +658,8 @@ if __name__ == "__main__":
     parser.add_argument("--batch_size",    type=int, default=4)
     parser.add_argument("--num_workers",   type=int, default=2)
     parser.add_argument("--max_seq_len",   type=int, default=1024)
+    parser.add_argument("--split",         type=str, default="train",
+                        help="HuggingFace dataset split to use (e.g. train, test)")
     parser.add_argument("--subset_ratio",  type=float, default=1.0,
                         help="Train on a smaller percentage of the dataset (e.g. 0.15 for 15%)")
     # Training schedule
@@ -707,7 +709,7 @@ if __name__ == "__main__":
     dataloader = build_stage2_dataloader(
         processor=processor,
         hf_repo=args.hf_repo,
-        split="train",
+        split=args.split,
         batch_size=args.batch_size,
         num_workers=args.num_workers,
         max_length=args.max_seq_len,

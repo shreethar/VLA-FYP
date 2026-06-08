@@ -10,7 +10,7 @@
 set -e
 
 # Replace with the actual path to your Stage 1 checkpoint
-STAGE1_CKPT="checkpoints/stage1_unsloth"
+STAGE1_CKPT="shreethar/stage1_unsloth"
 
 echo "============================================================"
 echo " Starting ThinkFlow-VLA Stage 2 Mini Training"
@@ -26,7 +26,8 @@ mkdir -p "$OUTPUT_DIR"
 python training/train_stage2.py \
     --stage1_ckpt "$STAGE1_CKPT" \
     --output_dir "$OUTPUT_DIR" \
-    --subset_ratio 0.15 \
+    --split "test" \
+    --subset_ratio 1.0 \
     --total_steps 100 \
     --warmup_steps 50 \
     --save_steps 50 \

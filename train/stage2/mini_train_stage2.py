@@ -11,7 +11,7 @@ def main():
     print("============================================================")
 
     # Replace with the actual path to your Stage 1 checkpoint
-    stage1_ckpt = "checkpoints/stage1_unsloth"
+    stage1_ckpt = "shreethar/stage1_unsloth"
     output_dir = "checkpoints/stage2_mini"
 
     # Create the output directory for this test run
@@ -25,6 +25,7 @@ def main():
         sys.executable, train_script,
         "--stage1_ckpt", stage1_ckpt,
         "--output_dir", output_dir,
+        "--split", "test",
         "--subset_ratio", "0.15",
         "--total_steps", "100",
         "--warmup_steps", "50",
