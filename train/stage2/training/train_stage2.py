@@ -675,18 +675,6 @@ if __name__ == "__main__":
     parser.add_argument("--no_wandb",      action="store_true", help="Disable WandB logging")
     args = parser.parse_args()
 
-    # ── Tokenizer ──────────────────────────────────────────────────────────
-    from transformers import AutoTokenizer
-    # Automatically fetch end_think_token_id directly from the tokenizer
-    # Since </think> is already in the Qwen3 register as the user specified
-    tok = AutoTokenizer.from_pretrained(args.hf_repo if "hf_repo" in args else "shreethar/stage1_unsloth", trust_remote_code=True)
-    think_end_token_id = tok.convert_tokens_to_ids("</think>")
-    if think_end_token_id is None or think_end_token_id == tok.unk_token_id:
-        think_end_token_id = tok.encode("</think>", add_special_tokens=False)[-1]
-    
-    answer_token_id = think_end_token_id
-    logger.info(f"Dynamically fetched </think> token ID for distillation target: {answer_token_id}")
-
     # ── Config ─────────────────────────────────────────────────────────────
     cfg = Stage2Config(
         stage1_ckpt_dir=args.stage1_ckpt,
@@ -698,6 +686,18 @@ if __name__ == "__main__":
         wandb_run_name=args.wandb_run,
         use_wandb=not args.no_wandb,
     )
+
+    # ── Tokenizer ──────────────────────────────────────────────────────────
+    from transformers import AutoTokenizer
+    # Automatically fetch end_think_token_id directly from the tokenizer
+    # Since </think> is already in the Qwen3 register as the user specified
+    tok = AutoTokenizer.from_pretrained(cfg.base_model_name, trust_remote_code=True)
+    think_end_token_id = tok.convert_tokens_to_ids("</think>")
+    if think_end_token_id is None or think_end_token_id == tok.unk_token_id:
+        think_end_token_id = tok.encode("</think>", add_special_tokens=False)[-1]
+    
+    answer_token_id = think_end_token_id
+    logger.info(f"Dynamically fetched </think> token ID for distillation target: {answer_token_id}")
 
     # ── Processor & Dataloader ─────────────────────────────────────────────
     # Import here so the module can be used without these heavy deps
