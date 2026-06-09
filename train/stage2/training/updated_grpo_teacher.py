@@ -349,13 +349,20 @@ class GRPOTeacher(nn.Module):
         for g in range(G):
             r_g = torch.zeros(batch, device=all_ids[0].device)
             for fn, w in zip(reward_fns, weights):
-                r_g = r_g + w * fn(
+                reward_out = fn(
                     rollout_ids=all_ids[g],
                     rollout_text=all_texts[g],
                     pixel_values=pixel_values,
                     image_grid_thw=image_grid_thw,
                     ground_truth=ground_truth,
-                ).float()
+                )
+                if isinstance(reward_out, torch.Tensor):
+                    reward_out = reward_out.to(r_g.device).float()
+                else:
+                    # In case a reward fn returns a list of floats
+                    reward_out = torch.tensor(reward_out, device=r_g.device, dtype=torch.float32)
+
+                r_g = r_g + w * reward_out
             rewards[g] = r_g
 
         return rewards   # [G, batch]
