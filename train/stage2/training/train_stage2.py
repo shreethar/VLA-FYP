@@ -590,6 +590,26 @@ def train_stage2(
                 }
                 wandb.log(wandb_payload, step=step)
 
+                # ── Rollout Text Logging (every 10 steps) ────────────────
+                if step % 10 == 0:
+                    try:
+                        import wandb
+                        table = wandb.Table(columns=["Batch_Idx", "Rollout_Idx", "Reward", "Advantage", "Text"])
+                        G_len = buffer.rewards.shape[0]
+                        B_len = buffer.rewards.shape[1]
+                        for b in range(B_len):
+                            for g in range(G_len):
+                                table.add_data(
+                                    b, 
+                                    g, 
+                                    float(buffer.rewards[g, b].cpu()), 
+                                    float(buffer.advantages[g, b].cpu()), 
+                                    buffer.rollout_texts[g][b]
+                                )
+                        wandb.log({"rollouts/generation_samples": table}, step=step)
+                    except Exception as e:
+                        logger.warning(f"Failed to log wandb rollout table: {e}")
+
         # Gradient norm logging (less frequent)
         if step % cfg.grad_log_steps == 0:
             from training.student_losses import StudentLossComputer
