@@ -457,77 +457,83 @@ class GRPOTeacher(nn.Module):
             self._ref_model.to(device)
 
         for g in range(G):
-            # 1. Slice rollout
-            batch_ids = all_ids[g]      # [B, seq_g]
-            batch_masks = all_masks[g]  # [B, seq_g]
-            
-            # Response mask & lengths
-            resp_mask = torch.zeros_like(batch_ids, dtype=torch.float)
-            resp_mask[:, prompt_len:] = (batch_ids[:, prompt_len:] != 0).float()
-            resp_lens = resp_mask.sum(dim=-1).clamp(min=1)  # [B]
+            for b_idx in range(B):
+                # 1. Slice rollout to EXACTLY 1 sequence (Absolute minimum peak VRAM)
+                batch_id = all_ids[g][b_idx:b_idx+1]      # [1, seq_g]
+                batch_mask = all_masks[g][b_idx:b_idx+1]  # [1, seq_g]
+                
+                # Response mask & lengths
+                resp_mask = torch.zeros_like(batch_id, dtype=torch.float)
+                resp_mask[:, prompt_len:] = (batch_id[:, prompt_len:] != 0).float()
+                resp_lens = resp_mask.sum(dim=-1).clamp(min=1)  # [1]
 
-            # 2. Forward pass for just this chunk
-            inputs_embeds = self._build_input_embeds(
-                batch_ids, pixel_values, image_grid_thw
-            )
-            out = self.vlm(
-                inputs_embeds=inputs_embeds,
-                attention_mask=batch_masks,
-                use_cache=False,
-                return_dict=True,
-            )
-            logits = out.logits  # [B, seq_g, vocab]
-
-            # 3. Log-probs
-            target_ids = batch_ids[:, 1:]
-            logits_shifted = logits[:, :-1, :]
-            target_logits = logits_shifted.gather(dim=-1, index=target_ids.unsqueeze(-1)).squeeze(-1)
-            token_log_p = target_logits - torch.logsumexp(logits_shifted, dim=-1) # [B, seq-1]
-
-            # Mean log-prob per response
-            resp_mask_shifted = resp_mask[:, 1:]
-            mean_log_p = (token_log_p * resp_mask_shifted).sum(dim=-1) / resp_lens  # [B]
-
-            # 4. Rollout Loss
-            adv_g = advantages[g, :]  # [B]
-            loss_g = -(adv_g * mean_log_p).mean() / G  # scaled by 1/G
-            
-            # 5. KL Loss
-            kl_g = torch.tensor(0.0, device=device)
-            if self.kl_coef > 0:
-                with torch.no_grad(), torch.cuda.amp.autocast(dtype=torch.float16):
-                    ref_out = self._ref_model(
-                        inputs_embeds=inputs_embeds.detach(),
-                        attention_mask=batch_masks,
-                        use_cache=False,
-                        return_dict=True,
-                    )
-                    ref_logits = ref_out.logits[:, :-1, :]
-                    ref_target_logits = ref_logits.gather(dim=-1, index=target_ids.unsqueeze(-1)).squeeze(-1)
-                    ref_token_p = ref_target_logits - torch.logsumexp(ref_logits, dim=-1)
+                # 2. Correctly slice the flattened image patches for this specific sequence
+                if pixel_values is not None:
+                    thw = image_grid_thw[b_idx:b_idx+1]  # [1, 3]
+                    num_patches = thw.prod(dim=-1).item()
                     
-                    kl = (token_log_p.detach() - ref_token_p) * resp_mask_shifted
-                    kl_per_token = kl.sum(dim=-1) / resp_lens
-                    kl_g = (self.kl_coef * kl_per_token.mean()) / G
+                    offset = 0 if b_idx == 0 else image_grid_thw[:b_idx].prod(dim=-1).sum().item()
+                    pv = pixel_values[offset : offset + num_patches]
+                else:
+                    pv = None
+                    thw = None
 
-            # 6. Backward pass FOR THIS CHUNK ONLY!
-            # Frees the massive intermediate tensors immediately.
-            chunk_loss = loss_g + kl_g
-            chunk_loss.backward()
-            
-            total_rollout_loss += (loss_g.item() * G)  # un-scale for logging
-            total_kl_loss += (kl_g.item() * G)
-            
-            # Explicitly delete all massive intermediate tensors BEFORE the next 
-            # iteration's forward pass begins! If we don't do this, Python holds 
-            # them in local scope during the next vlm() call, doubling peak VRAM!
-            del out, logits, inputs_embeds, logits_shifted
-            del target_logits, token_log_p, chunk_loss, loss_g
-            if self.kl_coef > 0:
-                del ref_out, ref_logits, ref_target_logits, ref_token_p, kl_g
-            
-            # Force CUDA to release the freed blocks back to the OS allocator
-            torch.cuda.empty_cache()
+                # 3. Forward pass for just ONE sequence
+                inputs_embeds = self._build_input_embeds(batch_id, pv, thw)
+                out = self.vlm(
+                    inputs_embeds=inputs_embeds,
+                    attention_mask=batch_mask,
+                    use_cache=False,
+                    return_dict=True,
+                )
+                logits = out.logits  # [1, seq_g, vocab]
+
+                # 4. Log-probs
+                target_ids = batch_id[:, 1:]
+                logits_shifted = logits[:, :-1, :]
+                target_logits = logits_shifted.gather(dim=-1, index=target_ids.unsqueeze(-1)).squeeze(-1)
+                token_log_p = target_logits - torch.logsumexp(logits_shifted, dim=-1) # [1, seq-1]
+
+                # Mean log-prob per response
+                resp_mask_shifted = resp_mask[:, 1:]
+                mean_log_p = (token_log_p * resp_mask_shifted).sum(dim=-1) / resp_lens  # [1]
+
+                # 5. Rollout Loss
+                adv_g = advantages[g, b_idx:b_idx+1]  # [1]
+                loss_gb = -(adv_g * mean_log_p).mean() / (G * B)  # scaled by 1/(G*B)
+                
+                # 6. KL Loss
+                kl_gb = torch.tensor(0.0, device=device)
+                if self.kl_coef > 0:
+                    with torch.no_grad(), torch.cuda.amp.autocast(dtype=torch.float16):
+                        ref_out = self._ref_model(
+                            inputs_embeds=inputs_embeds.detach(),
+                            attention_mask=batch_mask,
+                            use_cache=False,
+                            return_dict=True,
+                        )
+                        ref_logits = ref_out.logits[:, :-1, :]
+                        ref_target_logits = ref_logits.gather(dim=-1, index=target_ids.unsqueeze(-1)).squeeze(-1)
+                        ref_token_p = ref_target_logits - torch.logsumexp(ref_logits, dim=-1)
+                        
+                        kl = (token_log_p.detach() - ref_token_p) * resp_mask_shifted
+                        kl_per_token = kl.sum(dim=-1) / resp_lens
+                        kl_gb = (self.kl_coef * kl_per_token.mean()) / (G * B)
+
+                # 7. Backward pass FOR THIS 1-ITEM CHUNK ONLY!
+                chunk_loss = loss_gb + kl_gb
+                chunk_loss.backward()
+                
+                total_rollout_loss += (loss_gb.item() * G * B)  # un-scale for logging
+                total_kl_loss += (kl_gb.item() * G * B)
+                
+                # Explicitly delete massive tensors BEFORE next micro-batch!
+                del out, logits, inputs_embeds, logits_shifted
+                del target_logits, token_log_p, chunk_loss, loss_gb
+                if self.kl_coef > 0:
+                    del ref_out, ref_logits, ref_target_logits, ref_token_p, kl_gb
+                
+                torch.cuda.empty_cache()
 
         if self.kl_coef > 0:
             self._ref_model.cpu()
