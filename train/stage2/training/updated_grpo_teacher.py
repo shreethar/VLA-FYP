@@ -730,7 +730,7 @@ class GRPOTeacher(nn.Module):
             tau_neg_response_mask=tau_neg_response,
             answer_token_pos=think_end_pos,
             h_T=h_T,
-            grpo_loss=grpo_loss.item(),
+            grpo_loss=grpo_loss_val.item(),
         )
 
         return buffer
