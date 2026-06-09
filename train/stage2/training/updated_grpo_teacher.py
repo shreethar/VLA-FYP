@@ -210,8 +210,9 @@ class GRPOTeacher(nn.Module):
             embeds = embeds.clone()
             
             if not isinstance(img_feats, torch.Tensor):
-                # Typically BaseModelOutputWithPooling where [0] or .last_hidden_state is the tensor
-                img_feats = img_feats[0]
+                # Qwen3_5/Qwen2VL returns BaseModelOutputWithPooling where last_hidden_state is unmerged
+                # and pooler_output is the projected/merged 2560-dim tensor.
+                img_feats = getattr(img_feats, 'pooler_output', img_feats[0])
                 
             embeds[mask] = img_feats.to(embeds.dtype)
         return embeds

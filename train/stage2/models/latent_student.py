@@ -310,6 +310,8 @@ class LatentStudent(nn.Module):
                 mask = (input_ids == self._image_token_id)   # [batch, seq]
                 if mask.any():
                     embeds = embeds.clone()
+                    if not isinstance(img_feats, torch.Tensor):
+                        img_feats = getattr(img_feats, 'pooler_output', img_feats[0])
                     embeds[mask] = img_feats.to(embeds.dtype)
 
         return embeds   # [batch, seq, d]
