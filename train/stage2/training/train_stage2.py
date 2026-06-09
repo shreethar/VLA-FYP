@@ -258,6 +258,12 @@ def load_checkpoint(
 # Main training function
 # ---------------------------------------------------------------------------
 
+def log_memory(tag: str):
+    if torch.cuda.is_available():
+        allocated = torch.cuda.memory_allocated() / (1024**3)
+        reserved = torch.cuda.memory_reserved() / (1024**3)
+        logger.info(f"[Memory] {tag}: Allocated={allocated:.2f} GB | Reserved={reserved:.2f} GB")
+
 def train_stage2(
     cfg: Stage2Config,
     dataloader: DataLoader,
@@ -337,6 +343,8 @@ def train_stage2(
     # ------------------------------------------------------------------
     # 2. Build models
     # ------------------------------------------------------------------
+    log_memory("Before loading models")
+
     logger.info("Building Teacher …")
     teacher = GRPOTeacher(
         pretrained_model_name_or_path=cfg.base_model_name,
@@ -349,6 +357,8 @@ def train_stage2(
         kl_coef=cfg.kl_coef,
     ).to(device)
 
+    log_memory("After Teacher loaded")
+
     logger.info("Building Student …")
     student = LatentStudent(
         model_name=cfg.base_model_name,
@@ -359,6 +369,8 @@ def train_stage2(
         end_think_token_id=answer_token_id,
     ).to(device)
 
+    log_memory("After Student loaded")
+
     logger.info("Building Verbalizer …")
     verbalizer = Verbalizer(
         model_name=cfg.verbalizer_name,
@@ -366,6 +378,8 @@ def train_stage2(
         lora_rank=cfg.verbalizer_lora_rank,
         lora_alpha=cfg.verbalizer_lora_rank * 2,
     ).to(device)
+
+    log_memory("After Verbalizer loaded")
 
     # Load Stage 1 checkpoint into both Teacher and Student
     # (identical init — they diverge from here via their respective objectives)
@@ -454,6 +468,8 @@ def train_stage2(
         # B. Teacher GRPO step
         #    Internally: rollouts → score → GRPO backward → step → h_T
         # ----------------------------------------------------------------
+        log_memory(f"Step {step} - Before Teacher")
+
         buffer: RolloutBuffer = teacher.training_step(
             input_ids=input_ids,
             pixel_values=pixel_values,
@@ -467,6 +483,7 @@ def train_stage2(
             grad_clip=cfg.grad_clip,
         )
         teacher_sched.step()
+        log_memory(f"Step {step} - After Teacher")
 
         # ----------------------------------------------------------------
         # C. Verbalizer freeze transition at warmup_steps
@@ -489,6 +506,7 @@ def train_stage2(
             gt_waypoints=gt_waypoints,
             global_step=step,
         )
+        log_memory(f"Step {step} - After Student/Verbalizer Forward")
 
         # ----------------------------------------------------------------
         # E. Backward passes — phase dependent
@@ -524,6 +542,8 @@ def train_stage2(
             )
             student_opt.step()
             student_sched.step()
+
+        log_memory(f"Step {step} - After Backprop")
 
         # ----------------------------------------------------------------
         # F. Logging  (console + WandB)
