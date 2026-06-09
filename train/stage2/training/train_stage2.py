@@ -593,7 +593,6 @@ def train_stage2(
                 # ── Rollout Text Logging (every 10 steps) ────────────────
                 if step % 10 == 0:
                     try:
-                        import wandb
                         table = wandb.Table(columns=["Batch_Idx", "Rollout_Idx", "Reward", "Advantage", "Text"])
                         G_len = buffer.rewards.shape[0]
                         B_len = buffer.rewards.shape[1]
