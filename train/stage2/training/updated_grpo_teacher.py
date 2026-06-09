@@ -517,6 +517,17 @@ class GRPOTeacher(nn.Module):
             
             total_rollout_loss += (loss_g.item() * G)  # un-scale for logging
             total_kl_loss += (kl_g.item() * G)
+            
+            # Explicitly delete all massive intermediate tensors BEFORE the next 
+            # iteration's forward pass begins! If we don't do this, Python holds 
+            # them in local scope during the next vlm() call, doubling peak VRAM!
+            del out, logits, inputs_embeds, logits_shifted
+            del target_logits, token_log_p, chunk_loss, loss_g
+            if self.kl_coef > 0:
+                del ref_out, ref_logits, ref_target_logits, ref_token_p, kl_g
+            
+            # Force CUDA to release the freed blocks back to the OS allocator
+            torch.cuda.empty_cache()
 
         if self.kl_coef > 0:
             self._ref_model.cpu()
