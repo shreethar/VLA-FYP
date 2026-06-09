@@ -445,92 +445,84 @@ class GRPOTeacher(nn.Module):
         device = all_ids[0].device
         # total_loss = torch.tensor(0.0, device=device)
 
-        # Step A: Pad all GxB sequences to the same lenght
-        max_len = max(ids.shape[1] for ids in all_ids)
-
-        padded_ids = torch.zeros(G, B, max_len, dtype=torch.long, device=device)
-        padded_masks = torch.zeros(G, B, max_len, dtype=torch.long, device=device)
+        # ── Step B: Chunked Forward & Backward Pass ───────────────────────
+        # By processing one rollout group (B sequences) at a time and calling 
+        # .backward(), PyTorch instantly frees the massive activation memory and 
+        # gradient tensors. Peak VRAM becomes B instead of G*B!
+        
+        total_rollout_loss = 0.0
+        total_kl_loss = 0.0
+        
+        if self.kl_coef > 0:
+            self._ref_model.to(device)
 
         for g in range(G):
-            L = all_ids[g].shape[1]
-            padded_ids[g, :, :L]   = all_ids[g]
-            padded_masks[g, :, :L] = all_masks[g]
-
-        # Step B: Flatten G and B into one big batch
-        flat_ids   = padded_ids.reshape(G * B, max_len)     # [G*B, seq]
-        flat_masks = padded_masks.reshape(G * B, max_len)   # [G*B, seq]
-        
-        # Build labels: -100 on prompt tokens
-        flat_labels = flat_ids.clone()
-        flat_labels[:, :prompt_len] = -100
-
-        # Response mask & lengths
-        resp_mask = torch.zeros_like(flat_ids, dtype=torch.float)
-        resp_mask[:, prompt_len:] = (flat_ids[:, prompt_len:] != 0).float()
-        resp_lens = resp_mask.sum(dim=-1).clamp(min=1)      # [G*B]
-
-        # ── Step C: ONE forward pass ──────────────────────────────────────
-
-        if pixel_values is not None:
-            pv_flat = pixel_values.repeat_interleave(G, dim=0)
-            thw_flat = image_grid_thw.repeat_interleave(G, dim=0) if image_grid_thw is not None else None
-        else:
-            pv_flat, thw_flat = None, None
+            # 1. Slice rollout
+            batch_ids = all_ids[g]      # [B, seq_g]
+            batch_masks = all_masks[g]  # [B, seq_g]
             
-        inputs_embeds = self._build_input_embeds(
-            flat_ids, pv_flat, thw_flat
-        )
-        
-        out = self.vlm(
-            inputs_embeds=inputs_embeds,
-            attention_mask=flat_masks,
-            use_cache=False,
-            return_dict=True,
-        )
-        logits = out.logits                                   # [G*B, seq, vocab]
+            # Response mask & lengths
+            resp_mask = torch.zeros_like(batch_ids, dtype=torch.float)
+            resp_mask[:, prompt_len:] = (batch_ids[:, prompt_len:] != 0).float()
+            resp_lens = resp_mask.sum(dim=-1).clamp(min=1)  # [B]
 
-        # Memory-efficient per-token log-probs (prevents OOM on 248k vocab)
-        target_ids = flat_ids[:, 1:]                           # [G*B, seq-1]
-        logits_shifted = logits[:, :-1, :]                     # [G*B, seq-1, vocab]
-        
-        # We manually compute log_softmax to avoid .transpose() which forces a massive .contiguous() copy
-        target_logits = logits_shifted.gather(dim=-1, index=target_ids.unsqueeze(-1)).squeeze(-1)
-        token_log_p = target_logits - torch.logsumexp(logits_shifted, dim=-1) # [G*B, seq-1]
+            # 2. Forward pass for just this chunk
+            inputs_embeds = self._build_input_embeds(
+                batch_ids, pixel_values, image_grid_thw
+            )
+            out = self.vlm(
+                inputs_embeds=inputs_embeds,
+                attention_mask=batch_masks,
+                use_cache=False,
+                return_dict=True,
+            )
+            logits = out.logits  # [B, seq_g, vocab]
 
-        # Mask to response tokens, average over response length
-        resp_mask_shifted = resp_mask[:, 1:]                   # [G*B, seq-1]
-        mean_log_p = (token_log_p * resp_mask_shifted).sum(dim=-1) / resp_lens
-        # [G*B]
+            # 3. Log-probs
+            target_ids = batch_ids[:, 1:]
+            logits_shifted = logits[:, :-1, :]
+            target_logits = logits_shifted.gather(dim=-1, index=target_ids.unsqueeze(-1)).squeeze(-1)
+            token_log_p = target_logits - torch.logsumexp(logits_shifted, dim=-1) # [B, seq-1]
 
-        # Reshape back to [G, B]
-        mean_log_p = mean_log_p.reshape(G, B)
+            # Mean log-prob per response
+            resp_mask_shifted = resp_mask[:, 1:]
+            mean_log_p = (token_log_p * resp_mask_shifted).sum(dim=-1) / resp_lens  # [B]
 
+            # 4. Rollout Loss
+            adv_g = advantages[g, :]  # [B]
+            loss_g = -(adv_g * mean_log_p).mean() / G  # scaled by 1/G
+            
+            # 5. KL Loss
+            kl_g = torch.tensor(0.0, device=device)
+            if self.kl_coef > 0:
+                with torch.no_grad(), torch.cuda.amp.autocast(dtype=torch.float16):
+                    ref_out = self._ref_model(
+                        inputs_embeds=inputs_embeds.detach(),
+                        attention_mask=batch_masks,
+                        use_cache=False,
+                        return_dict=True,
+                    )
+                    ref_logits = ref_out.logits[:, :-1, :]
+                    ref_target_logits = ref_logits.gather(dim=-1, index=target_ids.unsqueeze(-1)).squeeze(-1)
+                    ref_token_p = ref_target_logits - torch.logsumexp(ref_logits, dim=-1)
+                    
+                    kl = (token_log_p.detach() - ref_token_p) * resp_mask_shifted
+                    kl_per_token = kl.sum(dim=-1) / resp_lens
+                    kl_g = (self.kl_coef * kl_per_token.mean()) / G
 
-       # ── Step D: GRPO loss (vectorised over G and B) ───────────────────
-        rollout_loss = -(advantages * mean_log_p).mean()       # scalar
+            # 6. Backward pass FOR THIS CHUNK ONLY!
+            # Frees the massive intermediate tensors immediately.
+            chunk_loss = loss_g + kl_g
+            chunk_loss.backward()
+            
+            total_rollout_loss += (loss_g.item() * G)  # un-scale for logging
+            total_kl_loss += (kl_g.item() * G)
 
-        # ── Optional KL (also batched) ────────────────────────────────────
-        kl_loss = torch.tensor(0.0, device=device)
         if self.kl_coef > 0:
-            self._ref_model.to(device)                          # move to GPU
-            with torch.no_grad(), torch.cuda.amp.autocast(dtype=torch.float16):
-                ref_out = self._ref_model(
-                    inputs_embeds=inputs_embeds.detach(),
-                    attention_mask=flat_masks,
-                    use_cache=False,
-                    return_dict=True,
-                )
-                ref_logits  = ref_out.logits[:, :-1, :]
-                ref_target_logits = ref_logits.gather(dim=-1, index=target_ids.unsqueeze(-1)).squeeze(-1)
-                ref_token_p = ref_target_logits - torch.logsumexp(ref_logits, dim=-1)
-                kl = (token_log_p.detach() - ref_token_p) * resp_mask_shifted
-                kl_per_token = kl.sum(dim=-1) / resp_lens      # [G*B]
-                kl_loss = self.kl_coef * kl_per_token.mean()
-
             self._ref_model.cpu()
             torch.cuda.empty_cache()
 
-        return rollout_loss + kl_loss
+        return torch.tensor(total_rollout_loss + total_kl_loss, device=device)
 
     # -----------------------------------------------------------------------
     # Step 5 + 6: Identify τ+/τ- and extract h_T
@@ -693,13 +685,13 @@ class GRPOTeacher(nn.Module):
         # --- Step 3: Advantages --------------------------------------------
         advantages = self.compute_advantages(rewards)   # [G, batch]
 
-        # --- Step 4: GRPO loss + Teacher update ----------------------------
         optimizer.zero_grad()
-        grpo_loss = self.compute_grpo_loss(
+        # compute_grpo_loss now internally chunks the forward/backward passes 
+        # to prevent OOM. Gradients are automatically accumulated.
+        grpo_loss_val = self.compute_grpo_loss(
             all_ids, all_masks, advantages,
             pixel_values, image_grid_thw, prompt_len,
         )
-        grpo_loss.backward()
         nn.utils.clip_grad_norm_(self.vlm.parameters(), grad_clip)
         optimizer.step()
 
