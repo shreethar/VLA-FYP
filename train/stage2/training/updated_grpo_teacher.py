@@ -208,6 +208,11 @@ class GRPOTeacher(nn.Module):
                 img_feats = (self.vlm.model.model.visual(pixel_values, grid_thw=image_grid_thw) if image_grid_thw is not None else self.vlm.model.model.visual(pixel_values))
             mask = (input_ids == self.vlm.config.image_token_id)
             embeds = embeds.clone()
+            
+            if not isinstance(img_feats, torch.Tensor):
+                # Typically BaseModelOutputWithPooling where [0] or .last_hidden_state is the tensor
+                img_feats = img_feats[0]
+                
             embeds[mask] = img_feats.to(embeds.dtype)
         return embeds
 
