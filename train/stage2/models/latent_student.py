@@ -221,6 +221,15 @@ class LatentStudent(nn.Module):
         )
         self.vlm = get_peft_model(base, lora_cfg)
 
+        # Explicitly enable gradient checkpointing for the Student
+        # The enable_input_require_grads() is MANDATORY because PEFT freezes the embedding
+        # layer, which otherwise causes PyTorch to silently skip checkpointing entirely!
+        self.vlm.enable_input_require_grads()
+        self.vlm.gradient_checkpointing_enable(
+            gradient_checkpointing_kwargs={"use_reentrant": False}
+        )
+        self.vlm.config.use_cache = False
+
         if new_vocab_size > 0:
             self.vlm.resize_token_embeddings(new_vocab_size)
 

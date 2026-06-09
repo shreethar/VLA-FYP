@@ -185,6 +185,15 @@ class Verbalizer(nn.Module):
         )
         self.lm = get_peft_model(base, lora_cfg)
 
+        # Explicitly enable gradient checkpointing for the Verbalizer
+        # The enable_input_require_grads() is MANDATORY because PEFT freezes the embedding
+        # layer, which otherwise causes PyTorch to silently skip checkpointing entirely!
+        self.lm.enable_input_require_grads()
+        self.lm.gradient_checkpointing_enable(
+            gradient_checkpointing_kwargs={"use_reentrant": False}
+        )
+        self.lm.config.use_cache = False
+
         # Infer verbalizer hidden dim and layer count from config
         self.hidden_dim: int = self.lm.config.hidden_size        # 1024 for 0.8B
         self.num_layers: int = self.lm.config.num_hidden_layers  # 24 for 0.8B
