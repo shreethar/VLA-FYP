@@ -347,20 +347,18 @@ class Verbalizer(nn.Module):
         """
         logits, _ = self._forward_with_latents(input_ids, attention_mask, latents)
 
-        # log-softmax over vocab
-        log_probs_all = F.log_softmax(logits, dim=-1)  # [batch, seq, vocab]
-
-        # Shift to align: logits at position i predict token i+1
-        # Predicted log-prob of token i+1 is log_probs_all[:, i, token_{i+1}]
-        shift_log_probs = log_probs_all[:, :-1, :]         # [batch, seq-1, vocab]
+        # Memory-efficient manual log-probs (avoids allocating [batch, seq, vocab] tensor)
+        shift_logits = logits[:, :-1, :]                    # [batch, seq-1, vocab]
         shift_labels    = input_ids[:, 1:]                  # [batch, seq-1]
         shift_mask      = response_mask[:, 1:]              # [batch, seq-1]
 
-        # Gather the log-prob of each ground-truth token
-        token_log_probs = shift_log_probs.gather(
+        # Gather the logit of each ground-truth token
+        target_logits = shift_logits.gather(
             dim=-1,
             index=shift_labels.unsqueeze(-1),
         ).squeeze(-1)  # [batch, seq-1]
+        
+        token_log_probs = target_logits - torch.logsumexp(shift_logits, dim=-1) # [batch, seq-1]
 
         # Sum over response positions only
         seq_log_probs = (token_log_probs * shift_mask).sum(dim=-1)  # [batch]

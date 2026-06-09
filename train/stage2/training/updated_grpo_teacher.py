@@ -491,11 +491,11 @@ class GRPOTeacher(nn.Module):
 
         # Memory-efficient per-token log-probs (prevents OOM on 248k vocab)
         target_ids = flat_ids[:, 1:]                           # [G*B, seq-1]
-        token_log_p = -F.cross_entropy(
-            logits[:, :-1, :].transpose(1, 2),                 # [G*B, vocab, seq-1]
-            target_ids,
-            reduction='none'
-        )                                                      # [G*B, seq-1]
+        logits_shifted = logits[:, :-1, :]                     # [G*B, seq-1, vocab]
+        
+        # We manually compute log_softmax to avoid .transpose() which forces a massive .contiguous() copy
+        target_logits = logits_shifted.gather(dim=-1, index=target_ids.unsqueeze(-1)).squeeze(-1)
+        token_log_p = target_logits - torch.logsumexp(logits_shifted, dim=-1) # [G*B, seq-1]
 
         # Mask to response tokens, average over response length
         resp_mask_shifted = resp_mask[:, 1:]                   # [G*B, seq-1]
@@ -520,12 +520,9 @@ class GRPOTeacher(nn.Module):
                     use_cache=False,
                     return_dict=True,
                 )
-                ref_logits  = ref_out.logits
-                ref_token_p = -F.cross_entropy(
-                    ref_logits[:, :-1, :].transpose(1, 2),
-                    target_ids,
-                    reduction='none'
-                )
+                ref_logits  = ref_out.logits[:, :-1, :]
+                ref_target_logits = ref_logits.gather(dim=-1, index=target_ids.unsqueeze(-1)).squeeze(-1)
+                ref_token_p = ref_target_logits - torch.logsumexp(ref_logits, dim=-1)
                 kl = (token_log_p.detach() - ref_token_p) * resp_mask_shifted
                 kl_per_token = kl.sum(dim=-1) / resp_lens      # [G*B]
                 kl_loss = self.kl_coef * kl_per_token.mean()
