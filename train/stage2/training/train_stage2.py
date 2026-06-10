@@ -738,6 +738,7 @@ if __name__ == "__main__":
     parser.add_argument("--total_steps",   type=int, default=4500)
     parser.add_argument("--warmup_steps",  type=int, default=3000)
     parser.add_argument("--save_steps",    type=int, default=500)
+    parser.add_argument("--log_steps",     type=int, default=10, help="Frequency of console and WandB metrics logging")
     # WandB
     parser.add_argument("--wandb_project", type=str, default="reasonflow-vla")
     parser.add_argument("--wandb_run",     type=str, default="stage2-distillation")
@@ -751,6 +752,7 @@ if __name__ == "__main__":
         total_steps=args.total_steps,
         warmup_steps=args.warmup_steps,
         save_steps=args.save_steps,
+        log_steps=args.log_steps,
         wandb_project=args.wandb_project,
         wandb_run_name=args.wandb_run,
         use_wandb=not args.no_wandb,
