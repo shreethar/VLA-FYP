@@ -613,7 +613,6 @@ def train_stage2(
                     "verbalizer/ca_gate":       torch.sigmoid(verbalizer.ca_blocks[0].gate).item(),
                     "global_step":              step,
                 }
-                wandb.log(wandb_payload)
 
                 # ── Rollout Text Logging (every 10 steps) ────────────────
                 if step % 10 == 0:
@@ -630,7 +629,7 @@ def train_stage2(
                                     float(buffer.advantages[g, b].cpu()), 
                                     buffer.rollout_texts[g][b]
                                 )
-                        wandb.log({"rollouts/generation_samples": table})
+                        wandb_payload["rollouts/generation_samples"] = table
                     except Exception as e:
                         logger.warning(f"Failed to log wandb rollout table: {e}")
 
@@ -656,24 +655,23 @@ def train_stage2(
                         gen_texts = tokenizer.batch_decode(generated_ids, skip_special_tokens=True)
                         for b, txt in enumerate(gen_texts):
                             verbalizer_table.add_data(b, txt)
-                        wandb.log({"rollouts/verbalizer_samples": verbalizer_table})
+                        wandb_payload["rollouts/verbalizer_samples"] = verbalizer_table
                     except Exception as e:
                         logger.warning(f"Failed to log wandb verbalizer table: {e}")
 
-        # Gradient norm logging (less frequent)
-        if step % cfg.grad_log_steps == 0:
-            from training.student_losses import StudentLossComputer
-            grad_norms = StudentLossComputer.log_student_grad_norms(student)
-            logger.info(
-                f"  grad_norm/lora={grad_norms.get('grad_norm/lora_total', 0):.4f} | "
-                f"  grad_norm/spatial={grad_norms.get('grad_norm/spatial_total', 0):.4f}"
-            )
-            if use_wandb:
-                wandb.log({
-                    "grad/lora_total":    grad_norms.get("grad_norm/lora_total",    0.0),
-                    "grad/spatial_total": grad_norms.get("grad_norm/spatial_total", 0.0),
-                    "global_step":        step,
-                })
+                # Gradient norm logging (less frequent)
+                if step % cfg.grad_log_steps == 0:
+                    from training.student_losses import StudentLossComputer
+                    grad_norms = StudentLossComputer.log_student_grad_norms(student)
+                    logger.info(
+                        f"  grad_norm/lora={grad_norms.get('grad_norm/lora_total', 0):.4f} | "
+                        f"  grad_norm/spatial={grad_norms.get('grad_norm/spatial_total', 0):.4f}"
+                    )
+                    wandb_payload["grad/lora_total"] = grad_norms.get("grad_norm/lora_total", 0.0)
+                    wandb_payload["grad/spatial_total"] = grad_norms.get("grad_norm/spatial_total", 0.0)
+
+                # Finally, log everything together to keep the x-axis perfectly synced
+                wandb.log(wandb_payload)
 
         # ----------------------------------------------------------------
         # G. Checkpointing
