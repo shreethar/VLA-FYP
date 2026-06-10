@@ -214,6 +214,7 @@ class Stage2Dataset(Dataset):
             messages,
             tokenize=False,
             add_generation_prompt=True,
+            enable_thinking=True,
         )
 
         # ── Tokenize with processor (handles image patches) ───────────────

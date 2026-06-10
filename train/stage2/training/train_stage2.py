@@ -81,7 +81,7 @@ class Stage2Config:
     # Optimizers
     teacher_lr:          float = 1e-4
     student_lr:          float = 2e-4
-    verbalizer_lr:       float = 1e-4
+    verbalizer_lr:       float = 5e-4
     weight_decay:        float = 0.01
 
     # LoRA
