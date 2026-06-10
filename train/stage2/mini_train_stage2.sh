@@ -33,6 +33,6 @@ python training/train_stage2.py \
     --save_steps 50 \
     --wandb_run "stage2-mini-test" \
     --batch_size 4 \
-    --num_workers 2
+    --num_workers 2 2>&1 | tee "$OUTPUT_DIR/training_log.txt"
 
 echo "Mini training complete! Checkpoints saved to $OUTPUT_DIR"
