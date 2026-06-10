@@ -55,3 +55,6 @@ checkpoints/
 
 # WandB
 wandb/
+
+# Logs
+train/stage2/mini_training_log.txt
