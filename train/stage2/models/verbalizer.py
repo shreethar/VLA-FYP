@@ -525,6 +525,40 @@ class Verbalizer(nn.Module):
         """
         self._current_latents = None
 
+    @torch.no_grad()
+    def generate_from_latents(
+        self,
+        input_ids: torch.Tensor,
+        attention_mask: torch.Tensor,
+        latents: torch.Tensor,
+        generation_config=None,
+    ) -> torch.Tensor:
+        """
+        Generate text conditioned on the given latents.
+        This simply sets self._current_latents and calls self.lm.generate.
+        The forward hooks will automatically inject the latents into the layers.
+        """
+        self._current_latents = latents
+        
+        # Turn off caching override if gradient checkpointing is somehow active
+        was_training = self.lm.training
+        self.lm.eval()
+        
+        try:
+            outputs = self.lm.generate(
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                generation_config=generation_config,
+                use_cache=True,
+            )
+        finally:
+            if was_training:
+                self.lm.train()
+            # We don't automatically clear latents here in case the caller wants to 
+            # inspect them, but usually they are cleared later.
+            self.clear_latents()
+            
+        return outputs
 
     def print_trainable_parameters(self):
         self.lm.print_trainable_parameters()

@@ -611,8 +611,9 @@ def train_stage2(
                     "lr/student":               student_sched.get_last_lr()[0],
                     "lr/verbalizer":            (verbalizer_sched.get_last_lr()[0]
                                                  if not verbalizer.is_frozen() else 0.0),
+                    "global_step":              step,
                 }
-                wandb.log(wandb_payload, step=step)
+                wandb.log(wandb_payload)
 
                 # ── Rollout Text Logging (every 10 steps) ────────────────
                 if step % 10 == 0:
@@ -629,9 +630,35 @@ def train_stage2(
                                     float(buffer.advantages[g, b].cpu()), 
                                     buffer.rollout_texts[g][b]
                                 )
-                        wandb.log({"rollouts/generation_samples": table}, step=step)
+                        wandb.log({"rollouts/generation_samples": table})
                     except Exception as e:
                         logger.warning(f"Failed to log wandb rollout table: {e}")
+
+                    # ── Verbalizer Output Logging ────────────────────────────
+                    try:
+                        verbalizer_table = wandb.Table(columns=["Batch_Idx", "Verbalizer_Text"])
+                        from transformers import GenerationConfig
+                        gen_cfg = GenerationConfig(
+                            max_new_tokens=128, 
+                            temperature=0.7, 
+                            do_sample=True, 
+                            pad_token_id=tokenizer.pad_token_id, 
+                            eos_token_id=tokenizer.eos_token_id
+                        )
+                        gen_out = verbalizer.generate_from_latents(
+                            input_ids=batch["input_ids"],
+                            attention_mask=batch["attention_mask"],
+                            latents=loss_out.latents,
+                            generation_config=gen_cfg,
+                        )
+                        prompt_len = batch["input_ids"].shape[1]
+                        generated_ids = gen_out[:, prompt_len:]
+                        gen_texts = tokenizer.batch_decode(generated_ids, skip_special_tokens=True)
+                        for b, txt in enumerate(gen_texts):
+                            verbalizer_table.add_data(b, txt)
+                        wandb.log({"rollouts/verbalizer_samples": verbalizer_table})
+                    except Exception as e:
+                        logger.warning(f"Failed to log wandb verbalizer table: {e}")
 
         # Gradient norm logging (less frequent)
         if step % cfg.grad_log_steps == 0:
@@ -645,7 +672,8 @@ def train_stage2(
                 wandb.log({
                     "grad/lora_total":    grad_norms.get("grad_norm/lora_total",    0.0),
                     "grad/spatial_total": grad_norms.get("grad_norm/spatial_total", 0.0),
-                }, step=step)
+                    "global_step":        step,
+                })
 
         # ----------------------------------------------------------------
         # G. Checkpointing

@@ -60,6 +60,9 @@ class LossOutput:
     # Logging
     metrics: dict = field(default_factory=dict)
 
+    # Saved latents for generation logging
+    latents: Optional[torch.Tensor] = None
+
 
 # Alias for backwards compat if any code references the old name
 StudentLossOutput = LossOutput
@@ -248,6 +251,7 @@ class StudentLossComputer(nn.Module):
             student_total=student_total,
             lm_loss=lm_loss,
             metrics=metrics,
+            latents=z,
         )
 
     # -----------------------------------------------------------------------
