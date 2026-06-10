@@ -209,7 +209,7 @@ class Verbalizer(nn.Module):
                 dropout=ca_dropout,
             )
             for _ in range(self.num_layers)
-        ])
+        ]).to(base.dtype)
 
         # ------------------------------------------------------------------
         # 4. Register forward hooks on each decoder layer
