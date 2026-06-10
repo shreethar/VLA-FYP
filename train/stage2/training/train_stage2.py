@@ -49,7 +49,6 @@ from models.latent_student  import LatentStudent
 from models.verbalizer       import Verbalizer
 from training.grpo_teacher   import GRPOTeacher, RolloutBuffer
 from training.student_losses import StudentLossComputer, build_student_loss_computer
-from tokenizer_setup         import load_answer_token_id
 
 
 logger = logging.getLogger(__name__)
