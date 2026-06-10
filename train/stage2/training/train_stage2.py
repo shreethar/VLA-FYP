@@ -205,14 +205,14 @@ def save_checkpoint(
             "spatial_mlp":    student.spatial_mlp.state_dict(),
             # Verbalizer CA blocks
             "ca_blocks":      verbalizer.ca_blocks.state_dict(),
-            # Optimizers
-            "teacher_opt":    teacher_opt.state_dict(),
-            "student_opt":    student_opt.state_dict(),
-            "verbalizer_opt": verbalizer_opt.state_dict(),
+            # Optimizers (commented out to save space/time)
+            # "teacher_opt":    teacher_opt.state_dict(),
+            # "student_opt":    student_opt.state_dict(),
+            # "verbalizer_opt": verbalizer_opt.state_dict(),
             # Schedulers
-            "teacher_sched":    teacher_sched.state_dict(),
-            "student_sched":    student_sched.state_dict(),
-            "verbalizer_sched": verbalizer_sched.state_dict(),
+            # "teacher_sched":    teacher_sched.state_dict(),
+            # "student_sched":    student_sched.state_dict(),
+            # "verbalizer_sched": verbalizer_sched.state_dict(),
         },
         os.path.join(ckpt_dir, "training_state.pt"),
     )
@@ -241,13 +241,13 @@ def load_checkpoint(
     student.spatial_mlp.load_state_dict(state["spatial_mlp"])
     verbalizer.ca_blocks.load_state_dict(state["ca_blocks"])
 
-    # Restore optimizer and scheduler states
-    teacher_opt.load_state_dict(state["teacher_opt"])
-    student_opt.load_state_dict(state["student_opt"])
-    verbalizer_opt.load_state_dict(state["verbalizer_opt"])
-    teacher_sched.load_state_dict(state["teacher_sched"])
-    student_sched.load_state_dict(state["student_sched"])
-    verbalizer_sched.load_state_dict(state["verbalizer_sched"])
+    # Restore optimizer and scheduler states (commented out)
+    # teacher_opt.load_state_dict(state["teacher_opt"])
+    # student_opt.load_state_dict(state["student_opt"])
+    # verbalizer_opt.load_state_dict(state["verbalizer_opt"])
+    # teacher_sched.load_state_dict(state["teacher_sched"])
+    # student_sched.load_state_dict(state["student_sched"])
+    # verbalizer_sched.load_state_dict(state["verbalizer_sched"])
 
     logger.info(f"Resumed from checkpoint at step {step}")
     return step
