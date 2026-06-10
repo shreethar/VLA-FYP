@@ -1,43 +1,42 @@
 """
 verbalizer.py
 -------------
-Verbalizer (Vψ) for ThinkFlow-VLA Stage 2.
-
-Base model: Qwen3.5-0.8B (hybrid Gated DeltaNet + Attention architecture)
+Verbalizer (Vψ) — ThinkFlow-VLA Stage 2.
+Backbone: Qwen/Qwen3.5-0.8B  (AutoModelForImageTextToText)
 
 Architecture
 ------------
-At EVERY transformer layer, a new CrossAttentionBlock is inserted:
-    h_l  = OriginalTransformerLayer_l(h_{l-1})          ← untouched SA/DeltaNet + FFN
-    h_l  = CrossAttentionBlock_l(Q=h_l, K=z, V=z)      ← new CA reads Student latents
+Base: Qwen3.5-0.8B with LoRA rank=32 on all projection types.
 
-z = stack of Student's M=6 latent vectors, shape [batch, M, d_student].
-Since d_student (2560) ≠ d_verbalizer (1024), each CA block has its own K/V projection.
+At EVERY transformer layer, one CrossAttentionBlock is registered as a
+persistent forward hook (registered ONCE in __init__, lives for the model
+lifetime). The hook reads Student latents from self._current_latents, which
+is set immediately before each forward call and cleared in a try/finally.
 
-Qwen3.5-0.8B architecture:
-  - 24 transformer layers (3:1 Gated DeltaNet : standard Attention)
-  - Hidden dim: 1024
-  - Vocab: 248,320
+Hook pattern (persistent, not per-call):
+    hook(module, input, output):
+        h   = output[0]                     # hidden states — always first element
+        h   = ca_block(h, self._current_latents)
+        return (h,) + output[1:]            # return modified output tuple
 
-Model hierarchy (after PEFT wrapping):
-  self.lm                              → PeftModel
-  self.lm.model                        → Qwen3_5ForCausalLM
-  self.lm.model.model                  → Qwen3_5TextModel (.embed_tokens, .layers, .norm)
-  self.lm.model.lm_head                → Linear
+Model hierarchy after get_peft_model wrapping:
+    self.lm                                   # PeftModel
+    self.lm.model                             # AutoModelForImageTextToText (base)
+    self.lm.model.model                       # Qwen3_5Model (inner)
+    self.lm.model.model.visual                # vision encoder — FROZEN (Verbalizer is text-only)
+    self.lm.model.model.language_model        # transformer stack
+    self.lm.model.model.language_model.embed_tokens
+    self.lm.model.model.language_model.layers # 24 hybrid layers
+    self.lm.model.lm_head                     # output projection
 
-CA injection uses forward hooks on each decoder layer rather than manual
-layer-by-layer forward.  This avoids replicating the complex mask/position
-logic (4D position_ids, separate masks for linear_attention vs full_attention
-layers, rotary embeddings) that Qwen3.5's TextModel.forward() handles internally.
+Forward calls bypass the vision encoder entirely — Verbalizer only processes
+text sequences (τ+/τ−). All forward calls go through language_model directly.
 
 Training schedule (controlled externally by train_stage2.py):
-  Steps 0 – 3000  : warm-up  — CA blocks + LoRA trainable, LM loss on τ+
-  Steps 3000 – 4500: frozen  — all Vψ params frozen, DPO gradient flows into Student
+    Steps 0–3000   : warm-up — LM loss on τ+ (latents DETACHED → Vψ trains, Student does not)
+    Steps 3000–4500: frozen  — DPO loss, Vψ frozen → gradient flows through CA into Student
 
-Loss functions implemented here:
-  compute_lm_loss    : cross-entropy on τ+ tokens     (warm-up phase)
-  compute_dpo_loss   : DPO preference loss on τ+/τ−   (both phases, but only updates
-                       Vψ params during warm-up; Student params always)
+LoRA: rank=32, targets all attention + DeltaNet-specific + FFN projections.
 """
 
 import torch
@@ -45,73 +44,84 @@ import torch.nn as nn
 import torch.nn.functional as F
 from typing import List, Optional, Tuple
 
-from transformers import AutoModelForCausalLM
-from peft import LoraConfig, get_peft_model
+from transformers import AutoModelForImageTextToText
+from peft import LoraConfig, TaskType, get_peft_model
+
+# Architecture constants for Qwen3.5-0.8B
+QWEN35_0_8B_HIDDEN_DIM = 1024
+QWEN35_0_8B_NUM_LAYERS = 24
+
+# Full LoRA target set — mirrors Student (covers all layer types in hybrid arch)
+QWEN35_LORA_TARGETS = [
+    "q_proj", "k_proj", "v_proj", "o_proj",
+    "out_proj",
+    "in_proj_qkv", "in_proj_z", "in_proj_b", "in_proj_a",
+    "gate_proj", "up_proj", "down_proj",
+]
 
 
 # ---------------------------------------------------------------------------
-# Cross-Attention Block (one per Verbalizer transformer layer)
+# CrossAttentionBlock — one instance per transformer layer
 # ---------------------------------------------------------------------------
 
 class CrossAttentionBlock(nn.Module):
     """
-    A single cross-attention block that reads M Student latent vectors.
+    Cross-attends Verbalizer hidden states to Student latents z.
 
-    Q  = hidden states from the current Verbalizer layer  [batch, seq, d_verb]
-    K,V = Student latents z projected to d_verb            [batch, M,   d_verb]
+    Q  = Verbalizer hidden states  [batch, seq, d_verb]
+    K,V = Student latents z, projected from d_student → d_verb
 
-    Output replaces the query sequence via residual + pre-norm:
-        h = LayerNorm(h + MultiheadAttn(Q=h, K=k, V=v))
+    Residual + post-norm applied to the CA output.
+
+    Parameters
+    ----------
+    query_dim : Verbalizer hidden size   (d_verb = 1024)
+    kv_dim    : Student hidden size      (d_student = 2560)
+    num_heads : attention heads inside CA
+    dropout   : dropout on CA weights
     """
 
     def __init__(
         self,
-        query_dim: int,   # Verbalizer hidden size  (d_verb = 1024)
-        kv_dim: int,      # Student hidden size     (d_student = 2560)
+        query_dim: int,
+        kv_dim: int,
         num_heads: int,
         dropout: float = 0.0,
     ):
         super().__init__()
-
         assert query_dim % num_heads == 0, (
             f"query_dim {query_dim} must be divisible by num_heads {num_heads}"
         )
 
-        # Project Student latents into Verbalizer's space for K and V
+        # Project Student latents (d_student) → Verbalizer space (d_verb)
         self.k_proj = nn.Linear(kv_dim, query_dim, bias=False)
         self.v_proj = nn.Linear(kv_dim, query_dim, bias=False)
 
-        # Standard multi-head cross-attention
-        self.attn = nn.MultiheadAttention(
+        self.attn     = nn.MultiheadAttention(
             embed_dim=query_dim,
             num_heads=num_heads,
             dropout=dropout,
             batch_first=True,
         )
-
-        # Pre-norm on queries (applied before attention, following modern practice)
-        self.q_norm = nn.LayerNorm(query_dim, eps=1e-6)
-
-        # Post-norm on residual output
+        self.q_norm   = nn.LayerNorm(query_dim, eps=1e-6)
         self.out_norm = nn.LayerNorm(query_dim, eps=1e-6)
+
+        self.gate = nn.Parameter(torch.tensor(-4.0))
 
     def forward(
         self,
         hidden: torch.Tensor,    # [batch, seq, d_verb]
         latents: torch.Tensor,   # [batch, M, d_student]
     ) -> torch.Tensor:
-        # Project latents → K and V in verbalizer space
-        k = self.k_proj(latents)  # [batch, M, d_verb]
-        v = self.v_proj(latents)  # [batch, M, d_verb]
-
-        # Normalize queries before attention
-        q = self.q_norm(hidden)   # [batch, seq, d_verb]
-
-        # Cross-attention: every verbalizer token attends to all M latents
-        ca_out, _ = self.attn(q, k, v)  # [batch, seq, d_verb]
-
-        # Residual connection + post-norm
-        return self.out_norm(hidden + ca_out)  # [batch, seq, d_verb]
+        k = self.k_proj(latents)                  # [batch, M, d_verb]
+        v = self.v_proj(latents)                  # [batch, M, d_verb]
+        q = self.q_norm(hidden)                   # [batch, seq, d_verb]
+        ca_out, _ = self.attn(q, k, v)            # [batch, seq, d_verb]
+        # return self.out_norm(hidden + ca_out)      # residual + post-norm
+        return hidden  + torch.sigmoid(self.gate) * self.out_norm(ca_out)   # residual + learned gate * CA + post-norm
+        # --> if gate = 0, output becomes hidden (base model's raw state). if i keep our_norm outside, i'd get out_norm(hidden)
+        # which instroduces a subtl normalization shift at step 0. the gated form preserves the base distribution perfectly
+        
 
 
 # ---------------------------------------------------------------------------
@@ -120,39 +130,29 @@ class CrossAttentionBlock(nn.Module):
 
 class Verbalizer(nn.Module):
     """
-    Qwen3.5-0.8B with per-layer cross-attention blocks conditioned on Student latents.
-
-    CA injection uses forward hooks on each decoder layer.  This avoids
-    replicating the complex internal logic of Qwen3.5's TextModel.forward()
-    (4D position_ids, create_causal_mask, separate masks for linear_attention
-    vs full_attention layers, rotary embeddings, etc.).
-
-    Hook mechanism:
-        After each decoder_layer returns hidden_states, a registered
-        post-forward hook applies the corresponding CrossAttentionBlock.
-        The hooks read latents from self._current_latents (set before each
-        forward call).
+    Qwen3.5-0.8B with persistent per-layer CA hooks conditioned on Student latents.
 
     Parameters
     ----------
-    model_name     : HuggingFace repo ID for the 0.8B base model
-    student_hidden : hidden size of the Student VLM (d_student = 2560)
-    lora_rank      : LoRA rank for the base attention layers
-    lora_alpha     : LoRA scaling
-    ca_num_heads   : attention heads inside each CrossAttentionBlock
-    ca_dropout     : dropout in cross-attention (0 during distillation)
-    dpo_beta       : β temperature for DPO loss
+    model_name     : HuggingFace repo ID   (default: unsloth/Qwen3.5-0.8B)
+    student_hidden : Student hidden size   (2560 for Qwen3.5-4B)
+    lora_rank      : LoRA rank             (default: 32)
+    lora_alpha     : LoRA scaling          (default: 64)
+    ca_num_heads   : heads per CA block    (default: 8)
+    ca_dropout     : CA dropout            (default: 0.0)
+    dpo_beta       : β for DPO loss        (default: 0.1)
     """
 
     def __init__(
         self,
-        model_name: str = "Qwen/Qwen3.5-0.8B",
+        model_name: str = "unsloth/Qwen3.5-0.8B",
         student_hidden: int = 2560,
         lora_rank: int = 32,
         lora_alpha: int = 64,
         ca_num_heads: int = 8,
         ca_dropout: float = 0.0,
         dpo_beta: float = 0.1,
+        new_vocab_size: int = -1,           # vocab size after <answer> registration
     ):
         super().__init__()
         self.dpo_beta = dpo_beta
@@ -160,172 +160,192 @@ class Verbalizer(nn.Module):
         # ------------------------------------------------------------------
         # 1. Load Qwen3.5-0.8B
         # ------------------------------------------------------------------
-        base = AutoModelForCausalLM.from_pretrained(
+        base = AutoModelForImageTextToText.from_pretrained(
             model_name,
-            torch_dtype=torch.bfloat16,
+            dtype=torch.bfloat16,
+            device_map="cuda",
+            trust_remote_code=True,
         )
 
         # ------------------------------------------------------------------
-        # 2. Wrap with LoRA
+        # 2. Freeze vision encoder — Verbalizer is text-only.
+        #    τ+/τ− are pure text sequences; the visual head is never used.
         # ------------------------------------------------------------------
-        # Target modules span both layer types in the hybrid architecture:
-        #   - Standard Attention: q_proj, k_proj, v_proj, o_proj
-        #   - Gated DeltaNet:     out_proj, in_proj_qkv, in_proj_z
+        if hasattr(base.model, "visual"):
+            for p in base.model.visual.parameters():
+                p.requires_grad = False
+
+        # ------------------------------------------------------------------
+        # 3. Wrap with LoRA
+        # ------------------------------------------------------------------
         lora_cfg = LoraConfig(
+            task_type=TaskType.CAUSAL_LM,
             r=lora_rank,
             lora_alpha=lora_alpha,
             lora_dropout=0.05,
-            target_modules=[
-                # Standard attention projections
-                "q_proj", "k_proj", "v_proj", "o_proj",
-                # Gated DeltaNet main projections
-                "out_proj", "in_proj_qkv", "in_proj_z",
-            ],
+            target_modules=QWEN35_LORA_TARGETS,
             bias="none",
         )
         self.lm = get_peft_model(base, lora_cfg)
 
-        # Explicitly enable gradient checkpointing for the Verbalizer
-        # The enable_input_require_grads() is MANDATORY because PEFT freezes the embedding
-        # layer, which otherwise causes PyTorch to silently skip checkpointing entirely!
-        self.lm.enable_input_require_grads()
-        self.lm.gradient_checkpointing_enable(
-            gradient_checkpointing_kwargs={"use_reentrant": False}
-        )
-        self.lm.config.use_cache = False
-
-        # Infer verbalizer hidden dim and layer count from config
-        self.hidden_dim: int = self.lm.config.hidden_size        # 1024 for 0.8B
-        self.num_layers: int = self.lm.config.num_hidden_layers  # 24 for 0.8B
+        # Resize embedding table to match extended tokenizer (<answer> token)
+        if new_vocab_size > 0:
+            self.lm.resize_token_embeddings(new_vocab_size)
 
         # ------------------------------------------------------------------
-        # 3. Insert one CrossAttentionBlock per transformer layer
+        # 4. Read architecture constants
+        #    Path: self.lm.model.model.config.text_config.hidden_size
+        # ------------------------------------------------------------------
+        inner_cfg = getattr(
+            self.lm.model.model.config, "text_config", self.lm.model.model.config
+        )
+        self.hidden_dim: int = getattr(inner_cfg, "hidden_size",      QWEN35_0_8B_HIDDEN_DIM)
+        self.num_layers: int = getattr(inner_cfg, "num_hidden_layers", QWEN35_0_8B_NUM_LAYERS)
+
+        # ------------------------------------------------------------------
+        # 5. CrossAttentionBlocks — one per layer
         # ------------------------------------------------------------------
         self.ca_blocks = nn.ModuleList([
-            CrossAttentionBlock(
-                query_dim=self.hidden_dim,
-                kv_dim=student_hidden,
-                num_heads=ca_num_heads,
-                dropout=ca_dropout,
-            )
+            CrossAttentionBlock(self.hidden_dim, student_hidden, ca_num_heads, ca_dropout)
             for _ in range(self.num_layers)
-        ]).to(base.dtype)
+        ])
+        self.ca_blocks.to(self.lm.device)
+        self.ca_blocks.to(torch.bfloat16)
 
         # ------------------------------------------------------------------
-        # 4. Register forward hooks on each decoder layer
+        # 6. Instance variable for passing latents into persistent hooks.
+        #    Set immediately before each forward call; cleared in try/finally.
+        #    None when no forward is running.
         # ------------------------------------------------------------------
-        # _current_latents is set before each forward call and read by hooks
         self._current_latents: Optional[torch.Tensor] = None
-        self._hooks: List = []
-        self._register_ca_hooks()
 
-        # Freeze tracking
+        # ------------------------------------------------------------------
+        # 7. Register persistent hooks on each transformer layer.
+        #    Hooks fire after the layer's own computation and inject CA output.
+        #    Registered ONCE here; never re-registered.
+        # ------------------------------------------------------------------
+        self._hooks: List = []
+        self._register_persistent_hooks()
+
+        # Freeze state flag
         self._frozen: bool = False
 
-    def _register_ca_hooks(self):
-        """
-        Register a post-forward hook on each decoder layer that applies
-        the corresponding CrossAttentionBlock.
+    # -----------------------------------------------------------------------
+    # Persistent hook registration (called once in __init__)
+    # -----------------------------------------------------------------------
 
-        The hook reads latents from self._current_latents, which must be
-        set before calling the model's forward.
+    def _register_persistent_hooks(self):
         """
-        transformer = self._transformer
+        Register one post-forward hook per transformer layer.
 
-        for layer_idx, layer in enumerate(transformer.layers):
+        The hook reads self._current_latents at call time (not at registration
+        time), so the same hook correctly uses different latents each forward
+        call. This is more efficient than per-call register/remove and avoids
+        hook leaks if an exception is raised mid-forward.
+
+        Hook logic:
+            output[0] is always the hidden state tensor for both
+            GatedAttention and GatedDeltaNet layers in Qwen3.5.
+            We inject CA, return the modified tuple.
+        """
+        layers = self.lm.model.model.language_model.layers
+
+        for layer_idx, layer in enumerate(layers):
             ca_block = self.ca_blocks[layer_idx]
+            verbalizer_ref = self   # capture self for latent access
 
-            def make_hook(ca_blk, idx):
-                def hook_fn(module, args, output):
-                    # Decoder layers return hidden_states directly (not a tuple)
-                    # in newer transformers versions
-                    if isinstance(output, tuple):
-                        hidden = output[0]
-                    else:
-                        hidden = output
+            def make_hook(block, vref):
+                def hook(module, inp, output):
+                    # Guard: if latents not set (e.g. during parameter init),
+                    # pass through unchanged
+                    if vref._current_latents is None:
+                        return output
 
-                    if self._current_latents is not None:
-                        hidden = ca_blk(hidden, self._current_latents)
+                    h = output[0] if isinstance(output, tuple) else output # [B, seq, d_verb]
+                    latents = vref._current_latents.to(h.dtype)
+                    h = block(h, latents)  # CA injection
+                    return (h,) + output[1:] if isinstance(output, tuple) else h  # return modified tuple
+                return hook
 
-                    if isinstance(output, tuple):
-                        return (hidden,) + output[1:]
-                    else:
-                        return hidden
-                return hook_fn
-
-            handle = layer.register_forward_hook(make_hook(ca_block, layer_idx))
+            handle = layer.register_forward_hook(make_hook(ca_block, verbalizer_ref))
             self._hooks.append(handle)
 
     # -----------------------------------------------------------------------
-    # Internal: access helpers for the Qwen3.5 model hierarchy
+    # Context manager for safe latent injection
+    # -----------------------------------------------------------------------
+
+    def _with_latents(self, latents: torch.Tensor):
+        """
+        Returns a context manager that sets self._current_latents before
+        entering the forward pass and clears it after (even on exception).
+
+        Usage:
+            with self._with_latents(z):
+                out = self.lm.model.model.language_model(...)
+        """
+        verbalizer_ref = self
+
+        class _LatentContext:
+            def __enter__(self_):
+                verbalizer_ref._current_latents = latents
+                return self_
+
+            def __exit__(self_, exc_type, exc_val, exc_tb):
+                # DO NOT clear latents here. Gradient checkpointing requires latents 
+                # to persist until the backward pass is complete.
+                # Latents will be cleared manually via self.clear_latents() after backprop.
+                return False   # do not suppress exceptions
+
+        return _LatentContext()
+
+    # -----------------------------------------------------------------------
+    # Internal: language-model-only forward (text path)
     # -----------------------------------------------------------------------
 
     @property
-    def _transformer(self):
-        """
-        Returns the Qwen3_5TextModel (the actual transformer stack).
-
-        Hierarchy after PEFT wrapping:
-          self.lm (PeftModel) → .model (Qwen3_5ForCausalLM)
-          → .model (Qwen3_5TextModel: .embed_tokens, .layers, .norm)
-        """
-        return self.lm.model.model
+    def _language_model(self) -> nn.Module:
+        """Transformer stack — embed_tokens + layers + norm."""
+        return self.lm.model.model.language_model
 
     @property
-    def _lm_head(self):
-        """Returns the LM head (Linear layer for logit projection)."""
+    def _embed_tokens(self) -> nn.Embedding:
+        return self._language_model.embed_tokens
+
+    @property
+    def _lm_head(self) -> nn.Linear:
         return self.lm.model.lm_head
 
-    # -----------------------------------------------------------------------
-    # Forward with latent injection
-    # -----------------------------------------------------------------------
-
-    def _forward_with_latents(
+    def _lm_forward(
         self,
-        input_ids: torch.Tensor,        # [batch, seq]
-        attention_mask: torch.Tensor,    # [batch, seq]
-        latents: torch.Tensor,           # [batch, M, d_student]  — stacked z_1…z_M
-        labels: Optional[torch.Tensor] = None,  # [batch, seq] for LM loss
+        input_ids: torch.Tensor,
+        attention_mask: torch.Tensor,
+        latents: torch.Tensor,
+        labels: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
         """
-        Forward pass with CA injection via hooks.
-
-        The hooks read from self._current_latents which is set here before
-        calling the model and cleared after.  This lets the model's own
-        forward() handle all the complex mask/position/rotary logic while
-        we inject CA at each layer boundary.
+        Run a text-only forward pass through the language model with CA hooks active.
+        Vision encoder is bypassed entirely — τ+/τ− are pure text.
 
         Returns
         -------
         logits : [batch, seq, vocab_size]
         loss   : scalar CE loss if labels provided, else None
         """
-        # Set latents for hooks to read
-        # We do NOT clear this in a finally block because gradient checkpointing
-        # re-runs the forward pass during backward(), which requires reading this tensor again.
-        self._current_latents = latents
+        embeds = self._embed_tokens(input_ids)    # [B, seq, d_verb]
 
-        # Use the model's native forward — this handles:
-        #   - 4D position_ids computation
-        #   - create_causal_mask for full_attention layers
-        #   - _update_linear_attn_mask for linear_attention layers
-        #   - rotary embeddings
-        #   - layer iteration with correct mask selection
-        # The registered hooks inject CA after each layer
-        outputs = self._transformer(
-            input_ids=input_ids,
-            attention_mask=attention_mask,
-            output_hidden_states=False,
-            use_cache=False,
-        )
+        with self._with_latents(latents):
+            out = self._language_model(
+                inputs_embeds=embeds,
+                attention_mask=attention_mask,
+                use_cache=False,
+                output_hidden_states=False,
+                return_dict=True,
+            )
 
-        hidden = outputs.last_hidden_state  # [batch, seq, d_verb]
-        logits = self._lm_head(hidden)      # [batch, seq, vocab_size]
+        logits = self._lm_head(out.last_hidden_state)   # [B, seq, vocab]
 
-        # --- Optional LM loss ---
         loss = None
         if labels is not None:
-            # Shift: predict next token
             shift_logits = logits[:, :-1, :].contiguous()
             shift_labels = labels[:, 1:].contiguous()
             loss = F.cross_entropy(
@@ -336,183 +356,185 @@ class Verbalizer(nn.Module):
 
         return logits, loss
 
+    # -----------------------------------------------------------------------
+    # Sequence log-probs (used by DPO)
+    # -----------------------------------------------------------------------
+
     def _compute_sequence_log_probs(
         self,
-        input_ids: torch.Tensor,       # [batch, seq]
-        attention_mask: torch.Tensor,   # [batch, seq]
-        latents: torch.Tensor,          # [batch, M, d_student]
-        response_mask: torch.Tensor,    # [batch, seq] — 1 on response tokens only
+        input_ids: torch.Tensor,
+        attention_mask: torch.Tensor,
+        latents: torch.Tensor,
+        response_mask: torch.Tensor,   # [B, seq] — 1 on response tokens only
     ) -> torch.Tensor:
         """
-        Compute per-sequence sum of log-probabilities over response tokens.
+        Compute sum of per-token log-probs over response positions.
 
-        Used by compute_dpo_loss to get log π_ψ(τ | z).
+        log π_ψ(response | z) = Σ_{t∈response} log p(token_t | token_{<t}, z)
 
         Returns
         -------
-        log_probs : [batch]  — sum of token log-probs over response positions
+        seq_log_probs : [batch]
         """
-        logits, _ = self._forward_with_latents(input_ids, attention_mask, latents)
+        logits, _ = self._lm_forward(input_ids, attention_mask, latents)
 
-        # Memory-efficient manual log-probs (avoids allocating [batch, seq, vocab] tensor)
-        shift_logits = logits[:, :-1, :]                    # [batch, seq-1, vocab]
-        shift_labels    = input_ids[:, 1:]                  # [batch, seq-1]
-        shift_mask      = response_mask[:, 1:]              # [batch, seq-1]
+        log_probs = F.log_softmax(logits, dim=-1)           # [B, seq, vocab]
 
-        # Gather the logit of each ground-truth token
-        target_logits = shift_logits.gather(
-            dim=-1,
-            index=shift_labels.unsqueeze(-1),
-        ).squeeze(-1)  # [batch, seq-1]
-        
-        token_log_probs = target_logits - torch.logsumexp(shift_logits, dim=-1) # [batch, seq-1]
+        # Shift: logits[i] predicts token[i+1]
+        shift_lp   = log_probs[:, :-1, :]                  # [B, seq-1, vocab]
+        shift_ids  = input_ids[:, 1:]                       # [B, seq-1]
+        shift_mask = response_mask[:, 1:]                   # [B, seq-1]
 
-        # Sum over response positions only
-        seq_log_probs = (token_log_probs * shift_mask).sum(dim=-1)  # [batch]
+        token_lp   = shift_lp.gather(
+            -1, shift_ids.unsqueeze(-1)
+        ).squeeze(-1)                                        # [B, seq-1]
 
-        return seq_log_probs
+        return (token_lp * shift_mask).sum(dim=-1)          # [B]
 
     # -----------------------------------------------------------------------
-    # Public loss functions
+    # Public loss: LM warm-up
     # -----------------------------------------------------------------------
 
     def compute_lm_loss(
         self,
-        input_ids: torch.Tensor,       # [batch, seq]  — τ+ sequence
+        input_ids: torch.Tensor,
         attention_mask: torch.Tensor,
-        latents: torch.Tensor,         # [batch, M, d_student]  — Student z (DETACHED during warm-up)
-        labels: torch.Tensor,          # [batch, seq]  — τ+ with -100 on prefix positions
+        latents: torch.Tensor,         # pass z.detach() during warm-up
+        labels: torch.Tensor,          # -100 on prompt tokens, real ids on response
     ) -> torch.Tensor:
         """
-        Warm-up loss: standard cross-entropy on τ+ tokens.
-        Trains the CA blocks and LoRA to learn to read Student latents.
+        Warm-up loss: cross-entropy on τ+ tokens.
 
-        NOTE: during warm-up, pass latents.detach() so gradients do NOT
-        flow back into the Student yet. The Student is updated by L_distill
-        and L_ans only during warm-up.
+        The Verbalizer's CA blocks and LoRA learn to translate Student latents
+        into high-quality reasoning text. Passing latents.detach() ensures
+        this loss does NOT update the Student's weights during warm-up —
+        the Student is only updated by L_distill + L_ans + L_spatial at this stage.
 
         Returns
         -------
         lm_loss : scalar
         """
-        _, loss = self._forward_with_latents(
-            input_ids, attention_mask, latents, labels=labels
-        )
+        _, loss = self._lm_forward(input_ids, attention_mask, latents, labels=labels)
         return loss
+
+    # -----------------------------------------------------------------------
+    # Public loss: DPO
+    # -----------------------------------------------------------------------
 
     def compute_dpo_loss(
         self,
-        pos_input_ids: torch.Tensor,   # [batch, seq] — τ+ tokenized
-        neg_input_ids: torch.Tensor,    # [batch, seq] — τ− tokenized
+        pos_input_ids: torch.Tensor,
+        neg_input_ids: torch.Tensor,
         pos_attention_mask: torch.Tensor,
         neg_attention_mask: torch.Tensor,
-        latents: torch.Tensor,          # [batch, M, d_student] — Student z (NO detach here)
-        pos_response_mask: torch.Tensor,   # [batch, seq] — 1 on τ+ response tokens
-        neg_response_mask: torch.Tensor,   # [batch, seq] — 1 on τ− response tokens
-        ref_pos_log_probs: Optional[torch.Tensor] = None,  # [batch] reference model log-probs
+        latents: torch.Tensor,                  # NOT detached in frozen phase
+        pos_response_mask: torch.Tensor,
+        neg_response_mask: torch.Tensor,
+        ref_pos_log_probs: Optional[torch.Tensor] = None,
         ref_neg_log_probs: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, dict]:
         """
         DPO preference loss.
 
-        After Verbalizer is frozen (step > 3000), all gradients from this loss
-        flow through the latents tensor back into the Student's parameters.
+        When Verbalizer is frozen (step > 3000), all Vψ parameters have
+        requires_grad=False. Gradients from this loss flow through the
+        latents tensor → CA k_proj/v_proj computation → back to the Student.
 
-        DPO objective:
-            L_DPO = -E[ log σ( β * (log π(τ+|z) − log π_ref(τ+|z))
-                                 − β * (log π(τ−|z) − log π_ref(τ−|z)) ) ]
-
-        If reference log-probs not provided (common simplification), reduces to:
-            L_DPO = -E[ log σ( β * (log π(τ+|z) − log π(τ−|z)) ) ]
-
-        Parameters
-        ----------
-        ref_pos_log_probs / ref_neg_log_probs:
-            Pass pre-computed reference model log-probs if using a reference
-            policy (e.g., initial Verbalizer checkpoint). Pass None to use
-            the simplified reference-free variant.
+        L_DPO = -E[ log σ( β * (log π(τ+|z) − log π(τ−|z)) ) ]
+        (reference-free variant when ref log-probs not provided)
 
         Returns
         -------
         dpo_loss : scalar
-        metrics  : dict with reward margin and accuracy for logging
+        metrics  : dict for logging
         """
-        # Log-probs under current Verbalizer policy
-        # latents NOT detached → gradient flows into Student when Vψ is frozen
         log_pi_pos = self._compute_sequence_log_probs(
             pos_input_ids, pos_attention_mask, latents, pos_response_mask
-        )  # [batch]
+        )   # [B]
         log_pi_neg = self._compute_sequence_log_probs(
             neg_input_ids, neg_attention_mask, latents, neg_response_mask
-        )  # [batch]
+        )   # [B]
 
-        # DPO reward margins
         if ref_pos_log_probs is not None and ref_neg_log_probs is not None:
-            # Full DPO: subtract reference log-probs
-            pi_log_ratios_pos = log_pi_pos - ref_pos_log_probs
-            pi_log_ratios_neg = log_pi_neg - ref_neg_log_probs
+            margin = self.dpo_beta * (
+                (log_pi_pos - ref_pos_log_probs) - (log_pi_neg - ref_neg_log_probs)
+            )
         else:
-            # Simplified (reference-free) DPO
-            pi_log_ratios_pos = log_pi_pos
-            pi_log_ratios_neg = log_pi_neg
+            margin = self.dpo_beta * (log_pi_pos - log_pi_neg)
 
-        reward_margin = self.dpo_beta * (pi_log_ratios_pos - pi_log_ratios_neg)
+        dpo_loss = -F.logsigmoid(margin).mean()
 
-        # DPO loss: -log sigmoid(reward_margin)
-        dpo_loss = -F.logsigmoid(reward_margin).mean()
-
-        # Logging metrics
         with torch.no_grad():
             metrics = {
-                "dpo_loss":       dpo_loss.item(),
-                "reward_margin":  reward_margin.mean().item(),
-                "dpo_accuracy":   (reward_margin > 0).float().mean().item(),
-                "log_pi_pos":     log_pi_pos.mean().item(),
-                "log_pi_neg":     log_pi_neg.mean().item(),
+                "dpo_loss":      dpo_loss.item(),
+                "reward_margin": margin.mean().item(),
+                "dpo_accuracy":  (margin > 0).float().mean().item(),
+                "log_pi_pos":    log_pi_pos.mean().item(),
+                "log_pi_neg":    log_pi_neg.mean().item(),
             }
 
         return dpo_loss, metrics
 
     # -----------------------------------------------------------------------
-    # Warm-up → freeze transition
+    # Freeze / unfreeze schedule
     # -----------------------------------------------------------------------
 
     def freeze_for_student_training(self):
         """
-        Called at step 3000.
+        Called at step 3000. Freezes all Vψ parameters permanently.
 
-        Freezes ALL Verbalizer parameters (base model + LoRA + CA blocks).
-        After this, DPO gradients flow through the latents tensor only,
-        updating the Student's weights — not the Verbalizer's.
+        After this, DPO gradients flow through the frozen CA computation
+        graph → latents → Student LoRA weights. The Verbalizer's own
+        parameters no longer receive any gradient updates.
+
+        The persistent hooks remain registered and functional — they still
+        execute and still inject CA output. The only change is that
+        requires_grad=False on CA parameters means their weights don't update.
         """
         if self._frozen:
             return
-
-        for param in self.parameters():
-            param.requires_grad = False
-
+        for p in self.parameters():
+            p.requires_grad = False
         self._frozen = True
-        trainable = sum(p.numel() for p in self.parameters() if p.requires_grad)
-        print(f"[Verbalizer] Frozen. Trainable params remaining: {trainable:,}")
+        remaining = sum(p.numel() for p in self.parameters() if p.requires_grad)
+        print(f"[Verbalizer] Frozen. Trainable params remaining: {remaining:,}")
 
     def unfreeze_ca_and_lora(self):
         """
-        Re-enables gradient flow through CA blocks and LoRA layers.
-        Mainly useful for warm-up resumption after a checkpoint reload.
+        Re-enables CA blocks and LoRA weights for gradient flow.
+        Used when resuming from a warm-up checkpoint.
         """
-        # CA blocks are always fully trainable
-        for param in self.ca_blocks.parameters():
-            param.requires_grad = True
-
-        # LoRA layers: only the lora_A/lora_B matrices, not the frozen base weights
-        for name, param in self.lm.named_parameters():
-            if "lora_" in name:
-                param.requires_grad = True
-
+        if not self._frozen:
+            return
+        for p in self.ca_blocks.parameters():
+            p.requires_grad = True
+        for n, p in self.lm.named_parameters():
+            if "lora_" in n:
+                p.requires_grad = True
         self._frozen = False
 
     def is_frozen(self) -> bool:
         return self._frozen
+
+    # -----------------------------------------------------------------------
+    # Diagnostics
+    # -----------------------------------------------------------------------
+
+    def print_trainable_parameters(self):
+        self.lm.print_trainable_parameters()
+        ca = sum(p.numel() for p in self.ca_blocks.parameters())
+        print(f"  ca_blocks  : {ca:,} params  [TRAINABLE until step 3000]")
+        print(f"  hidden_dim : {self.hidden_dim}")
+        print(f"  num_layers : {self.num_layers}")
+
+    @staticmethod
+    def stack_latents(latents: List[torch.Tensor]) -> torch.Tensor:
+        """
+        Converts Student's List[M × [batch, d]] output to [batch, M, d]
+        as expected by CA blocks. Call this before passing latents to any
+        Verbalizer method.
+        """
+        return torch.stack(latents, dim=1)   # [batch, M, d]
 
     # -----------------------------------------------------------------------
     # Convenience
@@ -535,8 +557,8 @@ class Verbalizer(nn.Module):
     ) -> torch.Tensor:
         """
         Generate text conditioned on the given latents.
-        This simply sets self._current_latents and calls self.lm.generate.
-        The forward hooks will automatically inject the latents into the layers.
+        This sets self._current_latents and calls self.lm.generate.
+        The persistent hooks will automatically inject the latents into the layers.
         """
         self._current_latents = latents
         
@@ -559,18 +581,3 @@ class Verbalizer(nn.Module):
             self.clear_latents()
             
         return outputs
-
-    def print_trainable_parameters(self):
-        self.lm.print_trainable_parameters()
-        ca_params = sum(p.numel() for p in self.ca_blocks.parameters())
-        print(f"  ca_blocks (all layers): {ca_params:,} params")
-
-    @staticmethod
-    def stack_latents(latents: List[torch.Tensor]) -> torch.Tensor:
-        """
-        Converts the Student's output (List of M tensors [batch, d]) into
-        the [batch, M, d] tensor the Verbalizer expects.
-
-        Call this before passing latents into any Verbalizer method.
-        """
-        return torch.stack(latents, dim=1)  # [batch, M, d]
