@@ -251,9 +251,9 @@ def collate_stage2_batch(samples: List[dict]) -> dict:
 
     for i, s in enumerate(samples):
         seq_len = s["input_ids"].shape[0]
-        # Right-pad with zeros (pad token id = 0 for Qwen)
-        input_ids_padded[i, :seq_len]  = s["input_ids"]
-        attn_mask_padded[i, :seq_len]  = s["attention_mask"]
+        # Left-pad with zeros (pad token id = 0 for Qwen)
+        input_ids_padded[i, max_len - seq_len:]  = s["input_ids"]
+        attn_mask_padded[i, max_len - seq_len:]  = s["attention_mask"]
 
     # Stack waypoints [B, K, 2]
     gt_waypoints = torch.stack([s["gt_waypoints"] for s in samples], dim=0)

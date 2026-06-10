@@ -12,6 +12,9 @@ set -e
 # Replace with the actual path to your Stage 1 checkpoint
 STAGE1_CKPT="shreethar/stage1_unsloth"
 
+# Ensure user is logged into Weights & Biases before starting
+wandb login
+
 echo "============================================================"
 echo " Starting ThinkFlow-VLA Stage 2 Mini Training"
 echo " Dataset Subset  : 15%"

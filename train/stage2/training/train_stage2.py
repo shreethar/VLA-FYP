@@ -339,6 +339,7 @@ def train_stage2(
     # 1. Load tokenizer
     # ------------------------------------------------------------------
     tokenizer = AutoTokenizer.from_pretrained(cfg.base_model_name)
+    tokenizer.padding_side = 'left'
 
     # ------------------------------------------------------------------
     # 2. Build models

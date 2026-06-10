@@ -291,32 +291,39 @@ class GRPOTeacher(nn.Module):
             eos_token_id=tokenizer.eos_token_id,
         )
 
-        for _ in range(self.G):
-            outputs = self.vlm.generate(
-                input_ids=input_ids,
-                pixel_values=pixel_values,
-                image_grid_thw=image_grid_thw,
-                attention_mask=attention_mask,
-                generation_config=gen_config,
-                use_cache=True,
-                return_dict_in_generate=False,
-            )
-            # outputs: [batch, prompt_len + new_tokens]
+        was_training = self.vlm.training
+        self.vlm.eval()
 
-            # Pad to consistent length within this rollout (already done by generate)
-            response_ids = outputs[:, prompt_len:]   # [batch, new_tokens]
+        try:
+            for _ in range(self.G):
+                outputs = self.vlm.generate(
+                    input_ids=input_ids,
+                    pixel_values=pixel_values,
+                    image_grid_thw=image_grid_thw,
+                    attention_mask=attention_mask,
+                    generation_config=gen_config,
+                    use_cache=True,
+                    return_dict_in_generate=False,
+                )
+                # outputs: [batch, prompt_len + new_tokens]
 
-            # Decode response portion only
-            texts = tokenizer.batch_decode(
-                response_ids, skip_special_tokens=False
-            )
+                # Pad to consistent length within this rollout (already done by generate)
+                response_ids = outputs[:, prompt_len:]   # [batch, new_tokens]
 
-            # Build full attention mask (1 on all non-pad positions)
-            full_mask = (outputs != tokenizer.pad_token_id).long()
+                # Decode response portion only
+                texts = tokenizer.batch_decode(
+                    response_ids, skip_special_tokens=False
+                )
 
-            all_ids.append(outputs)
-            all_texts.append(texts)
-            all_masks.append(full_mask)
+                # Build full attention mask (1 on all non-pad positions)
+                full_mask = (outputs != tokenizer.pad_token_id).long()
+
+                all_ids.append(outputs)
+                all_texts.append(texts)
+                all_masks.append(full_mask)
+        finally:
+            if was_training:
+                self.vlm.train()
 
         return all_ids, all_texts, all_masks
 
