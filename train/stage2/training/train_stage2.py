@@ -646,12 +646,12 @@ def train_stage2(
                             eos_token_id=tokenizer.eos_token_id
                         )
                         gen_out = verbalizer.generate_from_latents(
-                            input_ids=batch["input_ids"],
-                            attention_mask=batch["attention_mask"],
+                            input_ids=input_ids,
+                            attention_mask=attention_mask,
                             latents=loss_out.latents,
                             generation_config=gen_cfg,
                         )
-                        prompt_len = batch["input_ids"].shape[1]
+                        prompt_len = input_ids.shape[1]
                         generated_ids = gen_out[:, prompt_len:]
                         gen_texts = tokenizer.batch_decode(generated_ids, skip_special_tokens=True)
                         for b, txt in enumerate(gen_texts):
