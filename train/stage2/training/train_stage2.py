@@ -258,10 +258,11 @@ def load_checkpoint(
 # ---------------------------------------------------------------------------
 
 def log_memory(tag: str):
-    if torch.cuda.is_available():
-        allocated = torch.cuda.memory_allocated() / (1024**3)
-        reserved = torch.cuda.memory_reserved() / (1024**3)
-        logger.info(f"[Memory] {tag}: Allocated={allocated:.2f} GB | Reserved={reserved:.2f} GB")
+    pass # Commented out to reduce console spam now that OOM issues are resolved
+    # if torch.cuda.is_available():
+    #     allocated = torch.cuda.memory_allocated() / (1024**3)
+    #     reserved = torch.cuda.memory_reserved() / (1024**3)
+    #     logger.info(f"[Memory] {tag}: Allocated={allocated:.2f} GB | Reserved={reserved:.2f} GB")
 
 def train_stage2(
     cfg: Stage2Config,
