@@ -543,6 +543,9 @@ def train_stage2(
             student_opt.step()
             student_sched.step()
 
+        # Clear latents from verbalizer to release the graph memory
+        verbalizer.clear_latents()
+
         log_memory(f"Step {step} - After Backprop")
 
         # ----------------------------------------------------------------

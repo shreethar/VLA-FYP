@@ -301,25 +301,23 @@ class Verbalizer(nn.Module):
         loss   : scalar CE loss if labels provided, else None
         """
         # Set latents for hooks to read
+        # We do NOT clear this in a finally block because gradient checkpointing
+        # re-runs the forward pass during backward(), which requires reading this tensor again.
         self._current_latents = latents
 
-        try:
-            # Use the model's native forward — this handles:
-            #   - 4D position_ids computation
-            #   - create_causal_mask for full_attention layers
-            #   - _update_linear_attn_mask for linear_attention layers
-            #   - rotary embeddings
-            #   - layer iteration with correct mask selection
-            # The registered hooks inject CA after each layer
-            outputs = self._transformer(
-                input_ids=input_ids,
-                attention_mask=attention_mask,
-                output_hidden_states=False,
-                use_cache=False,
-            )
-        finally:
-            # Clear latents reference to avoid holding memory
-            self._current_latents = None
+        # Use the model's native forward — this handles:
+        #   - 4D position_ids computation
+        #   - create_causal_mask for full_attention layers
+        #   - _update_linear_attn_mask for linear_attention layers
+        #   - rotary embeddings
+        #   - layer iteration with correct mask selection
+        # The registered hooks inject CA after each layer
+        outputs = self._transformer(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            output_hidden_states=False,
+            use_cache=False,
+        )
 
         hidden = outputs.last_hidden_state  # [batch, seq, d_verb]
         logits = self._lm_head(hidden)      # [batch, seq, vocab_size]
@@ -519,6 +517,14 @@ class Verbalizer(nn.Module):
     # -----------------------------------------------------------------------
     # Convenience
     # -----------------------------------------------------------------------
+
+    def clear_latents(self):
+        """
+        Clears the stored latents tensor to prevent memory leaks across
+        training steps after gradient checkpointing is finished.
+        """
+        self._current_latents = None
+
 
     def print_trainable_parameters(self):
         self.lm.print_trainable_parameters()
