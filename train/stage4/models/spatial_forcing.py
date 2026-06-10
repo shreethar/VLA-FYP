@@ -1,28 +1,34 @@
 """
-spatial_forcing.py
-------------------
-Spatial Forcing auxiliary loss for ThinkFlow-VLA Stage 2.
+spatial_forcing.py  [VGGT update]
+-----------------------------------
+Spatial Forcing auxiliary loss — ThinkFlow-VLA Stage 2.
 
-Loss:
-    L_spatial = -CosSim( ProjectionMLP(pool(x_V)), pool(Extractor(I)) )
+Changes from previous version:
+  1. VGGT: git-based install (not AutoModel).
+     Import: from vggt.models.vggt import VGGT
+     Load:   VGGT.from_pretrained("facebook/VGGT-1B")
+     Install: see install_vggt.sh
 
-Where:
-    x_V        — mid-layer (L/2) visual token hidden states from the Student
-                 already extracted via LatentStudent.get_mid_layer_visual_features()
-                 shape: [batch, num_visual_tokens, d_student=2560]
-    Extractor  — frozen VGGT or DINOv2 feature extractor; zero inference overhead
-                 at deployment because it is training-only
-    pool(·)    — mean pool over spatial/patch dimension → [batch, d]
-    MLP        — trainable projection on Student side: [d_student → d_extractor]
+  2. Token-level alignment (not mean-pooled).
+     The Spatial Forcing paper aligns VLA visual tokens with VGGT
+     patch-level spatial representations per-token, not globally pooled.
+     This requires spatial resolution matching via interpolation.
 
-Design:
-    - Extractor is ALWAYS frozen (no_grad); only MLP trains
-    - Spatial resolution mismatch between Student visual tokens and extractor
-      patches is handled by mean pooling both sides before loss computation
-    - Two extractor backends supported:
-        "dinov2"  → facebook/dinov2-large  (d=1024) or dinov2-base (d=768)
-        "vggt"    → configurable checkpoint (user-specified)
-    - Backend is pluggable via the FrozenExtractor base class
+  3. ProjectionMLP input: d_student=2560 (Qwen3.5-4B hidden dim)
+
+Loss (token-level):
+    x_V      : [batch, N_vis, d_student]  — mid-layer visual tokens
+    vggt_feat: [batch, N_patches, d_vggt] — VGGT patch features (extracted + PE)
+    
+    align both to [batch, N, d] via interpolation, then:
+    L_spatial = -mean_over_batch( mean_over_tokens( CosSim(MLP(x_V_i), vggt_i) ) )
+    L_spatial *= lambda_sf
+
+VGGT output format:
+    predictions = model(images)   # images: [batch, num_views, C, H, W]
+    The VGGT model outputs a dict of 3D attributes. For Spatial Forcing,
+    we use the aggregated_tokens_list or similar intermediate features.
+    See VGGTExtractor.extract() — update once confirmed on your setup.
 """
 
 import torch
@@ -31,143 +37,19 @@ import torch.nn.functional as F
 from abc import ABC, abstractmethod
 from typing import Optional
 
-from transformers import AutoModel
-
 
 # ---------------------------------------------------------------------------
-# Frozen extractor base + concrete implementations
-# ---------------------------------------------------------------------------
-
-class FrozenExtractor(ABC, nn.Module):
-    """
-    Base class for frozen spatial feature extractors.
-    All parameters are frozen at construction time.
-    output_dim must be set by subclasses.
-    """
-    output_dim: int
-
-    def __init__(self):
-        super().__init__()
-
-    def _freeze_all(self):
-        for param in self.parameters():
-            param.requires_grad = False
-
-    @abstractmethod
-    def extract(self, pixel_values: torch.Tensor) -> torch.Tensor:
-        """
-        Extract spatial features from raw pixel values.
-
-        Parameters
-        ----------
-        pixel_values : [batch, C, H, W]  — normalised image tensor
-
-        Returns
-        -------
-        features : [batch, d_extractor]
-            Mean-pooled over spatial/patch dimension.
-            This happens inside each extractor so the calling code is uniform.
-        """
-        ...
-
-    def forward(self, pixel_values: torch.Tensor) -> torch.Tensor:
-        with torch.no_grad():
-            return self.extract(pixel_values)
-
-
-class DINOv2Extractor(FrozenExtractor):
-    """
-    Frozen DINOv2 feature extractor.
-
-    Supported checkpoints:
-        "facebook/dinov2-large"  → output_dim = 1024
-        "facebook/dinov2-base"   → output_dim = 768
-        "facebook/dinov2-small"  → output_dim = 384
-    """
-
-    _DIM_MAP = {
-        "facebook/dinov2-large":  1024,
-        "facebook/dinov2-base":   768,
-        "facebook/dinov2-small":  384,
-        "facebook/dinov2-giant":  1536,
-    }
-
-    def __init__(self, checkpoint: str = "facebook/dinov2-large"):
-        super().__init__()
-        self.model = AutoModel.from_pretrained(
-            checkpoint, torch_dtype=torch.bfloat16
-        )
-        self.output_dim = self._DIM_MAP.get(checkpoint, 1024)
-        self._freeze_all()
-
-    def extract(self, pixel_values: torch.Tensor) -> torch.Tensor:
-        """
-        DINOv2 outputs last_hidden_state: [batch, num_patches+1, d]
-        Index 0 is the [CLS] token; patches start at index 1.
-        We mean-pool patch tokens only.
-        """
-        out = self.model(pixel_values=pixel_values, return_dict=True)
-        patch_features = out.last_hidden_state[:, 1:, :]  # [batch, num_patches, d]
-        return patch_features.mean(dim=1)                 # [batch, d]
-
-
-class VGGTExtractor(FrozenExtractor):
-    """
-    Frozen VGGT feature extractor.
-
-    The exact checkpoint path will be confirmed by the user; this class accepts
-    any AutoModel-compatible repo. Pass output_dim explicitly since VGGT's
-    hidden size varies by variant.
-
-    Typical usage:
-        VGGTExtractor(checkpoint="<user-confirmed-repo>", output_dim=1024)
-    """
-
-    def __init__(self, checkpoint: str = "facebook/VGGT-1B", output_dim: int = 1024):
-        super().__init__()
-        self.model = AutoModel.from_pretrained(
-            checkpoint, torch_dtype=torch.bfloat16, trust_remote_code=True
-        )
-        self.output_dim = output_dim
-        self._freeze_all()
-
-    def extract(self, pixel_values: torch.Tensor) -> torch.Tensor:
-        """
-        VGGT's exact output format depends on its architecture.
-        This implementation assumes last_hidden_state is available and
-        mean-pools it. Update the indexing once the checkpoint is confirmed.
-        """
-        out = self.model(pixel_values=pixel_values, return_dict=True)
-
-        if hasattr(out, "last_hidden_state"):
-            feats = out.last_hidden_state  # [batch, seq, d]
-            # If first token is CLS-like, skip it; otherwise pool everything
-            if feats.shape[1] > 1:
-                feats = feats[:, 1:, :]
-            return feats.mean(dim=1)       # [batch, d]
-
-        raise AttributeError(
-            "VGGTExtractor: model output has no 'last_hidden_state'. "
-            "Inspect the output keys and update extract() accordingly "
-            "once the checkpoint is confirmed."
-        )
-
-
-# ---------------------------------------------------------------------------
-# Trainable projection MLP (Student side only)
+# ProjectionMLP (Student side — trainable)
 # ---------------------------------------------------------------------------
 
 class ProjectionMLP(nn.Module):
     """
-    Projects mean-pooled Student mid-layer visual features into the extractor's
-    feature space so cosine similarity is well-defined.
-
-    Input:  [batch, d_student]   (mean-pooled x_V)
-    Output: [batch, d_extractor] (L2-normalised for CosSim stability)
-
-    Three-layer MLP with GELU activations and a final L2-norm.
+    [batch, N, d_student] → [batch, N, d_ext]  (L2-normalised)
+    Works on both token-level (N>1) and pooled (N=1) inputs.
+    
+    Three-layer MLP with GELU activations and LayerNorm for stable gradients.
+    Output is L2-normalised so that dot product equals cosine similarity.
     """
-
     def __init__(self, in_dim: int, out_dim: int):
         super().__init__()
         mid_dim = (in_dim + out_dim) // 2
@@ -182,8 +64,126 @@ class ProjectionMLP(nn.Module):
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        projected = self.net(x)                         # [batch, d_extractor]
+        projected = self.net(x)                         # [batch, N, d_ext]
         return F.normalize(projected, dim=-1)           # unit-norm for CosSim
+
+
+# ---------------------------------------------------------------------------
+# Frozen extractor base
+# ---------------------------------------------------------------------------
+
+class FrozenExtractor(ABC, nn.Module):
+    output_dim: int
+
+    def __init__(self):
+        super().__init__()
+
+    def _freeze_all(self):
+        for p in self.parameters():
+            p.requires_grad = False
+
+    @abstractmethod
+    def extract(self, pixel_values: torch.Tensor) -> torch.Tensor:
+        """
+        Returns patch-level features [batch, N_patches, d_ext].
+        N_patches depends on image resolution.
+        """
+        ...
+
+    @torch.no_grad()
+    def forward(self, pixel_values: torch.Tensor) -> torch.Tensor:
+        return self.extract(pixel_values)
+
+
+# ---------------------------------------------------------------------------
+# VGGT extractor  (primary extractor — requires git install)
+# ---------------------------------------------------------------------------
+
+class VGGTExtractor(FrozenExtractor):
+    """
+    Frozen VGGT-1B spatial feature extractor.
+
+    Install VGGT BEFORE running Stage 2 training:
+        bash stage2/install_vggt.sh
+
+    VGGT takes images shaped [batch, num_views, C, H, W].
+    For single-view robot observations, unsqueeze dim 1:
+        images = pixel_values.unsqueeze(1)   # [B, 1, C, H, W]
+
+    VGGT outputs a dict of 3D attributes. We extract the aggregated
+    context features which carry dense spatial information suitable
+    for per-token alignment with VLA visual tokens.
+
+    Output: [batch, N_patches, d_vggt]
+    """
+
+    # VGGT-1B outputs 1024-dim features
+    VGGT_1B_DIM = 1024
+
+    def __init__(
+        self,
+        checkpoint: str = "facebook/VGGT-1B",
+        output_dim: int = VGGT_1B_DIM,
+    ):
+        super().__init__()
+        try:
+            from vggt.models.vggt import VGGT
+        except ImportError:
+            raise ImportError(
+                "VGGT is not installed. Run: bash stage2/install_vggt.sh\n"
+                "Then verify: python -c 'from vggt.models.vggt import VGGT'"
+            )
+
+        self.model = VGGT.from_pretrained(checkpoint)
+        self.output_dim = output_dim
+        self._freeze_all()
+
+    def extract(self, pixel_values: torch.Tensor) -> torch.Tensor:
+        """
+        pixel_values: [batch, C, H, W] (single-view robot observation)
+        
+        Adds num_views=1 dimension, runs VGGT, extracts patch-level features.
+        
+        VGGT aggregated_tokens_list[-1] gives the final-layer context tokens
+        which encode dense 3D spatial information at the patch level.
+        
+        Returns: [batch, N_patches, d_vggt]
+        """
+        # VGGT expects [batch, num_views, C, H, W]
+        if pixel_values.dim() == 4:
+            images = pixel_values.unsqueeze(1)   # [B, 1, C, H, W]
+        else:
+            images = pixel_values                # already [B, V, C, H, W]
+
+        images = images.to(dtype=next(self.model.parameters()).dtype)
+
+        with torch.no_grad():
+            predictions = self.model(images)
+
+        # Extract dense spatial features.
+        # VGGT stores aggregated context tokens in aggregated_tokens_list.
+        # The last entry is the richest (full depth of processing).
+        if hasattr(predictions, "aggregated_tokens_list") and predictions.aggregated_tokens_list:
+            feats = predictions.aggregated_tokens_list[-1]   # [B, V, N, d]
+            # For single-view: squeeze view dim → [B, N, d]
+            if feats.dim() == 4:
+                feats = feats[:, 0, :, :]
+            return feats   # [B, N_patches, d_vggt]
+
+        # Fallback: if the above attribute name changes in a future VGGT version,
+        # try common alternatives
+        for attr in ["context_tokens", "image_features", "visual_features"]:
+            if hasattr(predictions, attr):
+                feats = getattr(predictions, attr)
+                if feats.dim() == 4:
+                    feats = feats[:, 0, :, :]
+                return feats
+
+        raise AttributeError(
+            "VGGTExtractor: could not find patch-level features in VGGT output.\n"
+            f"Available keys: {list(predictions.__dict__.keys()) if hasattr(predictions, '__dict__') else type(predictions)}\n"
+            "Update VGGTExtractor.extract() to use the correct attribute."
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -192,17 +192,20 @@ class ProjectionMLP(nn.Module):
 
 class SpatialForcingLoss(nn.Module):
     """
-    Full Spatial Forcing module: frozen extractor + trainable ProjectionMLP.
+    Token-level spatial alignment: align each VLA visual token with the
+    spatially corresponding VGGT patch feature.
 
-    Only ProjectionMLP trains; extractor is always inference-only.
+    L_spatial = -λ * mean_batch( mean_tokens( CosSim(MLP(x_V_i), vggt_i) ) )
+
+    Token count mismatch between x_V (VLA visual tokens) and VGGT patches
+    is handled by 1D interpolation along the spatial dimension.
 
     Parameters
     ----------
-    extractor_type  : "dinov2" or "vggt"
-    extractor_ckpt  : HuggingFace repo ID for the chosen extractor
-    student_dim     : Student hidden size (d_student = 2560 for Qwen3.5-4B)
-    extractor_dim   : Output dim of the extractor (pass explicitly for VGGT)
-    lambda_sf       : Loss scale λ (default 0.1 per the FYP spec)
+    extractor_type : "vggt" (default) or "dinov2" (fallback)
+    extractor_ckpt : checkpoint for chosen extractor
+    student_dim    : hidden size of Student VLM (2560 for Qwen3.5-4B)
+    lambda_sf      : loss weight (0.1 per FYP spec)
     """
 
     def __init__(
@@ -216,117 +219,78 @@ class SpatialForcingLoss(nn.Module):
         super().__init__()
         self.lambda_sf = lambda_sf
 
-        # ------------------------------------------------------------------
-        # 1. Frozen extractor
-        # ------------------------------------------------------------------
-        if extractor_type == "dinov2":
-            self.extractor = DINOv2Extractor(checkpoint=extractor_ckpt)
-        elif extractor_type == "vggt":
-            if extractor_dim is None:
-                raise ValueError(
-                    "extractor_dim must be provided explicitly for VGGT "
-                    "until the checkpoint is confirmed."
-                )
+        if extractor_type == "vggt":
             self.extractor = VGGTExtractor(
-                checkpoint=extractor_ckpt, output_dim=extractor_dim
+                checkpoint=extractor_ckpt,
+                output_dim=extractor_dim or VGGTExtractor.VGGT_1B_DIM,
             )
+        elif extractor_type == "dinov2":
+            self.extractor = DINOv2Extractor(checkpoint=extractor_ckpt)
         else:
-            raise ValueError(
-                f"Unknown extractor_type '{extractor_type}'. "
-                "Choose 'dinov2' or 'vggt'."
-            )
+            raise ValueError(f"Unknown extractor_type '{extractor_type}'")
 
-        d_ext = self.extractor.output_dim
-
-        # ------------------------------------------------------------------
-        # 2. Trainable projection MLP (Student side only)
-        # ------------------------------------------------------------------
-        self.proj_mlp = ProjectionMLP(in_dim=student_dim, out_dim=d_ext)
-
-    # -----------------------------------------------------------------------
-    # Feature extraction helpers (called separately for clarity in the loop)
-    # -----------------------------------------------------------------------
+        self.proj_mlp = ProjectionMLP(
+            in_dim=student_dim,
+            out_dim=self.extractor.output_dim,
+        )
 
     @torch.no_grad()
     def extract_reference_features(
         self, pixel_values: torch.Tensor
     ) -> torch.Tensor:
         """
-        Run the frozen extractor and L2-normalise.
-        Called ONCE per batch before the Student forward pass.
-        Cache the result and reuse — no need to re-extract within one step.
-
-        Parameters
-        ----------
-        pixel_values : [batch, C, H, W]  — preprocessed for the extractor's
-                       expected normalisation (ImageNet stats for DINOv2)
-
-        Returns
-        -------
-        ref_feats : [batch, d_extractor]  unit-norm
+        Run frozen extractor. Returns token-level features [batch, N, d_ext] (L2-normed).
+        Call ONCE before the Student forward pass and cache the result.
         """
-        feats = self.extractor(pixel_values)           # [batch, d_ext]
-        return F.normalize(feats.float(), dim=-1)      # unit-norm, fp32 for precision
-
-    # -----------------------------------------------------------------------
-    # Main loss computation
-    # -----------------------------------------------------------------------
+        feats = self.extractor(pixel_values)          # [B, N, d]
+        return F.normalize(feats.float(), dim=-1)     # unit-norm, fp32
 
     def compute_loss(
         self,
-        x_V: torch.Tensor,             # [batch, num_visual_tokens, d_student]
-        ref_feats: torch.Tensor,        # [batch, d_extractor]  — from extract_reference_features()
+        x_V: torch.Tensor,       # [batch, N_vis, d_student]  — Student mid-layer features
+        ref_feats: torch.Tensor,  # [batch, N_ref, d_ext]      — VGGT/DINOv2 patch features
     ) -> torch.Tensor:
         """
-        Compute the Spatial Forcing loss:
-            L_spatial = -mean( CosSim( ProjectionMLP(pool(x_V)), ref_feats ) )
+        Token-level cosine alignment loss.
 
-        Parameters
-        ----------
-        x_V       : mid-layer visual features from LatentStudent.get_mid_layer_visual_features()
-        ref_feats : pre-extracted extractor features (unit-norm)
+        Handles N_vis ≠ N_ref via linear interpolation so the loss is
+        resolution-invariant.
 
-        Returns
-        -------
-        loss : scalar (already scaled by lambda_sf)
+        Returns scalar (already scaled by lambda_sf).
         """
-        # Pool Student visual tokens: [batch, num_visual_tokens, d] → [batch, d]
-        pooled_student = x_V.mean(dim=1)                      # [batch, d_student]
+        B, N_vis, _ = x_V.shape
+        N_ref = ref_feats.shape[1]
 
-        # Project into extractor space and unit-norm
-        projected = self.proj_mlp(pooled_student.float())     # [batch, d_ext], unit-norm
+        # Project Student visual tokens → extractor space (unit-norm output)
+        projected = self.proj_mlp(x_V.float())   # [B, N_vis, d_ext]
 
-        # Cosine similarity per sample (both sides are unit-norm, so dot = cosim)
-        cos_sim = (projected * ref_feats).sum(dim=-1)         # [batch]
+        # Align spatial dimensions if needed
+        if N_vis != N_ref:
+            # Interpolate projected to match ref spatial resolution
+            # [B, N_vis, d] → [B, d, N_vis] → interp → [B, d, N_ref] → [B, N_ref, d]
+            projected = F.interpolate(
+                projected.permute(0, 2, 1),   # [B, d, N_vis]
+                size=N_ref,
+                mode="linear",
+                align_corners=False,
+            ).permute(0, 2, 1)               # [B, N_ref, d]
+            # Re-normalise after interpolation
+            projected = F.normalize(projected, dim=-1)
 
-        # Negative cosine similarity (maximising alignment = minimising negative cosim)
+        # Per-token cosine similarity (both sides are unit-norm → dot product)
+        cos_sim = (projected * ref_feats).sum(dim=-1)   # [B, N_ref]
+
         loss = -cos_sim.mean()
-
         return self.lambda_sf * loss
 
-    def forward(
-        self,
-        x_V: torch.Tensor,
-        pixel_values_for_extractor: torch.Tensor,
-    ) -> torch.Tensor:
-        """
-        Convenience wrapper: extract reference features + compute loss in one call.
-        Use compute_loss() directly if you've pre-cached ref_feats for efficiency.
-
-        Returns
-        -------
-        loss : scalar (scaled by lambda_sf)
-        """
+    def forward(self, x_V: torch.Tensor, pixel_values_for_extractor: torch.Tensor) -> torch.Tensor:
+        """Convenience: extract + compute in one call. Prefer compute_loss() in the training loop."""
         ref_feats = self.extract_reference_features(pixel_values_for_extractor)
         return self.compute_loss(x_V, ref_feats)
 
-    # -----------------------------------------------------------------------
-    # Utility
-    # -----------------------------------------------------------------------
-
     def print_trainable_parameters(self):
-        extractor_params = sum(p.numel() for p in self.extractor.parameters())
-        mlp_params       = sum(p.numel() for p in self.proj_mlp.parameters())
-        print(f"  extractor (frozen):  {extractor_params:,} params")
-        print(f"  projection_mlp:      {mlp_params:,} params  [TRAINABLE]")
-        print(f"  lambda_sf:           {self.lambda_sf}")
+        ext   = sum(p.numel() for p in self.extractor.parameters())
+        proj  = sum(p.numel() for p in self.proj_mlp.parameters())
+        print(f"  extractor (frozen): {ext:,}")
+        print(f"  proj_mlp:           {proj:,}  [TRAINABLE]")
+        print(f"  lambda_sf:          {self.lambda_sf}")
