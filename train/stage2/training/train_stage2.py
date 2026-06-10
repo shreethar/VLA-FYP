@@ -47,7 +47,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from models.latent_student  import LatentStudent
 from models.verbalizer       import Verbalizer
-from training.updated_grpo_teacher   import GRPOTeacher, RolloutBuffer
+from training.grpo_teacher   import GRPOTeacher, RolloutBuffer
 from training.student_losses import StudentLossComputer, build_student_loss_computer
 from tokenizer_setup         import load_answer_token_id
 

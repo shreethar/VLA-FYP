@@ -29,8 +29,9 @@ from dataclasses import dataclass, field
 from typing import List, Optional, Tuple, Protocol
 
 from transformers import AutoModelForImageTextToText, GenerationConfig
-from peft import LoraConfig, get_peft_model, get_peft_model_state_dict
+from peft import LoraConfig, TaskType, get_peft_model, get_peft_model_state_dict
 
+import warnings
 
 # ---------------------------------------------------------------------------
 # Reward function interface  (concrete implementations in rewards/)
@@ -89,6 +90,7 @@ class RolloutBuffer:
 
     # Teacher's <answer> hidden state from the post-update forward pass
     h_T: Optional[torch.Tensor] = None   # [batch, d_teacher]; filled after update
+    grpo_loss: Optional[float] = None    # for logging
 
 
 # ---------------------------------------------------------------------------
@@ -102,34 +104,32 @@ class GRPOTeacher(nn.Module):
 
     Parameters
     ----------
-    model_name          : HuggingFace checkpoint (same as Student init)
-    G                   : number of rollouts per input
-    think_end_token_id  : token id of </think> — the native Qwen3 end-of-reasoning
-                          token. Used as the h_T extraction anchor for L_distill.
-                          No need to register it; Qwen3 includes it natively.
-    lora_rank / alpha   : LoRA hyperparameters
-    gen_temperature     : sampling temperature for diverse rollouts
-    gen_max_new_tokens  : max tokens to generate per rollout
-    kl_coef             : KL penalty coefficient (0 = disabled)
+    model_name        : HuggingFace checkpoint (same as Student init)
+    G                 : number of rollouts per input
+    answer_token_id   : token id of <ans> (registered as a special token)
+    lora_rank / alpha : LoRA hyperparameters
+    gen_temperature   : sampling temperature for diverse rollouts
+    gen_max_new_tokens: max tokens to generate per rollout
+    kl_coef           : KL penalty coefficient (0 = disabled)
     """
 
     def __init__(
         self,
-        model_name: str = "shreethar/stage1_unsloth",
+        pretrained_model_name_or_path: str = "unsloth/Qwen3.5-4B",
         G: int = 5,
-        answer_token_id: int = -1,          # <answer> special token ID
-        new_vocab_size:  int = -1,          # vocab size after tokenizer extension
+        answer_token_id: int = -1,          # set after tokenizer extension
         lora_rank: int = 64,
         lora_alpha: int = 128,
         lora_dropout: float = 0.05,
         gen_temperature: float = 0.9,
         gen_max_new_tokens: int = 512,
         kl_coef: float = 0.0,
+        use_gradient_checkpointing: bool = True,
     ):
         super().__init__()
         self.G = G
-        self.answer_token_id = answer_token_id
-        self.gen_temperature   = gen_temperature
+        self.end_think_token_id = answer_token_id  # Rename variable internally
+        self.gen_temperature  = gen_temperature
         self.gen_max_new_tokens = gen_max_new_tokens
         self.kl_coef = kl_coef
 
@@ -137,46 +137,45 @@ class GRPOTeacher(nn.Module):
         # 1. Base VLM
         # ------------------------------------------------------------------
         base = AutoModelForImageTextToText.from_pretrained(
-            model_name,
-            torch_dtype=torch.bfloat16,
+            pretrained_model_name_or_path,
+            dtype=torch.bfloat16,
+            attn_implementation="flash_attention_2",
+            trust_remote_code=True,
         )
 
-        # Freeze vision encoder
-        # Qwen3.5 hierarchy: base.model.visual
-        for param in base.model.visual.parameters():
-            param.requires_grad = False
+        # Freeze vision encoder (if present)
+        if hasattr(base.model, "visual"):
+            for param in base.model.visual.parameters():
+                param.requires_grad = False
 
         # ------------------------------------------------------------------
-        # 2. LoRA — targets both standard Attention and Gated DeltaNet layers
+        # 2. LoRA
         # ------------------------------------------------------------------
         lora_cfg = LoraConfig(
+            task_type=TaskType.CAUSAL_LM,
             r=lora_rank,
             lora_alpha=lora_alpha,
             lora_dropout=lora_dropout,
             target_modules=[
-                # Standard attention projections
                 "q_proj", "k_proj", "v_proj", "o_proj",
-                # Gated DeltaNet main projections
-                "out_proj", "in_proj_qkv", "in_proj_z",
-                # Feed-forward network
                 "gate_proj", "up_proj", "down_proj",
-            ],
+                "out_proj", "in_proj_qkv", "in_proj_z", "in_proj_b", "in_proj_a"],
             bias="none",
         )
         self.vlm = get_peft_model(base, lora_cfg)
-
-        # Resize embedding table to match extended tokenizer (<answer> token)
-        if new_vocab_size > 0 and new_vocab_size != self.vlm.config.vocab_size:
-            self.vlm.resize_token_embeddings(new_vocab_size)
-
-        # Qwen3.5 config: hidden_size is under text_config
-        self.hidden_dim: int = self.vlm.config.text_config.hidden_size   # 2560
+        self.hidden_dim: int = self.vlm.config.text_config.hidden_size   # 2048
 
         # ------------------------------------------------------------------
         # 3. Optional frozen reference snapshot for KL penalty
         #    Created lazily on first call when kl_coef > 0
         # ------------------------------------------------------------------
         self._ref_model: Optional[nn.Module] = None
+
+        if use_gradient_checkpointing:
+            self.vlm.gradient_checkpointing_enable(
+                gradient_checkpointing_kwargs={"use_reentrant": False}
+            )
+            self.vlm.config.use_cache = False
 
     # -----------------------------------------------------------------------
     # Reference model for KL (lazy init, frozen copy of initial Teacher)
@@ -203,26 +202,26 @@ class GRPOTeacher(nn.Module):
         image_grid_thw: Optional[torch.Tensor],
     ) -> torch.Tensor:
         """Embed tokens and splice in visual encoder features."""
-        # Qwen3.5 hierarchy: vlm.model (Qwen3_5ForConditionalGeneration)
-        #   → .model (Qwen3_5Model) → .language_model.embed_tokens
-        inner_model = self.vlm.model.model  # Qwen3_5Model
-        embeds = inner_model.language_model.embed_tokens(input_ids)
+        embeds = self.vlm.model.model.language_model.embed_tokens(input_ids)
         if pixel_values is not None:
             with torch.no_grad():
-                img_feats = inner_model.visual(pixel_values, grid_thw=image_grid_thw)
+                img_feats = (self.vlm.model.model.visual(pixel_values, grid_thw=image_grid_thw) if image_grid_thw is not None else self.vlm.model.model.visual(pixel_values))
             mask = (input_ids == self.vlm.config.image_token_id)
             embeds = embeds.clone()
+            
+            if not isinstance(img_feats, torch.Tensor):
+                # Qwen3_5/Qwen2VL returns BaseModelOutputWithPooling where last_hidden_state is unmerged
+                # and pooler_output is the projected/merged 2560-dim tensor.
+                img_feats = getattr(img_feats, 'pooler_output', img_feats[0])
+                
             embeds[mask] = img_feats.to(embeds.dtype)
         return embeds
 
-    def _find_answer_positions(self, token_ids: torch.Tensor) -> torch.Tensor:
+    def _find_think_end_positions(self, token_ids: torch.Tensor) -> torch.Tensor:
         """
-        Locate the FIRST <answer> token position in each sequence.
-
-        <answer> is registered as a special single token and marks the START
-        of the answer section — the most semantically meaningful h_T anchor.
-        Falls back to the last non-padding position if <answer> is absent
-        (handles early training steps before the format is learned).
+        Locate the </think> token position in each sequence.
+        Falls back to the last non-padding position if </think> is not found
+        (should not happen after SFT, but guards against edge cases).
 
         Parameters
         ----------
@@ -236,9 +235,9 @@ class GRPOTeacher(nn.Module):
         positions  = torch.zeros(batch_size, dtype=torch.long, device=token_ids.device)
 
         for i in range(batch_size):
-            matches = (token_ids[i] == self.answer_token_id).nonzero(as_tuple=False)
+            matches = (token_ids[i] == self.end_think_token_id).nonzero(as_tuple=False)
             if matches.numel() > 0:
-                positions[i] = matches[0, 0]           # FIRST <answer> occurrence
+                positions[i] = matches[0, 0]           # first occurrence
             else:
                 # Fallback: last non-pad token
                 non_pad = (token_ids[i] != 0).nonzero(as_tuple=False)
@@ -292,32 +291,39 @@ class GRPOTeacher(nn.Module):
             eos_token_id=tokenizer.eos_token_id,
         )
 
-        for _ in range(self.G):
-            outputs = self.vlm.generate(
-                input_ids=input_ids,
-                pixel_values=pixel_values,
-                image_grid_thw=image_grid_thw,
-                attention_mask=attention_mask,
-                generation_config=gen_config,
-                use_cache=True,
-                return_dict_in_generate=False,
-            )
-            # outputs: [batch, prompt_len + new_tokens]
+        was_training = self.vlm.training
+        self.vlm.eval()
 
-            # Pad to consistent length within this rollout (already done by generate)
-            response_ids = outputs[:, prompt_len:]   # [batch, new_tokens]
+        try:
+            for _ in range(self.G):
+                outputs = self.vlm.generate(
+                    input_ids=input_ids,
+                    pixel_values=pixel_values,
+                    image_grid_thw=image_grid_thw,
+                    attention_mask=attention_mask,
+                    generation_config=gen_config,
+                    use_cache=True,
+                    return_dict_in_generate=False,
+                )
+                # outputs: [batch, prompt_len + new_tokens]
 
-            # Decode response portion only
-            texts = tokenizer.batch_decode(
-                response_ids, skip_special_tokens=False
-            )
+                # Pad to consistent length within this rollout (already done by generate)
+                response_ids = outputs[:, prompt_len:]   # [batch, new_tokens]
 
-            # Build full attention mask (1 on all non-pad positions)
-            full_mask = (outputs != tokenizer.pad_token_id).long()
+                # Decode response portion only
+                texts = tokenizer.batch_decode(
+                    response_ids, skip_special_tokens=False
+                )
 
-            all_ids.append(outputs)
-            all_texts.append(texts)
-            all_masks.append(full_mask)
+                # Build full attention mask (1 on all non-pad positions)
+                full_mask = (outputs != tokenizer.pad_token_id).long()
+
+                all_ids.append(outputs)
+                all_texts.append(texts)
+                all_masks.append(full_mask)
+        finally:
+            if was_training:
+                self.vlm.train()
 
         return all_ids, all_texts, all_masks
 
@@ -356,13 +362,20 @@ class GRPOTeacher(nn.Module):
         for g in range(G):
             r_g = torch.zeros(batch, device=all_ids[0].device)
             for fn, w in zip(reward_fns, weights):
-                r_g = r_g + w * fn(
+                reward_out = fn(
                     rollout_ids=all_ids[g],
                     rollout_text=all_texts[g],
                     pixel_values=pixel_values,
                     image_grid_thw=image_grid_thw,
                     ground_truth=ground_truth,
-                ).float()
+                )
+                if isinstance(reward_out, torch.Tensor):
+                    reward_out = reward_out.to(r_g.device).float()
+                else:
+                    # In case a reward fn returns a list of floats
+                    reward_out = torch.tensor(reward_out, device=r_g.device, dtype=torch.float32)
+
+                r_g = r_g + w * reward_out
             rewards[g] = r_g
 
         return rewards   # [G, batch]
@@ -389,6 +402,18 @@ class GRPOTeacher(nn.Module):
         # Compute mean and std over the G dimension for each batch item
         mean = rewards.mean(dim=0, keepdim=True)   # [1, batch]
         std  = rewards.std(dim=0, keepdim=True)    # [1, batch]
+
+        # Warning for near-zero variance
+        low_var_mask = std.squeeze(0) < (eps * 10)
+        if low_var_mask.any():
+            n = low_var_mask.sum().item()
+            warnings.warn(
+                f"{n}/{low_var_mask.shape[0]} batch items have near-zero reward "
+                f"variance across G rollouts. Advantages will be ~0 for these items "
+                f"(no learning signal). Consider increasing gen_temperature or "
+                f"checking your reward function.",
+                stacklevel=2,
+            )
         return (rewards - mean) / (std + eps)      # [G, batch]
 
     # -----------------------------------------------------------------------
@@ -397,8 +422,8 @@ class GRPOTeacher(nn.Module):
 
     def compute_grpo_loss(
         self,
-        all_ids: List[torch.Tensor],
-        all_masks: List[torch.Tensor],
+        all_ids: List[torch.Tensor],        # List[G], each [batch, seq_g]
+        all_masks: List[torch.Tensor],      # List[G], each [batch, seq_g]
         advantages: torch.Tensor,           # [G, batch]
         pixel_values: Optional[torch.Tensor],
         image_grid_thw: Optional[torch.Tensor],
@@ -423,68 +448,111 @@ class GRPOTeacher(nn.Module):
             self._ensure_ref_model()
 
         G     = len(all_ids)
+        B     = all_ids[0].shape[0]
         device = all_ids[0].device
-        total_loss = torch.tensor(0.0, device=device)
+        # total_loss = torch.tensor(0.0, device=device)
+
+        # ── Step B: Chunked Forward & Backward Pass ───────────────────────
+        # By processing one rollout group (B sequences) at a time and calling 
+        # .backward(), PyTorch instantly frees the massive activation memory and 
+        # gradient tensors. Peak VRAM becomes B instead of G*B!
+        
+        total_rollout_loss = 0.0
+        total_kl_loss = 0.0
+        
+        if self.kl_coef > 0:
+            self._ref_model.to(device)
 
         for g in range(G):
-            ids      = all_ids[g]         # [batch, seq]
-            attn     = all_masks[g]       # [batch, seq]
-            adv_g    = advantages[g]      # [batch]
+            for b_idx in range(B):
+                # 1. Slice rollout to EXACTLY 1 sequence (Absolute minimum peak VRAM)
+                batch_id = all_ids[g][b_idx:b_idx+1]      # [1, seq_g]
+                batch_mask = all_masks[g][b_idx:b_idx+1]  # [1, seq_g]
+                
+                # Response mask & lengths
+                resp_mask = torch.zeros_like(batch_id, dtype=torch.float)
+                resp_mask[:, prompt_len:] = (batch_id[:, prompt_len:] != 0).float()
+                resp_lens = resp_mask.sum(dim=-1).clamp(min=1)  # [1]
 
-            # Build labels: -100 on prompt tokens, real ids on response tokens
-            labels = ids.clone()
-            labels[:, :prompt_len] = -100
+                # 2. Correctly slice the flattened image patches for this specific sequence
+                if pixel_values is not None:
+                    thw = image_grid_thw[b_idx:b_idx+1]  # [1, 3]
+                    num_patches = thw.prod(dim=-1).item()
+                    offset = 0 if b_idx == 0 else image_grid_thw[:b_idx].prod(dim=-1).sum().item()
+                    pv = pixel_values[offset : offset + num_patches]
+                else:
+                    pv = None
+                    thw = None
 
-            # Pad mask for response positions only
-            response_mask = self._compute_response_mask(ids, prompt_len)
-            response_lens = response_mask.sum(dim=-1).clamp(min=1)  # [batch]
+                # 3. Forward pass for just ONE sequence
+                inputs_embeds = self._build_input_embeds(batch_id, pv, thw)
+                
+                # Explicitly compute position_ids to bypass Qwen3.5 RoPE bug when inputs_embeds is used
+                position_ids = batch_mask.long().cumsum(-1) - 1
+                position_ids.masked_fill_(batch_mask == 0, 1)
 
-            # Forward pass through Teacher
-            inputs_embeds = self._build_input_embeds(
-                ids, pixel_values, image_grid_thw
-            )
-            out = self.vlm.model.model(
-                inputs_embeds=inputs_embeds,
-                attention_mask=attn,
-                return_dict=True,
-            )
-            logits = self.vlm.model.lm_head(out.last_hidden_state)  # [batch, seq, vocab]
+                out = self.vlm(
+                    inputs_embeds=inputs_embeds,
+                    attention_mask=batch_mask,
+                    position_ids=position_ids,
+                    use_cache=False,
+                    return_dict=True,
+                )
+                logits = out.logits  # [1, seq_g, vocab]
 
-            # Per-token log-probs
-            log_probs = F.log_softmax(logits[:, :-1, :], dim=-1)  # [batch, seq-1, vocab]
-            target_ids = ids[:, 1:]                                # [batch, seq-1]
-            token_log_p = log_probs.gather(
-                dim=-1, index=target_ids.unsqueeze(-1)
-            ).squeeze(-1)                                          # [batch, seq-1]
+                # 4. Log-probs
+                target_ids = batch_id[:, 1:]
+                logits_shifted = logits[:, :-1, :]
+                target_logits = logits_shifted.gather(dim=-1, index=target_ids.unsqueeze(-1)).squeeze(-1)
+                token_log_p = target_logits - torch.logsumexp(logits_shifted, dim=-1) # [1, seq-1]
 
-            # Mask to response tokens and average over response length
-            resp_mask_shifted = response_mask[:, 1:]              # [batch, seq-1]
-            mean_log_p = (token_log_p * resp_mask_shifted).sum(dim=-1) / response_lens
-            # [batch]
+                # Mean log-prob per response
+                resp_mask_shifted = resp_mask[:, 1:]
+                mean_log_p = (token_log_p * resp_mask_shifted).sum(dim=-1) / resp_lens  # [1]
 
-            # Optional KL term per rollout
-            kl_term = torch.zeros_like(mean_log_p)
-            if self.kl_coef > 0:
-                with torch.no_grad():
-                    ref_out = self._ref_model.model.model(
-                        inputs_embeds=inputs_embeds.detach(),
-                        attention_mask=attn,
-                        return_dict=True,
-                    )
-                    ref_logits  = self._ref_model.model.lm_head(ref_out.last_hidden_state)
-                    ref_log_p   = F.log_softmax(ref_logits[:, :-1, :], dim=-1)
-                    ref_token_p = ref_log_p.gather(
-                        dim=-1, index=target_ids.unsqueeze(-1)
-                    ).squeeze(-1)
-                    kl = (token_log_p - ref_token_p) * resp_mask_shifted
-                    kl_term = kl.sum(dim=-1) / response_lens      # [batch]
+                # 5. Rollout Loss
+                adv_g = advantages[g, b_idx:b_idx+1]  # [1]
+                loss_gb = -(adv_g * mean_log_p).mean() / (G * B)  # scaled by 1/(G*B)
+                
+                # 6. KL Loss
+                kl_gb = torch.tensor(0.0, device=device)
+                if self.kl_coef > 0:
+                    with torch.no_grad(), torch.cuda.amp.autocast(dtype=torch.float16):
+                        ref_out = self._ref_model(
+                            inputs_embeds=inputs_embeds.detach(),
+                            attention_mask=batch_mask,
+                            position_ids=position_ids,
+                            use_cache=False,
+                            return_dict=True,
+                        )
+                        ref_logits = ref_out.logits[:, :-1, :]
+                        ref_target_logits = ref_logits.gather(dim=-1, index=target_ids.unsqueeze(-1)).squeeze(-1)
+                        ref_token_p = ref_target_logits - torch.logsumexp(ref_logits, dim=-1)
+                        
+                        kl = (token_log_p.detach() - ref_token_p) * resp_mask_shifted
+                        kl_per_token = kl.sum(dim=-1) / resp_lens
+                        kl_gb = (self.kl_coef * kl_per_token.mean()) / (G * B)
 
-            # GRPO contribution for rollout g
-            rollout_loss = -(adv_g * mean_log_p).mean()
-            kl_loss      = self.kl_coef * kl_term.mean()
-            total_loss   = total_loss + (rollout_loss + kl_loss)
+                # 7. Backward pass FOR THIS 1-ITEM CHUNK ONLY!
+                chunk_loss = loss_gb + kl_gb
+                chunk_loss.backward()
+                
+                total_rollout_loss += (loss_gb.item() * G * B)  # un-scale for logging
+                total_kl_loss += (kl_gb.item() * G * B)
+                
+                # Explicitly delete massive tensors BEFORE next micro-batch!
+                del out, logits, inputs_embeds, logits_shifted, position_ids
+                del target_logits, token_log_p, chunk_loss, loss_gb
+                if self.kl_coef > 0:
+                    del ref_out, ref_logits, ref_target_logits, ref_token_p, kl_gb
+                
+                torch.cuda.empty_cache()
 
-        return total_loss / G   # average over rollouts
+        if self.kl_coef > 0:
+            self._ref_model.cpu()
+            torch.cuda.empty_cache()
+
+        return torch.tensor(total_rollout_loss + total_kl_loss, device=device)
 
     # -----------------------------------------------------------------------
     # Step 5 + 6: Identify τ+/τ- and extract h_T
@@ -540,29 +608,29 @@ class GRPOTeacher(nn.Module):
         tau_pos_response = self._compute_response_mask(tau_pos_ids, prompt_len)
         tau_neg_response = self._compute_response_mask(tau_neg_ids, prompt_len)
 
-        # <answer> token positions in τ+
-        answer_pos = self._find_answer_positions(tau_pos_ids)
+        # </think> token positions in τ+
+        think_end_pos = self._find_think_end_positions(tau_pos_ids)
 
         return (
             tau_pos_ids, tau_pos_mask,
             tau_neg_ids, tau_neg_mask,
             tau_pos_texts, tau_neg_texts,
             tau_pos_response, tau_neg_response,
-            answer_pos,
+            think_end_pos,
         )
 
     @torch.no_grad()
-    def extract_answer_hidden_state(
+    def extract_think_end_hidden_state(
         self,
         tau_pos_ids: torch.Tensor,      # [batch, seq_pos]
         tau_pos_mask: torch.Tensor,
         pixel_values: Optional[torch.Tensor],
         image_grid_thw: Optional[torch.Tensor],
-        answer_token_pos: torch.Tensor, # [batch]
+        think_end_token_pos: torch.Tensor, # [batch]
     ) -> torch.Tensor:
         """
         Separate forward pass through the UPDATED Teacher on τ+.
-        Extracts the hidden state at the <answer> token position.
+        Extracts the hidden state at the </think> token position.
 
         Called AFTER the Teacher's GRPO optimizer step so that h_T reflects
         the post-update weights — matching Algorithm 1's sequential ordering.
@@ -575,19 +643,20 @@ class GRPOTeacher(nn.Module):
             tau_pos_ids, pixel_values, image_grid_thw
         )
 
-        out = self.vlm.model.model(
+        out = self.vlm(
             inputs_embeds=inputs_embeds,
             attention_mask=tau_pos_mask,
-            output_hidden_states=False,
+            use_cache=False,
+            output_hidden_states=True,
             return_dict=True,
         )
 
-        h_all = out.last_hidden_state   # [batch, seq, d]
+        h_all = out.hidden_states[-1]   # [batch, seq, d]
         batch  = h_all.shape[0]
 
         h_T = h_all[
             torch.arange(batch, device=h_all.device),
-            answer_token_pos,
+            think_end_token_pos,
         ]   # [batch, d]
 
         return h_T
@@ -624,6 +693,11 @@ class GRPOTeacher(nn.Module):
         -------
         buffer : RolloutBuffer  (h_T is set and ready for L_distill)
         """
+
+        assert self.end_think_token_id > 0, (
+            "end_think_token_id not provided properly"
+        )
+
         prompt_len = input_ids.shape[1]
 
         # --- Step 1: Generate G rollouts (no_grad) -------------------------
@@ -641,13 +715,13 @@ class GRPOTeacher(nn.Module):
         # --- Step 3: Advantages --------------------------------------------
         advantages = self.compute_advantages(rewards)   # [G, batch]
 
-        # --- Step 4: GRPO loss + Teacher update ----------------------------
         optimizer.zero_grad()
-        grpo_loss = self.compute_grpo_loss(
+        # compute_grpo_loss now internally chunks the forward/backward passes 
+        # to prevent OOM. Gradients are automatically accumulated.
+        grpo_loss_val = self.compute_grpo_loss(
             all_ids, all_masks, advantages,
             pixel_values, image_grid_thw, prompt_len,
         )
-        grpo_loss.backward()
         nn.utils.clip_grad_norm_(self.vlm.parameters(), grad_clip)
         optimizer.step()
 
@@ -657,16 +731,16 @@ class GRPOTeacher(nn.Module):
             tau_neg_ids, tau_neg_mask,
             tau_pos_texts, tau_neg_texts,
             tau_pos_response, tau_neg_response,
-            answer_pos,
+            think_end_pos,
         ) = self.select_best_worst(
             all_ids, all_masks, all_texts, advantages, prompt_len
         )
 
         # --- Step 6: Extract h_T from UPDATED Teacher ----------------------
-        h_T = self.extract_answer_hidden_state(
+        h_T = self.extract_think_end_hidden_state(
             tau_pos_ids, tau_pos_mask,
             pixel_values, image_grid_thw,
-            answer_pos,
+            think_end_pos,
         )
 
         # --- Pack into RolloutBuffer ---------------------------------------
@@ -684,8 +758,9 @@ class GRPOTeacher(nn.Module):
             tau_neg_mask=tau_neg_mask,
             tau_pos_response_mask=tau_pos_response,
             tau_neg_response_mask=tau_neg_response,
-            answer_token_pos=answer_pos,
+            answer_token_pos=think_end_pos,
             h_T=h_T,
+            grpo_loss=grpo_loss_val.item(),
         )
 
         return buffer
