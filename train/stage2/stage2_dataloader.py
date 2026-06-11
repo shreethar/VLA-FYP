@@ -75,6 +75,7 @@ STAGE2_TRAJ_SYSTEM = (
     "distinct waypoints showing the continuous movement from the start to the target. "
     "If reasoning, provide a single concise plan: identify the start, locate the target, "
     "and interpolate the path. Do NOT loop, endlessly refine, or re-evaluate. "
+    "Once you get a feasible trajectory output, finish reasoning, DO NOT RE-EVALUATE."
     "Finally, output the coordinate list exactly once in this exact format: "
     "[[x1,y1],[x2,y2],[x3,y3],[x4,y4],[x5,y5]]"
 )
