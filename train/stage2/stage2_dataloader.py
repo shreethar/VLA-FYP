@@ -71,10 +71,12 @@ _STAGE1_PREFIX_RE = re.compile(
 STAGE2_TRAJ_SYSTEM = (
     "You are a robot manipulation assistant. "
     "Given an observation image and a task instruction, predict the "
-    f"end-effector's 2D trajectory as {K_WAYPOINTS} waypoints.\n\n"
-    "Think through the task, then output the coordinate list inside answer tags:\n"
-    "<answer>[[x1,y1],[x2,y2],[x3,y3],[x4,y4],[x5,y5]]</answer>\n\n"
-    "Coordinates are 0-1000 integers (0=top-left, 1000=bottom-right)."
+    f"end-effector's 2D trajectory as {K_WAYPOINTS} "
+    "distinct waypoints showing the continuous movement from the start to the target. "
+    "If reasoning, provide a single concise plan: identify the start, locate the target, "
+    "and interpolate the path. Do NOT loop, endlessly refine, or re-evaluate. "
+    "Finally, output the coordinate list exactly once in this exact format: "
+    "[[x1,y1],[x2,y2],[x3,y3],[x4,y4],[x5,y5]]"
 )
 
 
