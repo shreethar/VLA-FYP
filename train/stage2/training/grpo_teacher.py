@@ -289,26 +289,36 @@ class GRPOTeacher(nn.Module):
             max_new_tokens=self.gen_max_new_tokens,
             pad_token_id=tokenizer.pad_token_id,
             eos_token_id=tokenizer.eos_token_id,
+            num_return_sequences=self.G,
         )
 
         was_training = self.vlm.training
         self.vlm.eval()
 
+        batch_size = input_ids.shape[0]
+
         try:
-            for _ in range(self.G):
-                outputs = self.vlm.generate(
-                    input_ids=input_ids,
-                    pixel_values=pixel_values,
-                    image_grid_thw=image_grid_thw,
-                    attention_mask=attention_mask,
-                    generation_config=gen_config,
-                    use_cache=True,
-                    return_dict_in_generate=False,
-                )
-                # outputs: [batch, prompt_len + new_tokens]
+            outputs = self.vlm.generate(
+                input_ids=input_ids,
+                pixel_values=pixel_values,
+                image_grid_thw=image_grid_thw,
+                attention_mask=attention_mask,
+                generation_config=gen_config,
+                use_cache=True,
+                return_dict_in_generate=False,
+            )
+            # outputs shape: [batch * G, prompt_len + new_tokens]
+            
+            # Reshape from [B * G, seq_len] to [B, G, seq_len]
+            # Transformers generates them interleaved: b0_g0, b0_g1... b1_g0, b1_g1...
+            seq_len = outputs.shape[1]
+            outputs = outputs.view(batch_size, self.G, seq_len)
+            
+            for g in range(self.G):
+                g_outputs = outputs[:, g, :]  # [batch, seq_len]
 
                 # Pad to consistent length within this rollout (already done by generate)
-                response_ids = outputs[:, prompt_len:]   # [batch, new_tokens]
+                response_ids = g_outputs[:, prompt_len:]   # [batch, new_tokens]
 
                 # Decode response portion only
                 texts = tokenizer.batch_decode(
@@ -316,9 +326,9 @@ class GRPOTeacher(nn.Module):
                 )
 
                 # Build full attention mask (1 on all non-pad positions)
-                full_mask = (outputs != tokenizer.pad_token_id).long()
+                full_mask = (g_outputs != tokenizer.pad_token_id).long()
 
-                all_ids.append(outputs)
+                all_ids.append(g_outputs)
                 all_texts.append(texts)
                 all_masks.append(full_mask)
         finally:
