@@ -59,52 +59,19 @@ _EXTRA_TEXT_PATTERN = re.compile(
 )
 
 
-def check_structural_format(text: str, K: int = 5) -> bool:
+def check_structural_format(text: str, K: int = 5) -> float:
     """
-    Returns True iff the rollout text exactly matches the required structure:
-        <think>NON-EMPTY</think><ans>K coordinate pairs</ans>
-
-    Checks (in order):
-        1. No leading text before <think>
-        2. <think> block is non-empty
-        3. <ans> block immediately follows </think>
-        4. <ans> contains exactly K semicolon-separated x,y pairs
-        5. All coordinates are floats in [0, 1]
-        6. Nothing follows </ans>
+    Returns the format reward based on presence of </think> and token length limit.
     """
-    text = text.strip()
-
-    # 1. Must start with <think>
-    if not text.lower().startswith("<think>"):
-        return False
-
-    # 2. <think> block must be non-empty
-    think_match = _THINK_PATTERN.match(text)
-    if not think_match or not think_match.group(1).strip():
-        return False
-
-    # 3 & 6. <ans> immediately after </think> with nothing following
-    ans_match = _ANS_PATTERN.search(text)
-    if not ans_match:
-        return False
-
-    # 4 & 5. Validate coordinates
-    pairs = ans_match.group(1).strip().split(";")
-    if len(pairs) != K:
-        return False
-
-    for pair in pairs:
-        parts = pair.strip().split(",")
-        if len(parts) != 2:
-            return False
-        try:
-            x, y = float(parts[0]), float(parts[1])
-            if not (0.0 <= x <= 1.0 and 0.0 <= y <= 1.0):
-                return False
-        except ValueError:
-            return False
-
-    return True
+    # Assuming ~4 characters per token as a standard heuristic.
+    # 2000 tokens * 4 chars/token = 8000 characters limit.
+    if len(text) > 8000:
+        return 0.0 # Penalize for being too long
+        
+    if "</think>" not in text:
+        return 0.0 # Penalize for missing </think>
+        
+    return 1.0
 
 
 # ---------------------------------------------------------------------------
@@ -209,8 +176,8 @@ class FormatReward:
                 except Exception:
                     rewards[i] = 0.0
             else:
-                # Coordinate mode: binary structural check
-                rewards[i] = 1.0 if check_structural_format(text, K=self.K) else 0.0
+                # Coordinate mode: structural check based on user criteria
+                rewards[i] = check_structural_format(text, K=self.K)
 
         return rewards   # [batch]
 

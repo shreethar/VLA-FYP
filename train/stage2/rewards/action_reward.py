@@ -101,32 +101,25 @@ _BRACKET_PAIR   = re.compile(r'\[\s*(\d+(?:\.\d+)?)\s*,\s*(\d+(?:\.\d+)?)\s*\]')
 def parse_waypoints(text: str, K: int = 5) -> Optional[np.ndarray]:
     """
     Parse K waypoints from a Teacher rollout string.
-
-    Expected format after Stage 1.5 SFT:
-        <think>...reasoning...</think>
-        <answer>[[x1,y1],[x2,y2],[x3,y3],[x4,y4],[x5,y5]]</answer>
-
-    Primary:  extract from <answer>...</answer> (clean boundary).
-    Fallback: search full text for K [x,y] pairs if <answer> tag absent
-              (handles early GRPO steps before format is fully learned).
-
-    Scale auto-detection:
-        if any coordinate > 1.0  ->  0-1000 scale  ->  divide by 1000
-        otherwise                ->  already [0, 1]
-    Returned array is always in [0, 1].
-
-    Returns
-    -------
-    waypoints : [K, 2] float32 ndarray in [0, 1], or None if parsing fails.
+    Only extracts coordinates found after the </think> token.
+    If </think> is missing, returns None (0 reward).
     """
-    # Primary: extract content from <answer>...</answer>
-    ans_match   = _ANSWER_PATTERN.search(text)
-    search_text = ans_match.group(1) if ans_match else text
+    if "</think>" not in text:
+        return None
+        
+    # Only search in the text after the </think> token
+    search_text = text.split("</think>")[-1]
 
     try:
         pairs = _BRACKET_PAIR.findall(search_text)
-        if len(pairs) != K:
+        
+        if len(pairs) < K:
             return None
+            
+        # If there are more than K pairs, assume the final ones are the intended output
+        if len(pairs) > K:
+            pairs = pairs[-K:]
+
         waypoints = [[float(x), float(y)] for x, y in pairs]
         arr = np.array(waypoints, dtype=np.float32)   # [K, 2]
 
