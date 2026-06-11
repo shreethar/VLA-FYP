@@ -617,6 +617,21 @@ def train_stage2(
 
                 # ── Rollout Text Logging (every 10 steps) ────────────────
                 if step % 10 == 0:
+                    # ── Waypoint Table Logging ───────────────────────────────
+                    try:
+                        wp_table = wandb.Table(columns=["Batch_Idx", "Pred_Waypoints", "GT_Waypoints"])
+                        B_len = gt_waypoints.shape[0]
+                        if loss_out.pred_waypoints is not None:
+                            pred_wp = loss_out.pred_waypoints.cpu().tolist()
+                            gt_wp = gt_waypoints.cpu().tolist()
+                            for b in range(B_len):
+                                pred_str = str([[round(p[0], 3), round(p[1], 3)] for p in pred_wp[b]])
+                                gt_str = str([[round(g[0], 3), round(g[1], 3)] for g in gt_wp[b]])
+                                wp_table.add_data(b, pred_str, gt_str)
+                            wandb_payload["waypoints/pred_vs_gt_table"] = wp_table
+                    except Exception as e:
+                        logger.warning(f"Failed to log wandb waypoints table: {e}")
+
                     try:
                         table = wandb.Table(columns=["Batch_Idx", "Rollout_Idx", "Reward", "Advantage", "Text"])
                         G_len = buffer.rewards.shape[0]

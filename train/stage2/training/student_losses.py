@@ -62,6 +62,7 @@ class LossOutput:
 
     # Saved latents for generation logging
     latents: Optional[torch.Tensor] = None
+    pred_waypoints: Optional[torch.Tensor] = None
 
 
 # Alias for backwards compat if any code references the old name
@@ -252,6 +253,7 @@ class StudentLossComputer(nn.Module):
             lm_loss=lm_loss,
             metrics=metrics,
             latents=z,
+            pred_waypoints=pred_waypoints.detach(),
         )
 
     # -----------------------------------------------------------------------
