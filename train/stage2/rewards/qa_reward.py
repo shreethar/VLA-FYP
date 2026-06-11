@@ -64,8 +64,8 @@ def check_structural_format(text: str, K: int = 5) -> float:
     Returns the format reward based on presence of </think> and token length limit.
     """
     # Assuming ~4 characters per token as a standard heuristic.
-    # 2000 tokens * 4 chars/token = 8000 characters limit.
-    if len(text) > 8000:
+    # 500 tokens * 4 chars/token = 2000 characters limit.
+    if len(text) > 2000:
         return 0.0 # Penalize for being too long
         
     if "</think>" not in text:
