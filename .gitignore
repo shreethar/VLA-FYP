@@ -51,6 +51,7 @@ train/stage2/test/images/
 
 
 # Checkpoints
+checkpoints.zip
 checkpoints/
 
 # WandB
