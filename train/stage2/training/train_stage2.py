@@ -540,8 +540,11 @@ def train_stage2(
             loss_lm = loss_out.lm_loss / cfg.grad_accum_steps
             loss_lm.backward()
             if is_accum_step:
-                nn.utils.clip_grad_norm_(verbalizer.parameters(), cfg.grad_clip)
-                verbalizer_opt.step()
+                v_norm = nn.utils.clip_grad_norm_(verbalizer.parameters(), cfg.grad_clip)
+                if torch.isnan(v_norm) or torch.isinf(v_norm):
+                    logger.warning(f"Verbalizer gradients are NaN/Inf (norm={v_norm}). Skipping step.")
+                else:
+                    verbalizer_opt.step()
                 verbalizer_sched.step()
                 verbalizer_opt.zero_grad()
 
@@ -549,11 +552,14 @@ def train_stage2(
             loss_student = loss_out.student_total / cfg.grad_accum_steps
             loss_student.backward()
             if is_accum_step:
-                nn.utils.clip_grad_norm_(
+                s_norm = nn.utils.clip_grad_norm_(
                     [p for p in student.parameters() if p.requires_grad],
                     cfg.grad_clip,
                 )
-                student_opt.step()
+                if torch.isnan(s_norm) or torch.isinf(s_norm):
+                    logger.warning(f"Student gradients are NaN/Inf (norm={s_norm}). Skipping step.")
+                else:
+                    student_opt.step()
                 student_sched.step()
                 student_opt.zero_grad()
 
@@ -563,11 +569,14 @@ def train_stage2(
             loss_student = loss_out.student_total / cfg.grad_accum_steps
             loss_student.backward()
             if is_accum_step:
-                nn.utils.clip_grad_norm_(
+                s_norm = nn.utils.clip_grad_norm_(
                     [p for p in student.parameters() if p.requires_grad],
                     cfg.grad_clip,
                 )
-                student_opt.step()
+                if torch.isnan(s_norm) or torch.isinf(s_norm):
+                    logger.warning(f"Student gradients are NaN/Inf (norm={s_norm}). Skipping step.")
+                else:
+                    student_opt.step()
                 student_sched.step()
                 student_opt.zero_grad()
 

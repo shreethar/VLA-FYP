@@ -573,7 +573,7 @@ class GRPOTeacher(nn.Module):
                     use_cache=False,
                     return_dict=True,
                 )
-                logits = out.logits  # [1, seq_g, vocab]
+                logits = out.logits.float()  # [1, seq_g, vocab]
 
                 # 4. Log-probs
                 target_ids = batch_id[:, 1:]
@@ -808,9 +808,13 @@ class GRPOTeacher(nn.Module):
         )
         
         if is_accum_step:
-            nn.utils.clip_grad_norm_(self.vlm.parameters(), grad_clip)
-            optimizer.step()
-            optimizer.zero_grad()
+            grad_norm = nn.utils.clip_grad_norm_(self.vlm.parameters(), grad_clip)
+            if torch.isnan(grad_norm) or torch.isinf(grad_norm):
+                warnings.warn(f"Teacher gradients are NaN/Inf (norm={grad_norm}). Skipping optimizer step.", stacklevel=2)
+                optimizer.zero_grad()
+            else:
+                optimizer.step()
+                optimizer.zero_grad()
 
         # --- Step 5: Select τ+ and τ- -------------------------------------
         (
