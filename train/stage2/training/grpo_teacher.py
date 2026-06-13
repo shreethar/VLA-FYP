@@ -438,6 +438,7 @@ class GRPOTeacher(nn.Module):
         pixel_values: Optional[torch.Tensor],
         image_grid_thw: Optional[torch.Tensor],
         prompt_len: int,
+        grad_accum_steps: int = 1,
     ) -> torch.Tensor:
         """
         GRPO policy-gradient loss (REINFORCE with group-relative baseline).
@@ -522,7 +523,7 @@ class GRPOTeacher(nn.Module):
 
                 # 5. Rollout Loss
                 adv_g = advantages[g, b_idx:b_idx+1]  # [1]
-                loss_gb = -(adv_g * mean_log_p).mean() / (G * B)  # scaled by 1/(G*B)
+                loss_gb = -(adv_g * mean_log_p).mean() / (G * B * grad_accum_steps)
                 
                 # 6. KL Loss
                 kl_gb = torch.tensor(0.0, device=device)
@@ -541,14 +542,14 @@ class GRPOTeacher(nn.Module):
                         
                         kl = (token_log_p.detach() - ref_token_p) * resp_mask_shifted
                         kl_per_token = kl.sum(dim=-1) / resp_lens
-                        kl_gb = (self.kl_coef * kl_per_token.mean()) / (G * B)
+                        kl_gb = (self.kl_coef * kl_per_token.mean()) / (G * B * grad_accum_steps)
 
                 # 7. Backward pass FOR THIS 1-ITEM CHUNK ONLY!
                 chunk_loss = loss_gb + kl_gb
                 chunk_loss.backward()
                 
-                total_rollout_loss += (loss_gb.item() * G * B)  # un-scale for logging
-                total_kl_loss += (kl_gb.item() * G * B)
+                total_rollout_loss += (loss_gb.item() * G * B * grad_accum_steps)  # un-scale for logging
+                total_kl_loss += (kl_gb.item() * G * B * grad_accum_steps)
                 
                 # Explicitly delete massive tensors BEFORE next micro-batch!
                 del out, logits, inputs_embeds, logits_shifted, position_ids
@@ -687,6 +688,8 @@ class GRPOTeacher(nn.Module):
         optimizer: torch.optim.Optimizer,
         tokenizer,
         grad_clip: float = 1.0,
+        grad_accum_steps: int = 1,
+        is_accum_step: bool = True,
     ) -> RolloutBuffer:
         """
         Execute the complete Teacher GRPO step and return a populated RolloutBuffer.
@@ -725,15 +728,18 @@ class GRPOTeacher(nn.Module):
         # --- Step 3: Advantages --------------------------------------------
         advantages = self.compute_advantages(rewards)   # [G, batch]
 
-        optimizer.zero_grad()
         # compute_grpo_loss now internally chunks the forward/backward passes 
         # to prevent OOM. Gradients are automatically accumulated.
         grpo_loss_val = self.compute_grpo_loss(
             all_ids, all_masks, advantages,
             pixel_values, image_grid_thw, prompt_len,
+            grad_accum_steps=grad_accum_steps,
         )
-        nn.utils.clip_grad_norm_(self.vlm.parameters(), grad_clip)
-        optimizer.step()
+        
+        if is_accum_step:
+            nn.utils.clip_grad_norm_(self.vlm.parameters(), grad_clip)
+            optimizer.step()
+            optimizer.zero_grad()
 
         # --- Step 5: Select τ+ and τ- -------------------------------------
         (

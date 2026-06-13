@@ -77,6 +77,7 @@ class Stage2Config:
     save_steps:          int  = 500
     log_steps:           int  = 10
     grad_clip:           float = 1.0
+    grad_accum_steps:    int  = 32
 
     # Optimizers
     teacher_lr:          float = 1e-4
@@ -441,6 +442,10 @@ def train_stage2(
     student.train()
     verbalizer.train()
 
+    teacher_opt.zero_grad()
+    student_opt.zero_grad()
+    verbalizer_opt.zero_grad()
+
     # Infinite dataloader iterator
     data_iter = iter(dataloader)
 
@@ -471,6 +476,8 @@ def train_stage2(
         # ----------------------------------------------------------------
         log_memory(f"Step {step} - Before Teacher")
 
+        is_accum_step = ((step + 1) % cfg.grad_accum_steps == 0) or (step == cfg.total_steps - 1)
+
         buffer: RolloutBuffer = teacher.training_step(
             input_ids=input_ids,
             pixel_values=pixel_values,
@@ -482,8 +489,11 @@ def train_stage2(
             optimizer=teacher_opt,
             tokenizer=tokenizer,
             grad_clip=cfg.grad_clip,
+            grad_accum_steps=cfg.grad_accum_steps,
+            is_accum_step=is_accum_step,
         )
-        teacher_sched.step()
+        if is_accum_step:
+            teacher_sched.step()
         log_memory(f"Step {step} - After Teacher")
 
         # ----------------------------------------------------------------
@@ -517,33 +527,39 @@ def train_stage2(
 
         if is_warmup:
             # --- E1. Verbalizer backward (LM loss on τ+, z detached) ----
-            verbalizer_opt.zero_grad()
-            loss_out.lm_loss.backward()
-            nn.utils.clip_grad_norm_(verbalizer.parameters(), cfg.grad_clip)
-            verbalizer_opt.step()
-            verbalizer_sched.step()
+            loss_lm = loss_out.lm_loss / cfg.grad_accum_steps
+            loss_lm.backward()
+            if is_accum_step:
+                nn.utils.clip_grad_norm_(verbalizer.parameters(), cfg.grad_clip)
+                verbalizer_opt.step()
+                verbalizer_sched.step()
+                verbalizer_opt.zero_grad()
 
             # --- E2. Student backward (distill + ans + spatial) ----------
-            student_opt.zero_grad()
-            loss_out.student_total.backward()
-            nn.utils.clip_grad_norm_(
-                [p for p in student.parameters() if p.requires_grad],
-                cfg.grad_clip,
-            )
-            student_opt.step()
-            student_sched.step()
+            loss_student = loss_out.student_total / cfg.grad_accum_steps
+            loss_student.backward()
+            if is_accum_step:
+                nn.utils.clip_grad_norm_(
+                    [p for p in student.parameters() if p.requires_grad],
+                    cfg.grad_clip,
+                )
+                student_opt.step()
+                student_sched.step()
+                student_opt.zero_grad()
 
         else:
             # --- E3. Student backward (verb + distill + ans + spatial) ---
             # Verbalizer is frozen; DPO gradient flows through CA into Student
-            student_opt.zero_grad()
-            loss_out.student_total.backward()
-            nn.utils.clip_grad_norm_(
-                [p for p in student.parameters() if p.requires_grad],
-                cfg.grad_clip,
-            )
-            student_opt.step()
-            student_sched.step()
+            loss_student = loss_out.student_total / cfg.grad_accum_steps
+            loss_student.backward()
+            if is_accum_step:
+                nn.utils.clip_grad_norm_(
+                    [p for p in student.parameters() if p.requires_grad],
+                    cfg.grad_clip,
+                )
+                student_opt.step()
+                student_sched.step()
+                student_opt.zero_grad()
 
         # Clear latents from verbalizer to release the graph memory
         verbalizer.clear_latents()
@@ -755,6 +771,7 @@ if __name__ == "__main__":
     parser.add_argument("--warmup_steps",  type=int, default=3000)
     parser.add_argument("--save_steps",    type=int, default=500)
     parser.add_argument("--log_steps",     type=int, default=10, help="Frequency of console and WandB metrics logging")
+    parser.add_argument("--grad_accum_steps", type=int, default=32, help="Number of gradient accumulation steps")
     # WandB
     parser.add_argument("--wandb_project", type=str, default="reasonflow-vla")
     parser.add_argument("--wandb_run",     type=str, default="stage2-distillation")
@@ -769,6 +786,7 @@ if __name__ == "__main__":
         warmup_steps=args.warmup_steps,
         save_steps=args.save_steps,
         log_steps=args.log_steps,
+        grad_accum_steps=args.grad_accum_steps,
         wandb_project=args.wandb_project,
         wandb_run_name=args.wandb_run,
         use_wandb=not args.no_wandb,
