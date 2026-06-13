@@ -155,30 +155,36 @@ class Stage2Dataset(Dataset):
         self.max_length = max_length
 
         # Filter to trajectory records and verify waypoints can be parsed
-        logger.info("Scanning HF split for trajectory records with valid waypoints…")
+        logger.info("Scanning HF split for records…")
         self.samples = []
         skipped = 0
         for row in hf_split:
-            if row.get("type") != "trajectory":
-                continue
-            wpts = parse_waypoints(row["assistant"])
-            if wpts is None:
-                skipped += 1
-                continue
+            task_type = row.get("type", "trajectory")
+            qa_answer = None
+            if task_type == "trajectory":
+                wpts = parse_waypoints(row["assistant"])
+                if wpts is None:
+                    skipped += 1
+                    continue
+                human_text = _reformat_traj_prompt(row["human"])
+            else:
+                wpts = torch.zeros((K_WAYPOINTS, 2), dtype=torch.float32)
+                human_text = row["human"]
+                qa_answer = row.get("qa_answer", row.get("assistant"))
+
             self.samples.append({
-                "frames":    row["frames"],      # list[PIL.Image]
-                # ↓ Stage 1 system prompt stripped and replaced with Stage 2's
-                # <think>/<ans> + [0,1] format. Without this the model would
-                # output [[500,300],...] in 0-1000 and get zero reward.
-                "human":     _reformat_traj_prompt(row["human"]),
-                "assistant": row["assistant"],   # stored for debugging only
+                "frames":    row["frames"],
+                "human":     human_text,
+                "assistant": row["assistant"],
                 "dataset":   row["dataset"],
-                "gt_wpts":   wpts,               # [K, 2] float32 in [0, 1]
+                "gt_wpts":   wpts,
+                "task_type": task_type,
+                "qa_answer": qa_answer,
             })
 
         logger.info(
-            f"Stage2Dataset: kept {len(self.samples):,} trajectory samples "
-            f"(skipped {skipped:,} with unparseable waypoints)."
+            f"Stage2Dataset: kept {len(self.samples):,} samples "
+            f"(skipped {skipped:,} trajectory samples with unparseable waypoints)."
         )
 
     def __len__(self) -> int:
@@ -237,6 +243,8 @@ class Stage2Dataset(Dataset):
             "pixel_values":   inputs.get("pixel_values"),              # [patches,C,H,W] or None
             "image_grid_thw": inputs.get("image_grid_thw"),            # [n_imgs, 3] or None
             "gt_waypoints":   s["gt_wpts"],                            # [K, 2]
+            "task_type":      s["task_type"],
+            "qa_answer":      s["qa_answer"],
         }
 
 
@@ -270,6 +278,9 @@ def collate_stage2_batch(samples: List[dict]) -> dict:
     gt_list = [s["image_grid_thw"] for s in samples if s["image_grid_thw"] is not None]
     image_grid_thw = torch.cat(gt_list, dim=0) if gt_list else None
 
+    task_types = [s["task_type"] for s in samples]
+    qa_answers = [s["qa_answer"] for s in samples]
+
     return {
         "input_ids":      input_ids_padded,
         "attention_mask": attn_mask_padded,
@@ -277,7 +288,11 @@ def collate_stage2_batch(samples: List[dict]) -> dict:
         "image_grid_thw": image_grid_thw,
         "gt_waypoints":   gt_waypoints,
         # ground_truth dict stays on CPU — used by reward functions
-        "ground_truth":   {"gt_waypoints": gt_waypoints.clone()},
+        "ground_truth":   {
+            "gt_waypoints": gt_waypoints.clone(),
+            "task_type": task_types,
+            "qa_answer": qa_answers,
+        },
     }
 
 

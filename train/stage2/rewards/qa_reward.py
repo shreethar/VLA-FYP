@@ -256,9 +256,20 @@ class FormatReward:
                     qa_answers[i] if isinstance(qa_answers, list) else qa_answers
                 )
                 try:
-                    rewards[i] = compute_rouge_score(hypothesis, reference)
+                    rouge_score = compute_rouge_score(hypothesis, reference)
                 except Exception:
-                    rewards[i] = 0.0
+                    rouge_score = 0.0
+
+                char_len = len(text)
+                if char_len > 4000:
+                    length_factor = 0.5
+                elif char_len > 2000:
+                    length_factor = 1.0 - 0.5 * (char_len - 2000) / 2000.0
+                else:
+                    length_factor = 1.0
+
+                r_format = 1.0 * length_factor
+                rewards[i] = rouge_score + r_format
             else:
                 rewards[i] = check_structural_format(text, K=self.K)
 

@@ -506,6 +506,7 @@ def train_stage2(
             buffer=buffer,
             gt_waypoints=gt_waypoints,
             global_step=step,
+            task_types=ground_truth.get("task_type", None),
         )
         log_memory(f"Step {step} - After Student/Verbalizer Forward")
 

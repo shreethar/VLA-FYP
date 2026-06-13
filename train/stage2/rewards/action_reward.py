@@ -301,4 +301,20 @@ class CombinedActionReward:
             rollout_ids, rollout_text,
             pixel_values, image_grid_thw, ground_truth,
         )
-        return 0.9 * r_visual + 0.1 * r_format
+
+        batch = len(rollout_text)
+        device = r_visual.device if hasattr(r_visual, 'device') else torch.device("cpu")
+        final_rewards = torch.zeros(batch, dtype=torch.float32, device=device)
+
+        task_types = None
+        if ground_truth is not None:
+            task_types = ground_truth.get("task_type", None)
+
+        for i in range(batch):
+            tt = task_types[i] if task_types else "trajectory"
+            if tt == "qa":
+                final_rewards[i] = r_format[i]
+            else:
+                final_rewards[i] = 0.9 * r_visual[i] + 0.1 * r_format[i]
+
+        return final_rewards

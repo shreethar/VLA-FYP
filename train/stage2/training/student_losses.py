@@ -124,12 +124,26 @@ class StudentLossComputer(nn.Module):
         self,
         pred_waypoints: torch.Tensor,   # [batch, K, 2]  from SpatialMLP (in [0,1])
         gt_waypoints: torch.Tensor,     # [batch, K, 2]  normalised ground truth
+        task_types: Optional[list] = None,
     ) -> torch.Tensor:
         """
         L_ans = λ_ans * MSE(pred_waypoints, gt_waypoints)
+        Masked out for QA tasks.
         """
         gt_aligned = gt_waypoints.to(dtype=pred_waypoints.dtype, device=pred_waypoints.device)
-        return self.lambda_ans * F.mse_loss(pred_waypoints, gt_aligned)
+        mse = F.mse_loss(pred_waypoints, gt_aligned, reduction='none') # [batch, K, 2]
+        mse = mse.mean(dim=(1, 2)) # [batch]
+        
+        if task_types is not None:
+            mask = torch.tensor([1.0 if t == "trajectory" else 0.0 for t in task_types], 
+                                device=mse.device, dtype=mse.dtype)
+            mse = mse * mask
+            num_traj = mask.sum().clamp(min=1.0)
+            loss = mse.sum() / num_traj
+        else:
+            loss = mse.mean()
+            
+        return self.lambda_ans * loss
 
     # -----------------------------------------------------------------------
     # Main compute method
@@ -151,6 +165,7 @@ class StudentLossComputer(nn.Module):
         gt_waypoints: torch.Tensor,         # [batch, K, 2]  normalised [0,1]
         # Verbalizer schedule
         global_step: int,
+        task_types: Optional[list] = None,
     ) -> LossOutput:
         """
         Compute all Student (and optionally Verbalizer) losses for one step.
@@ -187,7 +202,7 @@ class StudentLossComputer(nn.Module):
         # 3. Loss computations — always present
         # ==================================================================
         l_distill = self._compute_l_distill(h_S, buffer.h_T)
-        l_ans = self._compute_l_ans(pred_waypoints, gt_waypoints)
+        l_ans = self._compute_l_ans(pred_waypoints, gt_waypoints, task_types=task_types)
 
         # ==================================================================
         # 5. Phase-specific losses
