@@ -116,7 +116,7 @@ class CrossAttentionBlock(nn.Module):
         v = self.v_proj(latents)                  # [batch, M, d_verb]
         q = self.q_norm(hidden)                   # [batch, seq, d_verb]
         ca_out, _ = self.attn(q, k, v)            # [batch, seq, d_verb]
-        return self.out_norm(hidden + ca_out)      # residual + post-norm
+        return hidden + self.out_norm(ca_out)      # residual + post-norm
         
 
 
