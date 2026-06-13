@@ -40,21 +40,15 @@ Here is a detailed breakdown of every metric, what direction it should trend, an
 **What it is:** The overall Language Modeling Cross-Entropy loss of the Verbalizer trying to reconstruct the Teacher's text from the Student's latents.
 **Expected Trend:** 📉 **DOWN**
 - **What it means:** The Cross-Attention layers in the Verbalizer are successfully injecting the Student's latents into the language model.
-- **If it goes UP:** The Verbalizer's Gated Cross-Attention mechanism is failing, or the Student's latents are collapsing to zero (making it impossible to reconstruct text).
+- **If it goes UP:** The Verbalizer's Cross-Attention mechanism is failing, or the Student's latents are collapsing to zero (making it impossible to reconstruct text).
 
-## 7. `verbalizer/ca_gate`
-**What it is:** The learned Sigmoid gate value `σ(γ)` controlling how much the Student's latents influence the Verbalizer's language modeling.
-**Expected Trend:** 📈 **UP (starts near 0.0, grows steadily)**
-- **What it means:** The Verbalizer is learning to trust and utilize the injected latents. We initialize it near ~0.018 (`γ = -4.0`) so the Verbalizer relies on its frozen text capabilities first before slowly incorporating latents.
-- **If it stays at 0.0:** The gradients aren't reaching the `ca_gate` parameter, or the latents contain no useful information for text generation.
-
-## 8. `teacher/reward_mean` & `teacher/advantage_mean`
+## 7. `teacher/reward_mean` & `teacher/advantage_mean`
 **What it is:** The raw scores from the custom Reward Functions (Action Reward + Format Reward).
 **Expected Trend:** 📈 **UP (Rewards) / Flat near 0 (Advantages)**
 - **What it means:** The Teacher is exploring the action space and finding better, more accurate robotic trajectories. GRPO advantages will naturally center around 0 because they are group-relative (normalized).
 - **If Rewards stay low:** The Teacher policy has collapsed, or the generation temperature is too low/high, preventing it from finding the correct waypoints.
 
-## 9. `grad/lora_total` & `grad/spatial_total`
+## 8. `grad/lora_total` & `grad/spatial_total`
 **What it is:** The global L2 norm of the gradients flowing through the LoRA adapters and the Spatial layers.
 **Expected Trend:** 🌊 **STABLE (No massive spikes or drops to 0)**
 - **What it means:** Gradients are flowing healthily through the network.

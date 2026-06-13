@@ -106,7 +106,6 @@ class CrossAttentionBlock(nn.Module):
         self.q_norm   = nn.LayerNorm(query_dim, eps=1e-6)
         self.out_norm = nn.LayerNorm(query_dim, eps=1e-6)
 
-        self.gate = nn.Parameter(torch.tensor(-3.5))
 
     def forward(
         self,
@@ -117,10 +116,7 @@ class CrossAttentionBlock(nn.Module):
         v = self.v_proj(latents)                  # [batch, M, d_verb]
         q = self.q_norm(hidden)                   # [batch, seq, d_verb]
         ca_out, _ = self.attn(q, k, v)            # [batch, seq, d_verb]
-        # return self.out_norm(hidden + ca_out)      # residual + post-norm
-        return hidden  + torch.sigmoid(self.gate) * self.out_norm(ca_out)   # residual + learned gate * CA + post-norm
-        # --> if gate = 0, output becomes hidden (base model's raw state). if i keep our_norm outside, i'd get out_norm(hidden)
-        # which instroduces a subtl normalization shift at step 0. the gated form preserves the base distribution perfectly
+        return self.out_norm(hidden + ca_out)      # residual + post-norm
         
 
 

@@ -611,7 +611,6 @@ def train_stage2(
                     "lr/student":               student_sched.get_last_lr()[0],
                     "lr/verbalizer":            (verbalizer_sched.get_last_lr()[0]
                                                  if not verbalizer.is_frozen() else 0.0),
-                    "verbalizer/ca_gate":       torch.sigmoid(verbalizer.ca_blocks[0].gate).item(),
                     "global_step":              step,
                 }
 
