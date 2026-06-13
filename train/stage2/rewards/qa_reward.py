@@ -99,11 +99,12 @@ def check_structural_format(text: str, K: int = 5) -> float:
         chars > 4000         → 0.50
     """
     # --- Level 0: think structure (hard requirement) ---
-    if not _THINK_OPEN.search(text) or not _THINK_CLOSE.search(text):
+    if not _THINK_CLOSE.search(text):
         return 0.0
 
-    think_m = _THINK_CONTENT.search(text)
-    if not think_m or len(think_m.group(1).strip()) < 20:
+    parts = re.split(r'</think>', text, maxsplit=1, flags=re.IGNORECASE)
+    think_content = _THINK_OPEN.sub('', parts[0]).strip()
+    if len(think_content) < 20:
         return 0.0
 
     # --- Soft length penalty ---
@@ -117,7 +118,7 @@ def check_structural_format(text: str, K: int = 5) -> float:
         length_factor = 1.0
 
     # --- Level 1 / 2: check for answer block after </think> ---
-    after_think = text.split("</think>", 1)[-1]
+    after_think = parts[1]
 
     # Try <ans> tag first
     ans_m = _ANS_TAG.search(after_think)
@@ -183,8 +184,10 @@ def compute_rouge_score(hypothesis: str, reference: str) -> float:
 
 def extract_think_content(text: str) -> str:
     """Return stripped content of the first <think>...</think> block."""
-    match = _THINK_CONTENT.search(text)
-    return match.group(1).strip() if match else text.strip()
+    if not _THINK_CLOSE.search(text):
+        return text.strip()
+    parts = re.split(r'</think>', text, maxsplit=1, flags=re.IGNORECASE)
+    return _THINK_OPEN.sub('', parts[0]).strip()
 
 
 # ---------------------------------------------------------------------------
@@ -239,15 +242,16 @@ class FormatReward:
 
             if is_qa:
                 # Require valid think structure before awarding ROUGE score
-                if not _THINK_OPEN.search(text) or not _THINK_CLOSE.search(text):
+                if not _THINK_CLOSE.search(text):
                     rewards[i] = 0.0
                     continue
-                think_m = _THINK_CONTENT.search(text)
-                if not think_m or len(think_m.group(1).strip()) < 20:
+                parts = re.split(r'</think>', text, maxsplit=1, flags=re.IGNORECASE)
+                think_content = _THINK_OPEN.sub('', parts[0]).strip()
+                if len(think_content) < 20:
                     rewards[i] = 0.0
                     continue
 
-                hypothesis = think_m.group(1).strip()
+                hypothesis = parts[1].strip()
                 reference  = (
                     qa_answers[i] if isinstance(qa_answers, list) else qa_answers
                 )
