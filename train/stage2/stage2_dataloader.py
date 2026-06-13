@@ -242,6 +242,8 @@ class Stage2Dataset(Dataset):
             "attention_mask": inputs["attention_mask"].squeeze(0),     # [seq]
             "pixel_values":   inputs.get("pixel_values"),              # [patches,C,H,W] or None
             "image_grid_thw": inputs.get("image_grid_thw"),            # [n_imgs, 3] or None
+            "pixel_values_videos": inputs.get("pixel_values_videos"),
+            "video_grid_thw": inputs.get("video_grid_thw"),
             "gt_waypoints":   s["gt_wpts"],                            # [K, 2]
             "task_type":      s["task_type"],
             "qa_answer":      s["qa_answer"],
@@ -278,6 +280,14 @@ def collate_stage2_batch(samples: List[dict]) -> dict:
     gt_list = [s["image_grid_thw"] for s in samples if s["image_grid_thw"] is not None]
     image_grid_thw = torch.cat(gt_list, dim=0) if gt_list else None
 
+    # pixel_values_videos
+    pv_v_list = [s["pixel_values_videos"] for s in samples if s["pixel_values_videos"] is not None]
+    pixel_values_videos = torch.cat(pv_v_list, dim=0) if pv_v_list else None
+
+    # video_grid_thw
+    vgt_list = [s["video_grid_thw"] for s in samples if s["video_grid_thw"] is not None]
+    video_grid_thw = torch.cat(vgt_list, dim=0) if vgt_list else None
+
     task_types = [s["task_type"] for s in samples]
     qa_answers = [s["qa_answer"] for s in samples]
 
@@ -286,6 +296,8 @@ def collate_stage2_batch(samples: List[dict]) -> dict:
         "attention_mask": attn_mask_padded,
         "pixel_values":   pixel_values,
         "image_grid_thw": image_grid_thw,
+        "pixel_values_videos": pixel_values_videos,
+        "video_grid_thw": video_grid_thw,
         "gt_waypoints":   gt_waypoints,
         # ground_truth dict stays on CPU — used by reward functions
         "ground_truth":   {
