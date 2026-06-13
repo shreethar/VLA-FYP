@@ -49,6 +49,8 @@ class RewardFunction(Protocol):
         pixel_values: Optional[torch.Tensor],
         image_grid_thw: Optional[torch.Tensor],
         ground_truth: dict,             # task-specific GT (waypoints, QA answers, …)
+        pixel_values_videos: Optional[torch.Tensor] = None,
+        video_grid_thw: Optional[torch.Tensor] = None,
     ) -> torch.Tensor: ...             # [batch]  float32
 
 
@@ -200,21 +202,36 @@ class GRPOTeacher(nn.Module):
         input_ids: torch.Tensor,
         pixel_values: Optional[torch.Tensor],
         image_grid_thw: Optional[torch.Tensor],
+        pixel_values_videos: Optional[torch.Tensor] = None,
+        video_grid_thw: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """Embed tokens and splice in visual encoder features."""
         embeds = self.vlm.model.model.language_model.embed_tokens(input_ids)
         if pixel_values is not None:
-            with torch.no_grad():
-                img_feats = (self.vlm.model.model.visual(pixel_values, grid_thw=image_grid_thw) if image_grid_thw is not None else self.vlm.model.model.visual(pixel_values))
             mask = (input_ids == self.vlm.config.image_token_id)
-            embeds = embeds.clone()
-            
-            if not isinstance(img_feats, torch.Tensor):
-                # Qwen3_5/Qwen2VL returns BaseModelOutputWithPooling where last_hidden_state is unmerged
-                # and pooler_output is the projected/merged 2560-dim tensor.
-                img_feats = getattr(img_feats, 'pooler_output', img_feats[0])
+            if mask.any():
+                with torch.no_grad():
+                    img_feats = (self.vlm.model.model.visual(pixel_values, grid_thw=image_grid_thw) if image_grid_thw is not None else self.vlm.model.model.visual(pixel_values))
+                embeds = embeds.clone()
                 
-            embeds[mask] = img_feats.to(embeds.dtype)
+                if not isinstance(img_feats, torch.Tensor):
+                    # Qwen3_5/Qwen2VL returns BaseModelOutputWithPooling where last_hidden_state is unmerged
+                    # and pooler_output is the projected/merged 2560-dim tensor.
+                    img_feats = getattr(img_feats, 'pooler_output', img_feats[0])
+                    
+                embeds[mask] = img_feats.to(embeds.dtype)
+            
+        if pixel_values_videos is not None:
+            self._video_token_id = getattr(self.vlm.config, "video_token_id", 248057)
+            mask_vid = (input_ids == self._video_token_id)
+            if mask_vid.any():
+                with torch.no_grad():
+                    vid_feats = (self.vlm.model.model.visual(pixel_values_videos, grid_thw=video_grid_thw) if video_grid_thw is not None else self.vlm.model.model.visual(pixel_values_videos))
+                embeds = embeds.clone()
+                if not isinstance(vid_feats, torch.Tensor):
+                    vid_feats = getattr(vid_feats, 'pooler_output', vid_feats[0])
+                embeds[mask_vid] = vid_feats.to(embeds.dtype)
+                
         return embeds
 
     def _find_think_end_positions(self, token_ids: torch.Tensor) -> torch.Tensor:
@@ -267,6 +284,8 @@ class GRPOTeacher(nn.Module):
         image_grid_thw: Optional[torch.Tensor],
         attention_mask: torch.Tensor,
         tokenizer,
+        pixel_values_videos: Optional[torch.Tensor] = None,
+        video_grid_thw: Optional[torch.Tensor] = None,
     ) -> Tuple[List[torch.Tensor], List[List[str]], List[torch.Tensor]]:
         """
         Generate G independent rollout traces via temperature sampling.
@@ -298,15 +317,21 @@ class GRPOTeacher(nn.Module):
         batch_size = input_ids.shape[0]
 
         try:
-            outputs = self.vlm.generate(
-                input_ids=input_ids,
-                pixel_values=pixel_values,
-                image_grid_thw=image_grid_thw,
-                attention_mask=attention_mask,
-                generation_config=gen_config,
-                use_cache=True,
-                return_dict_in_generate=False,
-            )
+            gen_kwargs = {
+                "input_ids": input_ids,
+                "attention_mask": attention_mask,
+                "generation_config": gen_config,
+                "use_cache": True,
+                "return_dict_in_generate": False,
+            }
+            if pixel_values is not None:
+                gen_kwargs["pixel_values"] = pixel_values
+                gen_kwargs["image_grid_thw"] = image_grid_thw
+            if pixel_values_videos is not None:
+                gen_kwargs["pixel_values_videos"] = pixel_values_videos
+                gen_kwargs["video_grid_thw"] = video_grid_thw
+
+            outputs = self.vlm.generate(**gen_kwargs)
             # outputs shape: [batch * G, prompt_len + new_tokens]
             
             # Reshape from [B * G, seq_len] to [B, G, seq_len]
@@ -350,6 +375,8 @@ class GRPOTeacher(nn.Module):
         ground_truth: dict,
         reward_fns: List[RewardFunction],
         reward_weights: Optional[List[float]] = None,
+        pixel_values_videos: Optional[torch.Tensor] = None,
+        video_grid_thw: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """
         Score all G rollouts using one or more reward functions.
@@ -378,6 +405,8 @@ class GRPOTeacher(nn.Module):
                     pixel_values=pixel_values,
                     image_grid_thw=image_grid_thw,
                     ground_truth=ground_truth,
+                    pixel_values_videos=pixel_values_videos,
+                    video_grid_thw=video_grid_thw,
                 )
                 if isinstance(reward_out, torch.Tensor):
                     reward_out = reward_out.to(r_g.device).float()
@@ -439,6 +468,8 @@ class GRPOTeacher(nn.Module):
         image_grid_thw: Optional[torch.Tensor],
         prompt_len: int,
         grad_accum_steps: int = 1,
+        pixel_values_videos: Optional[torch.Tensor] = None,
+        video_grid_thw: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """
         GRPO policy-gradient loss (REINFORCE with group-relative baseline).
@@ -461,7 +492,27 @@ class GRPOTeacher(nn.Module):
         G     = len(all_ids)
         B     = all_ids[0].shape[0]
         device = all_ids[0].device
-        # total_loss = torch.tensor(0.0, device=device)
+
+        # ── Pre-compute per-batch-item image/video ownership ──────────────
+        # image_grid_thw / video_grid_thw only contain entries for samples
+        # that actually have images / videos.  We must map b_idx → the
+        # correct row in those tensors (not a 1:1 b_idx mapping).
+        image_token_id = getattr(self.vlm.config, "image_token_id", None)
+        video_token_id = getattr(self.vlm.config, "video_token_id", 248057)
+
+        # Use the FIRST rollout's prompt portion (identical across all G)
+        # to detect which batch items carry image vs video tokens.
+        ref_ids = all_ids[0]  # [B, seq]
+
+        # has_image[b] / has_video[b] = True if batch item b has those tokens
+        has_image = [False] * B
+        has_video = [False] * B
+        if pixel_values is not None and image_token_id is not None:
+            for b in range(B):
+                has_image[b] = (ref_ids[b] == image_token_id).any().item()
+        if pixel_values_videos is not None:
+            for b in range(B):
+                has_video[b] = (ref_ids[b] == video_token_id).any().item()
 
         # ── Step B: Chunked Forward & Backward Pass ───────────────────────
         # By processing one rollout group (B sequences) at a time and calling 
@@ -485,18 +536,31 @@ class GRPOTeacher(nn.Module):
                 resp_mask[:, prompt_len:] = (batch_id[:, prompt_len:] != 0).float()
                 resp_lens = resp_mask.sum(dim=-1).clamp(min=1)  # [1]
 
-                # 2. Correctly slice the flattened image patches for this specific sequence
-                if pixel_values is not None:
-                    thw = image_grid_thw[b_idx:b_idx+1]  # [1, 3]
+                # 2. Correctly slice the flattened image/video patches
+                #    Only pass pixel_values if THIS batch item has image tokens.
+                if pixel_values is not None and has_image[b_idx]:
+                    # Count how many image-bearing items precede b_idx
+                    img_row = sum(has_image[:b_idx])
+                    thw = image_grid_thw[img_row:img_row+1]  # [1, 3]
                     num_patches = thw.prod(dim=-1).item()
-                    offset = 0 if b_idx == 0 else image_grid_thw[:b_idx].prod(dim=-1).sum().item()
+                    offset = int(image_grid_thw[:img_row].prod(dim=-1).sum().item()) if img_row > 0 else 0
                     pv = pixel_values[offset : offset + num_patches]
                 else:
                     pv = None
                     thw = None
 
+                if pixel_values_videos is not None and has_video[b_idx]:
+                    vid_row = sum(has_video[:b_idx])
+                    v_thw = video_grid_thw[vid_row:vid_row+1]
+                    num_patches = v_thw.prod(dim=-1).item()
+                    offset = int(video_grid_thw[:vid_row].prod(dim=-1).sum().item()) if vid_row > 0 else 0
+                    pv_v = pixel_values_videos[offset : offset + num_patches]
+                else:
+                    pv_v = None
+                    v_thw = None
+
                 # 3. Forward pass for just ONE sequence
-                inputs_embeds = self._build_input_embeds(batch_id, pv, thw)
+                inputs_embeds = self._build_input_embeds(batch_id, pv, thw, pv_v, v_thw)
                 
                 # Explicitly compute position_ids to bypass Qwen3.5 RoPE bug when inputs_embeds is used
                 position_ids = batch_mask.long().cumsum(-1) - 1
@@ -638,6 +702,8 @@ class GRPOTeacher(nn.Module):
         pixel_values: Optional[torch.Tensor],
         image_grid_thw: Optional[torch.Tensor],
         think_end_token_pos: torch.Tensor, # [batch]
+        pixel_values_videos: Optional[torch.Tensor] = None,
+        video_grid_thw: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """
         Separate forward pass through the UPDATED Teacher on τ+.
@@ -651,7 +717,7 @@ class GRPOTeacher(nn.Module):
         h_T : [batch, d_teacher]
         """
         inputs_embeds = self._build_input_embeds(
-            tau_pos_ids, pixel_values, image_grid_thw
+            tau_pos_ids, pixel_values, image_grid_thw, pixel_values_videos, video_grid_thw
         )
 
         out = self.vlm(
@@ -690,6 +756,8 @@ class GRPOTeacher(nn.Module):
         grad_clip: float = 1.0,
         grad_accum_steps: int = 1,
         is_accum_step: bool = True,
+        pixel_values_videos: Optional[torch.Tensor] = None,
+        video_grid_thw: Optional[torch.Tensor] = None,
     ) -> RolloutBuffer:
         """
         Execute the complete Teacher GRPO step and return a populated RolloutBuffer.
@@ -715,7 +783,7 @@ class GRPOTeacher(nn.Module):
 
         # --- Step 1: Generate G rollouts (no_grad) -------------------------
         all_ids, all_texts, all_masks = self.generate_rollouts(
-            input_ids, pixel_values, image_grid_thw, attention_mask, tokenizer
+            input_ids, pixel_values, image_grid_thw, attention_mask, tokenizer, pixel_values_videos, video_grid_thw
         )
 
         # --- Step 2: Score --------------------------------------------------
@@ -723,6 +791,7 @@ class GRPOTeacher(nn.Module):
             all_ids, all_texts,
             pixel_values, image_grid_thw,
             ground_truth, reward_fns, reward_weights,
+            pixel_values_videos, video_grid_thw,
         )   # [G, batch]
 
         # --- Step 3: Advantages --------------------------------------------
@@ -734,6 +803,8 @@ class GRPOTeacher(nn.Module):
             all_ids, all_masks, advantages,
             pixel_values, image_grid_thw, prompt_len,
             grad_accum_steps=grad_accum_steps,
+            pixel_values_videos=pixel_values_videos,
+            video_grid_thw=video_grid_thw,
         )
         
         if is_accum_step:
@@ -757,6 +828,7 @@ class GRPOTeacher(nn.Module):
             tau_pos_ids, tau_pos_mask,
             pixel_values, image_grid_thw,
             think_end_pos,
+            pixel_values_videos, video_grid_thw,
         )
 
         # --- Pack into RolloutBuffer ---------------------------------------

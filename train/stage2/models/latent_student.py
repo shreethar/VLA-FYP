@@ -293,6 +293,8 @@ class LatentStudent(nn.Module):
         input_ids: torch.Tensor,
         pixel_values: Optional[torch.Tensor],
         image_grid_thw: Optional[torch.Tensor],
+        pixel_values_videos: Optional[torch.Tensor] = None,
+        video_grid_thw: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """
         Convert input_ids to embeddings, then splice in visual encoder
@@ -323,6 +325,20 @@ class LatentStudent(nn.Module):
                         img_feats = getattr(img_feats, 'pooler_output', img_feats[0])
                     embeds[mask] = img_feats.to(embeds.dtype)
 
+        if pixel_values_videos is not None:
+            if video_grid_thw is not None:
+                vid_feats = self._visual_encoder(pixel_values_videos, grid_thw=video_grid_thw)
+            else:
+                vid_feats = self._visual_encoder(pixel_values_videos)
+            
+            self._video_token_id = getattr(self.vlm.config, "video_token_id", 248057)
+            mask_vid = (input_ids == self._video_token_id)
+            if mask_vid.any():
+                embeds = embeds.clone()
+                if not isinstance(vid_feats, torch.Tensor):
+                    vid_feats = getattr(vid_feats, 'pooler_output', vid_feats[0])
+                embeds[mask_vid] = vid_feats.to(embeds.dtype)
+
         return embeds   # [batch, seq, d]
 
     # -----------------------------------------------------------------------
@@ -335,6 +351,8 @@ class LatentStudent(nn.Module):
         pixel_values: Optional[torch.Tensor],
         image_grid_thw: Optional[torch.Tensor],
         attention_mask: torch.Tensor,
+        pixel_values_videos: Optional[torch.Tensor] = None,
+        video_grid_thw: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """
         Process the full prompt through the language model.
@@ -363,7 +381,7 @@ class LatentStudent(nn.Module):
             chunk-parallel computation over full sequences during training.
         """
         prefix_embeds = self._build_input_embeds(
-            input_ids, pixel_values, image_grid_thw
+            input_ids, pixel_values, image_grid_thw, pixel_values_videos, video_grid_thw
         )   # [batch, prompt_len, d]
 
         out = self._language_model(
@@ -390,6 +408,8 @@ class LatentStudent(nn.Module):
         image_grid_thw: Optional[torch.Tensor],
         attention_mask: torch.Tensor,
         end_think_token_id: Optional[int] = None,
+        pixel_values_videos: Optional[torch.Tensor] = None,
+        video_grid_thw: Optional[torch.Tensor] = None,
     ) -> Tuple[List[torch.Tensor], torch.Tensor, torch.Tensor, torch.Tensor]:
         """
         Generate M=6 continuous latent vectors via concat-based autoregressive
@@ -459,7 +479,7 @@ class LatentStudent(nn.Module):
         # input_ids ends with <think> → seed_hidden = h at <think>
         # ------------------------------------------------------------------
         prefix_embeds, seed_hidden = self.encode_prefix(
-            input_ids, pixel_values, image_grid_thw, attention_mask
+            input_ids, pixel_values, image_grid_thw, attention_mask, pixel_values_videos, video_grid_thw
         )
 
         current_embeds = prefix_embeds   # [B, prompt_len, d]
@@ -559,6 +579,8 @@ class LatentStudent(nn.Module):
         pixel_values: Optional[torch.Tensor],
         image_grid_thw: Optional[torch.Tensor],
         attention_mask: torch.Tensor,
+        pixel_values_videos: Optional[torch.Tensor] = None,
+        video_grid_thw: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """
         Full forward pass with output_hidden_states=True.
@@ -577,7 +599,7 @@ class LatentStudent(nn.Module):
         x_V : [batch, num_visual_tokens, hidden_dim]
               or [batch, 1, hidden_dim] if no visual tokens (text-only batch)
         """
-        embeds = self._build_input_embeds(input_ids, pixel_values, image_grid_thw)
+        embeds = self._build_input_embeds(input_ids, pixel_values, image_grid_thw, pixel_values_videos, video_grid_thw)
 
         out = self._language_model(
             inputs_embeds=embeds,
@@ -590,11 +612,16 @@ class LatentStudent(nn.Module):
         # hidden_states[0] = embed output; hidden_states[k] = layer k-1 output
         mid_hidden = out.hidden_states[self.mid_layer_idx + 1]   # [B, seq, d]
 
-        if self._image_token_id is None:
+        if self._image_token_id is None and not hasattr(self, "_video_token_id"):
             return mid_hidden
 
-        image_mask = (input_ids == self._image_token_id)   # [B, seq]
-        n_visual   = image_mask[0].sum().item()
+        mask = torch.zeros_like(input_ids, dtype=torch.bool)
+        if self._image_token_id is not None:
+            mask = mask | (input_ids == self._image_token_id)
+        if hasattr(self, "_video_token_id"):
+            mask = mask | (input_ids == self._video_token_id)
+
+        n_visual = mask[0].sum().item()
 
         if n_visual == 0:
             return torch.zeros(
@@ -603,7 +630,7 @@ class LatentStudent(nn.Module):
                 dtype=mid_hidden.dtype,
             )
 
-        x_V = mid_hidden[image_mask].view(
+        x_V = mid_hidden[mask].view(
             input_ids.shape[0], n_visual, self.hidden_dim
         )
         return x_V
@@ -619,6 +646,8 @@ class LatentStudent(nn.Module):
         image_grid_thw: Optional[torch.Tensor] = None,
         attention_mask: Optional[torch.Tensor] = None,
         labels: Optional[torch.Tensor] = None,
+        pixel_values_videos: Optional[torch.Tensor] = None,
+        video_grid_thw: Optional[torch.Tensor] = None,
     ):
         """
         Standard causal LM forward — delegates to the full vlm.
@@ -630,6 +659,8 @@ class LatentStudent(nn.Module):
             image_grid_thw=image_grid_thw,
             attention_mask=attention_mask,
             labels=labels,
+            pixel_values_videos=pixel_values_videos,
+            video_grid_thw=video_grid_thw,
         )
 
     # -----------------------------------------------------------------------

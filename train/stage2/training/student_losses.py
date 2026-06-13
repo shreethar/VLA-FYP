@@ -166,6 +166,8 @@ class StudentLossComputer(nn.Module):
         # Verbalizer schedule
         global_step: int,
         task_types: Optional[list] = None,
+        pixel_values_videos: Optional[torch.Tensor] = None,
+        video_grid_thw: Optional[torch.Tensor] = None,
     ) -> LossOutput:
         """
         Compute all Student (and optionally Verbalizer) losses for one step.
@@ -188,7 +190,8 @@ class StudentLossComputer(nn.Module):
         # 1. Student forward: generate latents + h_S + spatial tokens + waypoints
         # ==================================================================
         latents, h_S, spatial_hidden, pred_waypoints = student.generate_latents(
-            input_ids, pixel_values, image_grid_thw, attention_mask
+            input_ids, pixel_values, image_grid_thw, attention_mask,
+            pixel_values_videos=pixel_values_videos, video_grid_thw=video_grid_thw,
         )
         # latents      : List[M tensors, each [batch, d_student]]
         # h_S          : [batch, d_student] (hidden state at </think>)

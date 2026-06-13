@@ -223,6 +223,8 @@ class FormatReward:
         pixel_values   = None,
         image_grid_thw = None,
         ground_truth:  dict = None,
+        pixel_values_videos = None,
+        video_grid_thw = None,
     ) -> torch.Tensor:
         batch   = len(rollout_text)
         rewards = torch.zeros(batch, dtype=torch.float32)

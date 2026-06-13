@@ -254,6 +254,8 @@ class ActionAlignedReward:
         pixel_values    = None,
         image_grid_thw  = None,
         ground_truth:   dict = None,
+        pixel_values_videos = None,
+        video_grid_thw = None,
     ) -> torch.Tensor:
         assert ground_truth is not None and "gt_waypoints" in ground_truth, (
             "ActionAlignedReward requires ground_truth['gt_waypoints']"
@@ -292,14 +294,18 @@ class CombinedActionReward:
         pixel_values    = None,
         image_grid_thw  = None,
         ground_truth:   dict = None,
+        pixel_values_videos = None,
+        video_grid_thw = None,
     ) -> torch.Tensor:
         r_visual = self.visual(
             rollout_ids, rollout_text,
             pixel_values, image_grid_thw, ground_truth,
+            pixel_values_videos, video_grid_thw,
         )
         r_format = self.format(
             rollout_ids, rollout_text,
             pixel_values, image_grid_thw, ground_truth,
+            pixel_values_videos, video_grid_thw,
         )
 
         batch = len(rollout_text)

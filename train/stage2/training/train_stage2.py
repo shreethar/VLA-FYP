@@ -466,6 +466,12 @@ def train_stage2(
         image_grid_thw = batch.get("image_grid_thw")
         if image_grid_thw is not None:
             image_grid_thw = image_grid_thw.to(device)
+        pixel_values_videos = batch.get("pixel_values_videos")
+        if pixel_values_videos is not None:
+            pixel_values_videos = pixel_values_videos.to(device)
+        video_grid_thw = batch.get("video_grid_thw")
+        if video_grid_thw is not None:
+            video_grid_thw = video_grid_thw.to(device)
         attention_mask = batch["attention_mask"].to(device)
         gt_waypoints   = batch["gt_waypoints"].to(device)          # [batch, K, 2]
         ground_truth   = batch["ground_truth"]                      # dict (stays on CPU)
@@ -482,6 +488,8 @@ def train_stage2(
             input_ids=input_ids,
             pixel_values=pixel_values,
             image_grid_thw=image_grid_thw,
+            pixel_values_videos=pixel_values_videos,
+            video_grid_thw=video_grid_thw,
             attention_mask=attention_mask,
             ground_truth=ground_truth,
             reward_fns=reward_fns,
@@ -512,6 +520,8 @@ def train_stage2(
             input_ids=input_ids,
             pixel_values=pixel_values,
             image_grid_thw=image_grid_thw,
+            pixel_values_videos=pixel_values_videos,
+            video_grid_thw=video_grid_thw,
             attention_mask=attention_mask,
             buffer=buffer,
             gt_waypoints=gt_waypoints,
