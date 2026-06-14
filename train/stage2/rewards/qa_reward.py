@@ -117,6 +117,11 @@ def check_structural_format(text: str, K: int = 5) -> float:
     else:
         length_factor = 1.0
 
+    # --- Duplicate </think> penalty (×0.8 per extra occurrence) ---
+    num_close_tags = len(_THINK_CLOSE.findall(text))
+    if num_close_tags > 1:
+        length_factor *= 0.8 ** (num_close_tags - 1)
+
     # --- Level 1 / 2: check for answer block after </think> ---
     after_think = parts[1]
 
