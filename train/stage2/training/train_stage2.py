@@ -785,15 +785,14 @@ def train_stage2(
                     except Exception as e:
                         logger.warning(f"Failed to log wandb verbalizer table: {e}")
 
-                # Gradient norm logging (less frequent) — uses cached norms from Fix 1
-                if step % cfg.grad_log_steps == 0:
-                    grad_norms = cached_grad_norms  # captured BEFORE zero_grad
-                    logger.info(
-                        f"  grad_norm/lora={grad_norms.get('grad_norm/lora_total', 0):.4f} | "
-                        f"  grad_norm/spatial={grad_norms.get('grad_norm/spatial_total', 0):.4f}"
-                    )
-                    wandb_payload["grad/lora_total"] = grad_norms.get("grad_norm/lora_total", 0.0)
-                    wandb_payload["grad/spatial_total"] = grad_norms.get("grad_norm/spatial_total", 0.0)
+                # Gradient norm logging — uses cached norms from Fix 1
+                grad_norms = cached_grad_norms  # captured BEFORE zero_grad
+                logger.info(
+                    f"  grad_norm/lora={grad_norms.get('grad_norm/lora_total', 0):.4f} | "
+                    f"  grad_norm/spatial={grad_norms.get('grad_norm/spatial_total', 0):.4f}"
+                )
+                wandb_payload["grad/lora_total"] = grad_norms.get("grad_norm/lora_total", 0.0)
+                wandb_payload["grad/spatial_total"] = grad_norms.get("grad_norm/spatial_total", 0.0)
 
                 # Finally, log everything together to keep the x-axis perfectly synced
                 wandb.log(wandb_payload)
