@@ -150,8 +150,9 @@ def parse_waypoints(text: str, K: int = 5) -> Optional[np.ndarray]:
     if len(think_content) < 20:
         return None
 
-    # Search only after </think>
+    # Search only after </think> and before generation padding/end tokens
     after_think = text.split("</think>", 1)[-1]
+    after_think = after_think.split('<|im_end|>')[0].split('<|vision_pad|>')[0].strip()
 
     # 3a. Try <ans>x,y;x,y</ans> format first (canonical)
     ans_m = _ANS_TAG.search(after_think)

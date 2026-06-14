@@ -258,7 +258,9 @@ class FormatReward:
                     rewards[i] = 0.0
                     continue
 
-                hypothesis = parts[1].strip()
+                # Strip generation padding/end tokens from the hypothesis
+                hypothesis = parts[1].split('<|im_end|>')[0].split('<|vision_pad|>')[0].strip()
+                
                 reference  = (
                     qa_answers[i] if isinstance(qa_answers, list) else qa_answers
                 )
