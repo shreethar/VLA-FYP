@@ -74,7 +74,7 @@ class Stage2Config:
     total_steps:         int  = 4500
     warmup_steps:        int  = 3000                            # Verbalizer LM warm-up
     lr_warmup_steps:     int  = 200                             # LR scheduler warm-up
-    save_steps:          int  = 500
+    save_steps:          int  = 100                             # was 500 — more recovery points
     log_steps:           int  = 10
     grad_clip:           float = 1.0
     grad_accum_steps:    int  = 32
@@ -115,6 +115,10 @@ class Stage2Config:
     wandb_tags:          List[str] = field(default_factory=lambda: ["stage2", "grpo", "distillation"])
     wandb_log_steps:     int  = 10   # same as log_steps by default
     use_wandb:           bool = True
+
+    # Collapse detection
+    reward_collapse_window:  int   = 20    # freeze teacher if reward=0 for this many consecutive steps
+    lm_collapse_threshold:   float = 0.01  # skip verbalizer update if LM loss falls below this
 
 
 # ---------------------------------------------------------------------------
@@ -449,6 +453,12 @@ def train_stage2(
     # Infinite dataloader iterator
     data_iter = iter(dataloader)
 
+    # ── Collapse detection state ────────────────────────────────────────
+    reward_zero_streak = 0             # consecutive steps with reward_mean == 0
+    teacher_frozen_by_watchdog = False # set True when watchdog freezes teacher
+    lm_collapse_streak = 0            # consecutive steps with lm_loss < threshold
+    cached_grad_norms = {}            # captured BEFORE zero_grad for correct logging
+
     for step in range(start_step, cfg.total_steps):
 
         # ------ Get next batch (cycle dataloader) ---------------------
@@ -484,6 +494,10 @@ def train_stage2(
 
         is_accum_step = ((step + 1) % cfg.grad_accum_steps == 0) or (step == cfg.total_steps - 1)
 
+        # When watchdog has frozen teacher, suppress optimizer step entirely
+        # but still run rollouts (needed for h_T, τ+, τ-)
+        effective_accum_step = is_accum_step and not teacher_frozen_by_watchdog
+
         buffer: RolloutBuffer = teacher.training_step(
             input_ids=input_ids,
             pixel_values=pixel_values,
@@ -498,8 +512,10 @@ def train_stage2(
             tokenizer=tokenizer,
             grad_clip=cfg.grad_clip,
             grad_accum_steps=cfg.grad_accum_steps,
-            is_accum_step=is_accum_step,
+            is_accum_step=effective_accum_step,
         )
+        if teacher_frozen_by_watchdog:
+            teacher_opt.zero_grad()  # clear any accumulated noise
         if is_accum_step:
             teacher_sched.step()
         log_memory(f"Step {step} - After Teacher")
@@ -543,6 +559,11 @@ def train_stage2(
                 v_norm = nn.utils.clip_grad_norm_(verbalizer.parameters(), cfg.grad_clip)
                 if torch.isnan(v_norm) or torch.isinf(v_norm):
                     logger.warning(f"Verbalizer gradients are NaN/Inf (norm={v_norm}). Skipping step.")
+                elif lm_collapse_streak >= 5:
+                    logger.warning(
+                        f"[Step {step}] LM loss collapsed ({loss_out.metrics.get('loss/lm_loss', 0):.6f} < {cfg.lm_collapse_threshold}) "
+                        f"for {lm_collapse_streak} consecutive steps — skipping verbalizer update."
+                    )
                 else:
                     verbalizer_opt.step()
                 verbalizer_sched.step()
@@ -556,6 +577,10 @@ def train_stage2(
                     [p for p in student.parameters() if p.requires_grad],
                     cfg.grad_clip,
                 )
+                # ── Fix 1: Capture grad norms BEFORE zero_grad ─────────────
+                if step % cfg.grad_log_steps == 0:
+                    from training.student_losses import StudentLossComputer
+                    cached_grad_norms = StudentLossComputer.log_student_grad_norms(student)
                 if torch.isnan(s_norm) or torch.isinf(s_norm):
                     logger.warning(f"Student gradients are NaN/Inf (norm={s_norm}). Skipping step.")
                 else:
@@ -573,6 +598,10 @@ def train_stage2(
                     [p for p in student.parameters() if p.requires_grad],
                     cfg.grad_clip,
                 )
+                # ── Fix 1: Capture grad norms BEFORE zero_grad ─────────────
+                if step % cfg.grad_log_steps == 0:
+                    from training.student_losses import StudentLossComputer
+                    cached_grad_norms = StudentLossComputer.log_student_grad_norms(student)
                 if torch.isnan(s_norm) or torch.isinf(s_norm):
                     logger.warning(f"Student gradients are NaN/Inf (norm={s_norm}). Skipping step.")
                 else:
@@ -586,6 +615,37 @@ def train_stage2(
         log_memory(f"Step {step} - After Backprop")
 
         # ----------------------------------------------------------------
+        # E-post. Collapse watchdogs
+        # ----------------------------------------------------------------
+        # ── Fix 3: Reward collapse watchdog ─────────────────────────────
+        reward_mean_now = float(buffer.rewards.mean().item())
+        if reward_mean_now <= 0.0:
+            reward_zero_streak += 1
+        else:
+            reward_zero_streak = 0
+            if teacher_frozen_by_watchdog:
+                # Reward recovered — unfreeze teacher
+                teacher_frozen_by_watchdog = False
+                logger.info(f"[Step {step}] Reward recovered ({reward_mean_now:.4f}) — unfreezing teacher.")
+
+        if reward_zero_streak >= cfg.reward_collapse_window and not teacher_frozen_by_watchdog:
+            teacher_frozen_by_watchdog = True
+            logger.warning(
+                f"\n{'='*60}\n"
+                f"[WATCHDOG] Reward has been 0.0 for {reward_zero_streak} consecutive steps!\n"
+                f"Freezing teacher optimizer to prevent further corruption.\n"
+                f"L_distill quality gate is also active (distill_gated={loss_out.distill_gated}).\n"
+                f"{'='*60}"
+            )
+
+        # ── Fix 5: LM loss collapse detection ──────────────────────────
+        lm_loss_val = loss_out.metrics.get('loss/lm_loss', 1.0)
+        if is_warmup and lm_loss_val < cfg.lm_collapse_threshold:
+            lm_collapse_streak += 1
+        else:
+            lm_collapse_streak = 0
+
+        # ----------------------------------------------------------------
         # F. Logging  (console + WandB)
         # ----------------------------------------------------------------
         if step % cfg.log_steps == 0:
@@ -595,11 +655,17 @@ def train_stage2(
             log_msg = (
                 f"Step {step:>5d}/{cfg.total_steps} | "
                 f"student={m['loss/student_total']:.4f} | "
-                f"distill={m['loss/l_distill']:.4f} | "
-                f"ans={m['loss/l_ans']:.4f} | "
+                f"distill={m['loss/l_distill']:.4f}"
+            )
+            if loss_out.distill_gated:
+                log_msg += " [GATED]"
+            log_msg += (
+                f" | ans={m['loss/l_ans']:.4f} | "
                 f"reward_mean={teacher_stats['grpo/reward_mean']:.4f} | "
                 f"phase={'warmup' if is_warmup else 'frozen'}"
             )
+            if teacher_frozen_by_watchdog:
+                log_msg += " | TEACHER_FROZEN"
             if is_warmup:
                 log_msg += f" | lm={m.get('loss/lm_loss', 0):.4f}"
             else:
@@ -642,6 +708,15 @@ def train_stage2(
                     "waypoints/pred_mean":      m.get("waypoints/pred_mean", 0.0),
                     "waypoints/pred_std":       m.get("waypoints/pred_std",  0.0),
 
+                    # ── Distillation quality gate ─────────────────────────
+                    "distill/gated":            m.get("distill/gated",       0.0),
+                    "distill/max_reward":       m.get("distill/max_reward",  0.0),
+
+                    # ── Collapse watchdog ─────────────────────────────────
+                    "watchdog/reward_zero_streak":       float(reward_zero_streak),
+                    "watchdog/teacher_frozen":           float(teacher_frozen_by_watchdog),
+                    "watchdog/lm_collapse_streak":       float(lm_collapse_streak),
+
                     # ── Learning rates ───────────────────────────────────
                     "lr/teacher":               teacher_sched.get_last_lr()[0],
                     "lr/student":               student_sched.get_last_lr()[0],
@@ -649,6 +724,10 @@ def train_stage2(
                                                  if not verbalizer.is_frozen() else 0.0),
                     "global_step":              step,
                 }
+
+                # ── CA gate sigmoid values (per block) ────────────────────
+                for blk_idx, blk in enumerate(verbalizer.ca_blocks):
+                    wandb_payload[f"ca_gate/block_{blk_idx}"] = torch.sigmoid(blk.gate).item()
 
                 # ── Rollout Text Logging (every 10 steps) ────────────────
                 if step % 10 == 0:
@@ -710,10 +789,9 @@ def train_stage2(
                     except Exception as e:
                         logger.warning(f"Failed to log wandb verbalizer table: {e}")
 
-                # Gradient norm logging (less frequent)
+                # Gradient norm logging (less frequent) — uses cached norms from Fix 1
                 if step % cfg.grad_log_steps == 0:
-                    from training.student_losses import StudentLossComputer
-                    grad_norms = StudentLossComputer.log_student_grad_norms(student)
+                    grad_norms = cached_grad_norms  # captured BEFORE zero_grad
                     logger.info(
                         f"  grad_norm/lora={grad_norms.get('grad_norm/lora_total', 0):.4f} | "
                         f"  grad_norm/spatial={grad_norms.get('grad_norm/spatial_total', 0):.4f}"

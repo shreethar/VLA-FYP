@@ -64,6 +64,9 @@ class LossOutput:
     latents: Optional[torch.Tensor] = None
     pred_waypoints: Optional[torch.Tensor] = None
 
+    # Whether L_distill was gated off this step (for external monitoring)
+    distill_gated: bool = False
+
 
 # Alias for backwards compat if any code references the old name
 StudentLossOutput = LossOutput
@@ -92,11 +95,13 @@ class StudentLossComputer(nn.Module):
         warmup_steps: int = 3000,
         lambda_distill: float = 1.0,
         lambda_ans: float = 1.0,
+        distill_clamp_max: float = 10.0,
     ):
         super().__init__()
         self.warmup_steps = warmup_steps
         self.lambda_distill = lambda_distill
         self.lambda_ans = lambda_ans
+        self.distill_clamp_max = distill_clamp_max
 
     # -----------------------------------------------------------------------
     # Internal helpers
@@ -110,15 +115,39 @@ class StudentLossComputer(nn.Module):
         self,
         h_S: torch.Tensor,    # [batch, d]  Student answer hidden state
         h_T: torch.Tensor,    # [batch, d]  Teacher answer hidden state (from buffer)
-    ) -> torch.Tensor:
+        max_reward: float = 1.0,   # max reward across all G rollouts this step
+    ) -> tuple:
         """
         L_distill = λ_distill * MSE(h_S, h_T)
 
         h_T is detached from the Teacher's graph (Teacher already updated).
         h_S must remain in the Student's computation graph.
+
+        Quality gate: when max_reward == 0 (all rollouts failed to produce valid
+        output), h_T is extracted from garbage text and is not a meaningful target.
+        In this case we replace the MSE with a small cosine-similarity regulariser
+        that just keeps h_S from collapsing to zero, without driving it toward the
+        corrupt h_T. This breaks the positive feedback loop that caused training
+        collapse around Step 147-154.
+
+        Returns
+        -------
+        l_distill : torch.Tensor  — the (clamped) loss scalar
+        gated     : bool          — True if the quality gate fired
         """
         h_T_aligned = h_T.detach().to(dtype=h_S.dtype)
-        return self.lambda_distill * F.mse_loss(h_S, h_T_aligned)
+
+        # ── Quality gate: skip MSE when teacher output is garbage ──────────
+        if max_reward <= 0.0:
+            # Small regulariser: keep h_S norm stable without matching garbage h_T.
+            # -cosine_similarity drives h_S toward unit norm (prevents collapse to 0)
+            # while NOT forcing alignment with the corrupt h_T direction.
+            reg = 0.01 * (1.0 - F.cosine_similarity(h_S, h_S.detach(), dim=-1).mean())
+            return reg, True
+
+        raw = self.lambda_distill * F.mse_loss(h_S, h_T_aligned)
+        clamped = torch.clamp(raw, max=self.distill_clamp_max)
+        return clamped, False
 
     def _compute_l_ans(
         self,
@@ -204,7 +233,8 @@ class StudentLossComputer(nn.Module):
         # ==================================================================
         # 3. Loss computations — always present
         # ==================================================================
-        l_distill = self._compute_l_distill(h_S, buffer.h_T)
+        max_reward = float(buffer.rewards.max().item())
+        l_distill, distill_gated = self._compute_l_distill(h_S, buffer.h_T, max_reward=max_reward)
         l_ans = self._compute_l_ans(pred_waypoints, gt_waypoints, task_types=task_types)
 
         # ==================================================================
@@ -255,6 +285,8 @@ class StudentLossComputer(nn.Module):
                 "distill/cosine_sim":   F.cosine_similarity(
                                             h_S.float(), buffer.h_T.float(), dim=-1
                                         ).mean().item(),
+                "distill/gated":        float(distill_gated),
+                "distill/max_reward":   max_reward,
             }
 
             # Always set both keys so train_stage2.py logging never fails
@@ -272,6 +304,7 @@ class StudentLossComputer(nn.Module):
             metrics=metrics,
             latents=z,
             pred_waypoints=pred_waypoints.detach(),
+            distill_gated=distill_gated,
         )
 
     # -----------------------------------------------------------------------
@@ -327,9 +360,11 @@ def build_student_loss_computer(
     warmup_steps: int = 3000,
     lambda_distill: float = 1.0,
     lambda_ans: float = 1.0,
+    distill_clamp_max: float = 10.0,
 ) -> StudentLossComputer:
     return StudentLossComputer(
         warmup_steps=warmup_steps,
         lambda_distill=lambda_distill,
         lambda_ans=lambda_ans,
+        distill_clamp_max=distill_clamp_max,
     )
