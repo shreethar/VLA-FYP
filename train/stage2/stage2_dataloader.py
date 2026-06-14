@@ -103,6 +103,36 @@ def _reformat_traj_prompt(human_text: str) -> str:
     return f"{STAGE2_TRAJ_SYSTEM}\n\n{human_text.strip()}"
 
 
+_STAGE1_QA_PREFIX_RE = re.compile(
+    r'^You are a robot manipulation assistant\. Answer questions about robot tasks, object affordances, spatial relationships, and manipulation strategies based on the provided image or video frame\.\s*',
+    re.DOTALL,
+)
+
+STAGE2_QA_SYSTEM = (
+    "You are a robot manipulation assistant. Answer questions about robot tasks, "
+    "object affordances, spatial relationships, and manipulation strategies based "
+    "on the provided image or video frame. "
+    "If reasoning, think step-by-step. "
+    "Finally, output the answer after </think>."
+)
+
+
+def _reformat_qa_prompt(human_text: str) -> str:
+    """
+    Replace the Stage 1 QA system prefix with the Stage 2 one.
+
+    The Stage 2 system prompt instructs the model to:
+      1. Think via Qwen3's native <think>...</think> block
+      2. Output the final answer after </think>
+    """
+    m = _STAGE1_QA_PREFIX_RE.match(human_text)
+    if m:
+        task_text = human_text[m.end():]   # just the question/task description
+        return f"{STAGE2_QA_SYSTEM}\n\n{task_text.strip()}"
+    # Fallback: prepend Stage 2 system prompt if pattern doesn't match
+    return f"{STAGE2_QA_SYSTEM}\n\n{human_text.strip()}"
+
+
 # ── Waypoint parsing ──────────────────────────────────────────────────────────
 # MolmoAct assistant format stored in HF dataset (from build_molmoact_records):
 #   "[[x1,y1],[x2,y2],[x3,y3],[x4,y4],[x5,y5]]"  — 0-1000 scale integers
@@ -169,7 +199,7 @@ class Stage2Dataset(Dataset):
                 human_text = _reformat_traj_prompt(row["human"])
             else:
                 wpts = torch.zeros((K_WAYPOINTS, 2), dtype=torch.float32)
-                human_text = row["human"]
+                human_text = _reformat_qa_prompt(row["human"])
                 qa_answer = row.get("qa_answer", row.get("assistant"))
 
             self.samples.append({
