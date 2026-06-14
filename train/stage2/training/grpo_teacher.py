@@ -594,7 +594,7 @@ class GRPOTeacher(nn.Module):
                 # 6. KL Loss
                 kl_gb = torch.tensor(0.0, device=device)
                 if self.kl_coef > 0:
-                    with torch.no_grad(), torch.cuda.amp.autocast(dtype=torch.float16):
+                    with torch.no_grad(), torch.amp.autocast('cuda', dtype=torch.bfloat16):
                         ref_out = self._ref_model(
                             inputs_embeds=inputs_embeds.detach(),
                             attention_mask=batch_mask,
