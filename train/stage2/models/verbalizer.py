@@ -106,6 +106,8 @@ class CrossAttentionBlock(nn.Module):
         self.q_norm   = nn.LayerNorm(query_dim, eps=1e-6)
         self.out_norm = nn.LayerNorm(query_dim, eps=1e-6)
 
+        self.gate = nn.Parameter(torch.tensor(1.0))
+
 
     def forward(
         self,
@@ -116,7 +118,8 @@ class CrossAttentionBlock(nn.Module):
         v = self.v_proj(latents)                  # [batch, M, d_verb]
         q = self.q_norm(hidden)                   # [batch, seq, d_verb]
         ca_out, _ = self.attn(q, k, v)            # [batch, seq, d_verb]
-        return hidden + self.out_norm(ca_out)      # residual + post-norm
+        gate_val = torch.sigmoid(self.gate)
+        return hidden + gate_val * self.out_norm(ca_out)      # residual + post-norm
         
 
 
