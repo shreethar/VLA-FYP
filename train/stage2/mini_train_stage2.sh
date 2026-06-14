@@ -16,14 +16,14 @@ STAGE1_CKPT="shreethar/stage1_unsloth"
 wandb login
 
 echo "============================================================"
-echo " Starting ThinkFlow-VLA Stage 2 Mini Training"
-echo " Dataset Subset  : 15%"
-echo " Total Steps     : 450"
-echo " Warmup Steps    : 300"
+echo " Starting ThinkFlow-VLA Stage 2 Training"
+echo " Dataset Subset  : 100%"
+echo " Total Steps     : 6000"
+echo " Warmup Steps    : 4000"
 echo "============================================================"
 
 # Create the output directory for this test run
-OUTPUT_DIR="checkpoints/stage2_mini"
+OUTPUT_DIR="checkpoints/stage2"
 mkdir -p "$OUTPUT_DIR"
 
 python training/train_stage2.py \
@@ -31,14 +31,14 @@ python training/train_stage2.py \
     --output_dir "$OUTPUT_DIR" \
     --split "test" \
     --subset_ratio 1.0 \
-    --total_steps 450 \
-    --warmup_steps 300 \
-    --save_steps 50 \
-    --wandb_run "stage2-mini-test" \
+    --total_steps 6000 \
+    --warmup_steps 4000 \
+    --save_steps 200 \
+    --wandb_run "stage2-mini-train" \
     --batch_size 2 \
     --grad_accum_steps 1 \
     --log_steps 1 \
     --max_seq_len 4096 \
-    --num_workers 2 2>&1 | tee "$OUTPUT_DIR/training_log_450.txt"
+    --num_workers 2 2>&1 | tee "$OUTPUT_DIR/training_log_full.txt"
 
 echo "Mini training complete! Checkpoints saved to $OUTPUT_DIR"
