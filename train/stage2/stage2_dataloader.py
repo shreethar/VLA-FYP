@@ -277,6 +277,7 @@ class Stage2Dataset(Dataset):
             "gt_waypoints":   s["gt_wpts"],                            # [K, 2]
             "task_type":      s["task_type"],
             "qa_answer":      s["qa_answer"],
+            "dataset":        s["dataset"],
         }
 
 
@@ -320,6 +321,7 @@ def collate_stage2_batch(samples: List[dict]) -> dict:
 
     task_types = [s["task_type"] for s in samples]
     qa_answers = [s["qa_answer"] for s in samples]
+    datasets   = [s["dataset"] for s in samples]
 
     return {
         "input_ids":      input_ids_padded,
@@ -334,6 +336,7 @@ def collate_stage2_batch(samples: List[dict]) -> dict:
             "gt_waypoints": gt_waypoints.clone(),
             "task_type": task_types,
             "qa_answer": qa_answers,
+            "dataset": datasets,
         },
     }
 

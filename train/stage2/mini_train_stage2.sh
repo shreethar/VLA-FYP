@@ -33,7 +33,7 @@ python training/train_stage2.py \
     --subset_ratio 1.0 \
     --total_steps 6000 \
     --warmup_steps 4000 \
-    --save_steps 200 \
+    --save_steps 100 \
     --wandb_run "stage2-mini-train" \
     --batch_size 2 \
     --grad_accum_steps 1 \

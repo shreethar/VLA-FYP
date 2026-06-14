@@ -80,9 +80,9 @@ class Stage2Config:
     grad_accum_steps:    int  = 32
 
     # Optimizers
-    teacher_lr:          float = 1e-4
-    student_lr:          float = 2e-4
-    verbalizer_lr:       float = 5e-4
+    teacher_lr:          float = 0.5e-4
+    student_lr:          float = 1e-4
+    verbalizer_lr:       float = 2.5e-4
     weight_decay:        float = 0.01
 
     # LoRA
@@ -94,15 +94,15 @@ class Stage2Config:
     G:                   int  = 5
     gen_temperature:     float = 0.9
     gen_max_new_tokens:  int  = 512
-    kl_coef:             float = 0.0
+    kl_coef:             float = 0.05
 
     # Architecture
     M:                   int  = 6     # reasoning latents
     K:                   int  = 5     # spatial tokens / waypoints
 
     # Loss weights
-    lambda_distill:      float = 1.0
-    lambda_ans:          float = 1.0
+    lambda_distill:      float = 0.1
+    lambda_ans:          float = 10.0
 
     # Misc
     seed:                int  = 42
@@ -686,11 +686,7 @@ def train_stage2(
                     "loss/l_verb":              m.get("loss/l_verb", 0.0),
 
                     # ── Teacher / GRPO ───────────────────────────────────
-                    "teacher/reward_mean":       teacher_stats["grpo/reward_mean"],
-                    "teacher/reward_max":        teacher_stats["grpo/reward_max"],
-                    "teacher/reward_min":        teacher_stats["grpo/reward_min"],
-                    "teacher/reward_std":        teacher_stats["grpo/reward_std"],
-                    "teacher/advantage_mean":    teacher_stats["grpo/advantage_mean"],
+                    **{k.replace("grpo/", "teacher/"): v for k, v in teacher_stats.items()},
 
                     # ── DPO (frozen phase only) ──────────────────────────
                     "dpo/loss":                 m.get("dpo/dpo_loss",      0.0),

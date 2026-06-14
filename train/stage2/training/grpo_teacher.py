@@ -93,6 +93,8 @@ class RolloutBuffer:
     # Teacher's <answer> hidden state from the post-update forward pass
     h_T: Optional[torch.Tensor] = None   # [batch, d_teacher]; filled after update
     grpo_loss: Optional[float] = None    # for logging
+    dataset_source: Optional[List[str]] = None
+    kl_loss: Optional[float] = None
 
 
 # ---------------------------------------------------------------------------
@@ -627,7 +629,7 @@ class GRPOTeacher(nn.Module):
             self._ref_model.cpu()
             torch.cuda.empty_cache()
 
-        return torch.tensor(total_rollout_loss + total_kl_loss, device=device)
+        return torch.tensor(total_rollout_loss, device=device), torch.tensor(total_kl_loss, device=device)
 
     # -----------------------------------------------------------------------
     # Step 5 + 6: Identify τ+/τ- and extract h_T
@@ -799,7 +801,7 @@ class GRPOTeacher(nn.Module):
 
         # compute_grpo_loss now internally chunks the forward/backward passes 
         # to prevent OOM. Gradients are automatically accumulated.
-        grpo_loss_val = self.compute_grpo_loss(
+        grpo_loss_val, kl_loss_val = self.compute_grpo_loss(
             all_ids, all_masks, advantages,
             pixel_values, image_grid_thw, prompt_len,
             grad_accum_steps=grad_accum_steps,
@@ -853,6 +855,8 @@ class GRPOTeacher(nn.Module):
             answer_token_pos=think_end_pos,
             h_T=h_T,
             grpo_loss=grpo_loss_val.item(),
+            dataset_source=ground_truth.get("dataset", None),
+            kl_loss=kl_loss_val.item(),
         )
 
         return buffer
@@ -863,13 +867,29 @@ class GRPOTeacher(nn.Module):
 
     @staticmethod
     def log_rollout_stats(buffer: RolloutBuffer) -> dict:
-        return {
+        stats = {
             "grpo/reward_mean":    buffer.rewards.mean().item(),
             "grpo/reward_max":     buffer.rewards.max().item(),
             "grpo/reward_min":     buffer.rewards.min().item(),
             "grpo/reward_std":     buffer.rewards.std().item(),
             "grpo/advantage_mean": buffer.advantages.mean().item(),
         }
+        
+        if buffer.kl_loss is not None:
+            stats["grpo/kl_loss"] = buffer.kl_loss
+            
+        if buffer.dataset_source is not None:
+            ds_rewards = {}
+            for b_idx, ds in enumerate(buffer.dataset_source):
+                if ds not in ds_rewards:
+                    ds_rewards[ds] = []
+                # Rewards is [G, B], mean across G for this batch item
+                ds_rewards[ds].append(buffer.rewards[:, b_idx].mean().item())
+            
+            for ds, rews in ds_rewards.items():
+                stats[f"grpo/reward_mean_{ds}"] = sum(rews) / len(rews)
+                
+        return stats
 
     def print_trainable_parameters(self):
         self.vlm.print_trainable_parameters()
