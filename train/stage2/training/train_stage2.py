@@ -652,6 +652,16 @@ def train_stage2(
             teacher_stats = GRPOTeacher.log_rollout_stats(buffer)
             m = loss_out.metrics   # shorthand
 
+            # Determine if this batch contains trajectory tasks
+            is_trajectory = False
+            task_types = ground_truth.get("task_type", [])
+            if isinstance(task_types, list):
+                is_trajectory = any(t == "trajectory" for t in task_types)
+            elif isinstance(task_types, str):
+                is_trajectory = (task_types == "trajectory")
+            if not task_types:
+                is_trajectory = True # fallback if no info is provided
+
             log_msg = (
                 f"Step {step:>5d}/{cfg.total_steps} | "
                 f"student={m['loss/student_total']:.4f} | "
@@ -659,9 +669,12 @@ def train_stage2(
             )
             if loss_out.distill_gated:
                 log_msg += " [GATED]"
+            
+            if is_trajectory and "loss/l_ans" in m:
+                log_msg += f" | ans={m['loss/l_ans']:.4f}"
+                
             log_msg += (
-                f" | ans={m['loss/l_ans']:.4f} | "
-                f"reward_mean={teacher_stats['grpo/reward_mean']:.4f} | "
+                f" | reward_mean={teacher_stats['grpo/reward_mean']:.4f} | "
                 f"phase={'warmup' if is_warmup else 'frozen'}"
             )
             if teacher_frozen_by_watchdog:
@@ -681,7 +694,6 @@ def train_stage2(
                     # ── Student losses ───────────────────────────────────
                     "loss/student_total":        m["loss/student_total"],
                     "loss/l_distill":            m["loss/l_distill"],
-                    "loss/l_ans":               m["loss/l_ans"],
                     "loss/lm_loss":             m.get("loss/lm_loss", 0.0),
                     "loss/l_verb":              m.get("loss/l_verb", 0.0),
 
@@ -700,10 +712,6 @@ def train_stage2(
                     "distill/h_T_norm":         m.get("distill/h_T_norm",    0.0),
                     "distill/cosine_sim":       m.get("distill/cosine_sim",  0.0),
 
-                    # ── Waypoints ────────────────────────────────────────
-                    "waypoints/pred_mean":      m.get("waypoints/pred_mean", 0.0),
-                    "waypoints/pred_std":       m.get("waypoints/pred_std",  0.0),
-
                     # ── Distillation quality gate ─────────────────────────
                     "distill/gated":            m.get("distill/gated",       0.0),
                     "distill/max_reward":       m.get("distill/max_reward",  0.0),
@@ -721,9 +729,14 @@ def train_stage2(
                     "global_step":              step,
                 }
 
-                # ── CA gate sigmoid values (per block) ────────────────────
-                for blk_idx, blk in enumerate(verbalizer.ca_blocks):
-                    wandb_payload[f"ca_gate/block_{blk_idx}"] = torch.sigmoid(blk.gate).item()
+                # Conditionally log trajectory-specific metrics
+                if is_trajectory:
+                    if "loss/l_ans" in m:
+                        wandb_payload["loss/l_ans"] = m["loss/l_ans"]
+                    if "waypoints/pred_mean" in m:
+                        wandb_payload["waypoints/pred_mean"] = m["waypoints/pred_mean"]
+                    if "waypoints/pred_std" in m:
+                        wandb_payload["waypoints/pred_std"] = m["waypoints/pred_std"]
 
                 # ── Rollout Text Logging (every 10 steps) ────────────────
                 if step % 10 == 0:
