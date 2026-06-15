@@ -94,7 +94,7 @@ class Stage2Config:
     G:                   int  = 5
     gen_temperature:     float = 0.9
     gen_max_new_tokens:  int  = 512
-    kl_coef:             float = 0.05
+    kl_coef:             float = 0.0
 
     # Architecture
     M:                   int  = 6     # reasoning latents
