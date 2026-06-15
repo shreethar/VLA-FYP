@@ -764,7 +764,7 @@ def train_stage2(
 
                     # ── Verbalizer Output Logging ────────────────────────────
                     try:
-                        verbalizer_table = wandb.Table(columns=["Batch_Idx", "Verbalizer_Text"])
+                        verbalizer_table = wandb.Table(columns=["Batch_Idx", "L_lm", "Teacher_Best_Text", "Verbalizer_Text"])
                         from transformers import GenerationConfig
                         gen_cfg = GenerationConfig(
                             max_new_tokens=128, 
@@ -783,7 +783,8 @@ def train_stage2(
                         generated_ids = gen_out[:, prompt_len:]
                         gen_texts = tokenizer.batch_decode(generated_ids, skip_special_tokens=True)
                         for b, txt in enumerate(gen_texts):
-                            verbalizer_table.add_data(b, txt)
+                            teacher_best = buffer.rollout_texts[buffer.best_idx[b].item()][b]
+                            verbalizer_table.add_data(b, m.get("loss/lm_loss", 0.0), teacher_best, txt)
                         wandb_payload["rollouts/verbalizer_samples"] = verbalizer_table
                     except Exception as e:
                         logger.warning(f"Failed to log wandb verbalizer table: {e}")
