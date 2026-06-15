@@ -870,9 +870,6 @@ class GRPOTeacher(nn.Module):
         stats = {
             "grpo/reward_mean":    buffer.rewards.mean().item(),
             "grpo/reward_max":     buffer.rewards.max().item(),
-            "grpo/reward_min":     buffer.rewards.min().item(),
-            "grpo/reward_std":     buffer.rewards.std().item(),
-            "grpo/advantage_mean": buffer.advantages.mean().item(),
         }
         
         if buffer.kl_loss is not None:

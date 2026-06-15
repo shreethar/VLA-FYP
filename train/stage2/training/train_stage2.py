@@ -101,8 +101,8 @@ class Stage2Config:
     K:                   int  = 5     # spatial tokens / waypoints
 
     # Loss weights
-    lambda_distill:      float = 0.1
-    lambda_ans:          float = 10.0
+    lambda_distill:      float = 0.5
+    lambda_ans:          float = 50.0
 
     # Misc
     seed:                int  = 42
@@ -687,10 +687,6 @@ def train_stage2(
 
             if use_wandb:
                 wandb_payload = {
-                    # ── Phase ───────────────────────────────────────────
-                    "phase/is_warmup":          float(is_warmup),
-                    "phase/step":               step,
-
                     # ── Student losses ───────────────────────────────────
                     "loss/student_total":        m["loss/student_total"],
                     "loss/l_distill":            m["loss/l_distill"],
@@ -716,17 +712,11 @@ def train_stage2(
                     "distill/gated":            m.get("distill/gated",       0.0),
                     "distill/max_reward":       m.get("distill/max_reward",  0.0),
 
-                    # ── Collapse watchdog ─────────────────────────────────
-                    "watchdog/reward_zero_streak":       float(reward_zero_streak),
-                    "watchdog/teacher_frozen":           float(teacher_frozen_by_watchdog),
-                    "watchdog/lm_collapse_streak":       float(lm_collapse_streak),
-
                     # ── Learning rates ───────────────────────────────────
                     "lr/teacher":               teacher_sched.get_last_lr()[0],
                     "lr/student":               student_sched.get_last_lr()[0],
                     "lr/verbalizer":            (verbalizer_sched.get_last_lr()[0]
                                                  if not verbalizer.is_frozen() else 0.0),
-                    "global_step":              step,
                 }
 
                 # Conditionally log trajectory-specific metrics
