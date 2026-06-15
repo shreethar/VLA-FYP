@@ -188,7 +188,12 @@ class Stage2Dataset(Dataset):
         logger.info("Scanning HF split for records…")
         self.samples = []
         skipped = 0
+        skipped_dataset = 0
         for row in hf_split:
+            if row.get("dataset") in ["pixmocapqa", "pixmocap", "pixmoama"]:
+                skipped_dataset += 1
+                continue
+
             task_type = row.get("type", "trajectory")
             qa_answer = None
             if task_type == "trajectory":
@@ -214,7 +219,8 @@ class Stage2Dataset(Dataset):
 
         logger.info(
             f"Stage2Dataset: kept {len(self.samples):,} samples "
-            f"(skipped {skipped:,} trajectory samples with unparseable waypoints)."
+            f"(skipped {skipped:,} trajectory samples with unparseable waypoints, "
+            f"skipped {skipped_dataset:,} ignored datasets)."
         )
 
     def __len__(self) -> int:
