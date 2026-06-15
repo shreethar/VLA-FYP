@@ -60,3 +60,5 @@ wandb/
 # Logs
 train/stage2/mini_training_log.txt
 training_log.txt
+
+train/stage2/test/image.jpg
