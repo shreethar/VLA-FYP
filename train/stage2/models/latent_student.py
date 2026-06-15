@@ -140,6 +140,12 @@ class SpatialMLP(nn.Module):
             nn.Sigmoid(),
         )
 
+        # Initialize the final linear layer to output near 0.0 before sigmoid.
+        # This prevents the sigmoid from saturating to 1.0 or 0.0 at initialization,
+        # which would cause "dead" zero gradients.
+        nn.init.zeros_(self.net[4].weight)
+        nn.init.zeros_(self.net[4].bias)
+
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         # x: [batch, K, d]  →  [batch, K, 2]
         return self.net(x)
