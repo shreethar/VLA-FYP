@@ -345,7 +345,8 @@ class Verbalizer(nn.Module):
 
         loss = None
         if labels is not None:
-            shift_logits = logits[:, :-1, :].contiguous()
+            # Cast to float32 before cross-entropy to prevent bf16 overflow → NaN gradients
+            shift_logits = logits[:, :-1, :].contiguous().float()
             shift_labels = labels[:, 1:].contiguous()
             loss = F.cross_entropy(
                 shift_logits.view(-1, shift_logits.size(-1)),
