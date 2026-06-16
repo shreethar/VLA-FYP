@@ -62,3 +62,5 @@ train/stage2/mini_training_log.txt
 training_log.txt
 
 train/stage2/test/image.jpg
+train/stage2/gen1.json
+train/stage2/gen0.json
