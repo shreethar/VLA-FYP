@@ -94,7 +94,7 @@ class Stage2Config:
     G:                   int  = 5
     gen_temperature:     float = 0.9
     gen_max_new_tokens:  int  = 512
-    kl_coef:             float = 0.0
+    kl_coef:             float = 0.05
 
     # Architecture
     M:                   int  = 6     # reasoning latents
@@ -140,10 +140,11 @@ def build_student_optimizer(student: LatentStudent, cfg: Stage2Config):
             ],
             "lr": cfg.student_lr,
         },
-        # Spatial tokens + SpatialMLP — same LR
+        # Spatial tokens + SpatialMLP — 10x higher LR!
+        # Because they are trained from scratch, they need a higher LR than the pre-trained LoRA weights.
         {
             "params": list(student.spatial_mlp.parameters()) + [student.spatial_tokens],
-            "lr": cfg.student_lr,
+            "lr": cfg.student_lr * 10.0,
         },
     ]
     return torch.optim.AdamW(param_groups, weight_decay=cfg.weight_decay)
@@ -573,14 +574,14 @@ def train_stage2(
             loss_student = loss_out.student_total / cfg.grad_accum_steps
             loss_student.backward()
             if is_accum_step:
+                # Capture grad norms BEFORE clipping (every accum step for fresh logging)
+                from training.student_losses import StudentLossComputer
+                cached_grad_norms = StudentLossComputer.log_student_grad_norms(student)
+                
                 s_norm = nn.utils.clip_grad_norm_(
                     [p for p in student.parameters() if p.requires_grad],
                     cfg.grad_clip,
                 )
-                # ── Fix 1: Capture grad norms BEFORE zero_grad ─────────────
-                if step % cfg.grad_log_steps == 0:
-                    from training.student_losses import StudentLossComputer
-                    cached_grad_norms = StudentLossComputer.log_student_grad_norms(student)
                 if torch.isnan(s_norm) or torch.isinf(s_norm):
                     logger.warning(f"Student gradients are NaN/Inf (norm={s_norm}). Skipping step.")
                 else:
@@ -594,14 +595,14 @@ def train_stage2(
             loss_student = loss_out.student_total / cfg.grad_accum_steps
             loss_student.backward()
             if is_accum_step:
+                # Capture grad norms BEFORE clipping (every accum step for fresh logging)
+                from training.student_losses import StudentLossComputer
+                cached_grad_norms = StudentLossComputer.log_student_grad_norms(student)
+
                 s_norm = nn.utils.clip_grad_norm_(
                     [p for p in student.parameters() if p.requires_grad],
                     cfg.grad_clip,
                 )
-                # ── Fix 1: Capture grad norms BEFORE zero_grad ─────────────
-                if step % cfg.grad_log_steps == 0:
-                    from training.student_losses import StudentLossComputer
-                    cached_grad_norms = StudentLossComputer.log_student_grad_norms(student)
                 if torch.isnan(s_norm) or torch.isinf(s_norm):
                     logger.warning(f"Student gradients are NaN/Inf (norm={s_norm}). Skipping step.")
                 else:
@@ -728,43 +729,85 @@ def train_stage2(
                     if "waypoints/pred_std" in m:
                         wandb_payload["waypoints/pred_std"] = m["waypoints/pred_std"]
 
-                # ── Rollout Text Logging (every 10 steps) ────────────────
-                if step % 10 == 0:
+                # ── Rollout Text Logging (every step for first 50 steps, then every 10 steps) ──
+                is_text_log_step = (step < 50) or (step % 10 == 0)
+                if is_text_log_step:
+                    import json
+                    import os
+                    log_root = "logs"
+                    os.makedirs(os.path.join(log_root, "generation"), exist_ok=True)
+                    os.makedirs(os.path.join(log_root, "verbalizer"), exist_ok=True)
+                    os.makedirs(os.path.join(log_root, "waypoint"), exist_ok=True)
+                    datasets = ground_truth.get("dataset", [])
+
                     # ── Waypoint Table Logging ───────────────────────────────
                     try:
-                        wp_table = wandb.Table(columns=["Batch_Idx", "Pred_Waypoints", "GT_Waypoints"])
+                        wp_table = wandb.Table(columns=["Batch_Idx", "Dataset", "Pred_Waypoints", "GT_Waypoints"])
+                        wp_data = []
                         B_len = gt_waypoints.shape[0]
                         if loss_out.pred_waypoints is not None:
                             pred_wp = loss_out.pred_waypoints.cpu().tolist()
                             gt_wp = gt_waypoints.cpu().tolist()
                             for b in range(B_len):
+                                ds_name = datasets[b] if b < len(datasets) else "unknown"
                                 pred_str = str([[round(p[0], 3), round(p[1], 3)] for p in pred_wp[b]])
                                 gt_str = str([[round(g[0], 3), round(g[1], 3)] for g in gt_wp[b]])
-                                wp_table.add_data(b, pred_str, gt_str)
+                                wp_table.add_data(b, ds_name, pred_str, gt_str)
+                                wp_data.append({
+                                    "Batch_Idx": b,
+                                    "Dataset": ds_name,
+                                    "Pred_Waypoints": [[round(p[0], 3), round(p[1], 3)] for p in pred_wp[b]],
+                                    "GT_Waypoints": [[round(g[0], 3), round(g[1], 3)] for g in gt_wp[b]]
+                                })
+                            
                             wandb_payload["waypoints/pred_vs_gt_table"] = wp_table
+                            # Save locally
+                            wp_log_path = os.path.join(log_root, "waypoint", f"step_{step:06d}.json")
+                            with open(wp_log_path, "w", encoding="utf-8") as f:
+                                json.dump(wp_data, f, indent=2)
                     except Exception as e:
-                        logger.warning(f"Failed to log wandb waypoints table: {e}")
+                        logger.warning(f"Failed to log waypoints table: {e}")
 
+                    # ── Generation Table Logging ─────────────────────────────
                     try:
-                        table = wandb.Table(columns=["Batch_Idx", "Rollout_Idx", "Reward", "Advantage", "Text"])
+                        table = wandb.Table(columns=["Batch_Idx", "Rollout_Idx", "Reward", "Advantage", "Dataset", "Text"])
+                        gen_data = []
                         G_len = buffer.rewards.shape[0]
                         B_len = buffer.rewards.shape[1]
                         for b in range(B_len):
+                            ds_name = datasets[b] if b < len(datasets) else "unknown"
                             for g in range(G_len):
+                                reward_val = float(buffer.rewards[g, b].cpu())
+                                adv_val = float(buffer.advantages[g, b].cpu())
+                                rollout_txt = buffer.rollout_texts[g][b]
                                 table.add_data(
                                     b, 
                                     g, 
-                                    float(buffer.rewards[g, b].cpu()), 
-                                    float(buffer.advantages[g, b].cpu()), 
-                                    buffer.rollout_texts[g][b]
+                                    reward_val, 
+                                    adv_val, 
+                                    ds_name,
+                                    rollout_txt
                                 )
+                                gen_data.append({
+                                    "Batch_Idx": b,
+                                    "Rollout_Idx": g,
+                                    "Reward": reward_val,
+                                    "Advantage": adv_val,
+                                    "Dataset": ds_name,
+                                    "Text": rollout_txt
+                                })
                         wandb_payload["rollouts/generation_samples"] = table
+                        # Save locally
+                        gen_log_path = os.path.join(log_root, "generation", f"step_{step:06d}.json")
+                        with open(gen_log_path, "w", encoding="utf-8") as f:
+                            json.dump(gen_data, f, indent=2)
                     except Exception as e:
-                        logger.warning(f"Failed to log wandb rollout table: {e}")
+                        logger.warning(f"Failed to log rollout table: {e}")
 
                     # ── Verbalizer Output Logging ────────────────────────────
                     try:
-                        verbalizer_table = wandb.Table(columns=["Batch_Idx", "L_lm", "Teacher_Best_Text", "Verbalizer_Text"])
+                        verbalizer_table = wandb.Table(columns=["Batch_Idx", "Dataset", "L_lm", "Teacher_Best_Text", "Verbalizer_Text"])
+                        verb_data = []
                         from transformers import GenerationConfig
                         gen_cfg = GenerationConfig(
                             max_new_tokens=128, 
@@ -783,11 +826,24 @@ def train_stage2(
                         generated_ids = gen_out[:, prompt_len:]
                         gen_texts = tokenizer.batch_decode(generated_ids, skip_special_tokens=True)
                         for b, txt in enumerate(gen_texts):
+                            ds_name = datasets[b] if b < len(datasets) else "unknown"
                             teacher_best = buffer.rollout_texts[buffer.best_idx[b].item()][b]
-                            verbalizer_table.add_data(b, m.get("loss/lm_loss", 0.0), teacher_best, txt)
+                            lm_loss_val = float(m.get("loss/lm_loss", 0.0))
+                            verbalizer_table.add_data(b, ds_name, lm_loss_val, teacher_best, txt)
+                            verb_data.append({
+                                "Batch_Idx": b,
+                                "Dataset": ds_name,
+                                "L_lm": lm_loss_val,
+                                "Teacher_Best_Text": teacher_best,
+                                "Verbalizer_Text": txt
+                            })
                         wandb_payload["rollouts/verbalizer_samples"] = verbalizer_table
+                        # Save locally
+                        verb_log_path = os.path.join(log_root, "verbalizer", f"step_{step:06d}.json")
+                        with open(verb_log_path, "w", encoding="utf-8") as f:
+                            json.dump(verb_data, f, indent=2)
                     except Exception as e:
-                        logger.warning(f"Failed to log wandb verbalizer table: {e}")
+                        logger.warning(f"Failed to log verbalizer table: {e}")
 
                 # Gradient norm logging — uses cached norms from Fix 1
                 grad_norms = cached_grad_norms  # captured BEFORE zero_grad
