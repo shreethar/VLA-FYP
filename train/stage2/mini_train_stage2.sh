@@ -18,8 +18,8 @@ wandb login
 echo "============================================================"
 echo " Starting ThinkFlow-VLA Stage 2 Training"
 echo " Dataset Subset  : 100%"
-echo " Total Steps     : 6000"
-echo " Warmup Steps    : 4000"
+echo " Total Steps     : 4500"
+echo " Warmup Steps    : 3000"
 echo "============================================================"
 
 # Create the output directory for this test run
@@ -31,12 +31,12 @@ python training/train_stage2.py \
     --output_dir "$OUTPUT_DIR" \
     --split "test" \
     --subset_ratio 1.0 \
-    --total_steps 6000 \
-    --warmup_steps 4000 \
+    --total_steps 450 \
+    --warmup_steps 300 \
     --save_steps 100 \
     --wandb_run "stage2-mini-train" \
-    --batch_size 4 \
-    --grad_accum_steps 16 \
+    --batch_size 2 \
+    --grad_accum_steps 4 \
     --log_steps 1 \
     --max_seq_len 4096 \
     --offload_ref_model False \
