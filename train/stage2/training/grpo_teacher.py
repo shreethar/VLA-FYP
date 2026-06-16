@@ -577,11 +577,13 @@ class GRPOTeacher(nn.Module):
                 )
                 logits = out.logits.float()  # [1, seq_g, vocab]
 
-                # 4. Log-probs
+                # 4. Log-probs (with numerical stability clamps on log-probs only)
                 target_ids = batch_id[:, 1:]
                 logits_shifted = logits[:, :-1, :]
                 target_logits = logits_shifted.gather(dim=-1, index=target_ids.unsqueeze(-1)).squeeze(-1)
                 token_log_p = target_logits - torch.logsumexp(logits_shifted, dim=-1) # [1, seq-1]
+                # Clamp log-probs to valid range (log-probs should be ≤ 0)
+                token_log_p = token_log_p.clamp(min=-100.0, max=0.0)
 
                 # Mean log-prob per response
                 resp_mask_shifted = resp_mask[:, 1:]
@@ -604,18 +606,23 @@ class GRPOTeacher(nn.Module):
                         )
                         ref_logits = ref_out.logits[:, :-1, :]
                         ref_target_logits = ref_logits.gather(dim=-1, index=target_ids.unsqueeze(-1)).squeeze(-1)
-                        ref_token_p = ref_target_logits - torch.logsumexp(ref_logits, dim=-1)
+                        ref_token_p = (ref_target_logits - torch.logsumexp(ref_logits, dim=-1)).clamp(min=-100.0, max=0.0)
                         
-                        kl = (token_log_p.detach() - ref_token_p) * resp_mask_shifted
-                        kl_per_token = kl.sum(dim=-1) / resp_lens
-                        kl_gb = (self.kl_coef * kl_per_token.mean()) / (G * B * grad_accum_steps)
+                    kl = (token_log_p - ref_token_p.detach()) * resp_mask_shifted
+                    kl_per_token = kl.sum(dim=-1) / resp_lens
+                    kl_gb = (self.kl_coef * kl_per_token.mean()) / (G * B * grad_accum_steps)
 
-                # 7. Backward pass FOR THIS 1-ITEM CHUNK ONLY!
+                # 7. NaN guard: skip this chunk if loss is NaN/Inf
                 chunk_loss = loss_gb + kl_gb
-                chunk_loss.backward()
+                if torch.isnan(chunk_loss) or torch.isinf(chunk_loss):
+                    # Zero out gradients from this corrupted chunk
+                    chunk_loss = torch.tensor(0.0, device=device, requires_grad=True)
+                    chunk_loss.backward()  # no-op backward to keep graph consistent
+                else:
+                    chunk_loss.backward()
                 
-                total_rollout_loss += (loss_gb.item() * G * B * grad_accum_steps)  # un-scale for logging
-                total_kl_loss += (kl_gb.item() * G * B * grad_accum_steps)
+                total_rollout_loss += (loss_gb.item() * G * B * grad_accum_steps) if not torch.isnan(loss_gb) else 0.0
+                total_kl_loss += (kl_gb.item() * G * B * grad_accum_steps) if not torch.isnan(kl_gb) else 0.0
                 
                 # Explicitly delete massive tensors BEFORE next micro-batch!
                 del out, logits, inputs_embeds, logits_shifted, position_ids
