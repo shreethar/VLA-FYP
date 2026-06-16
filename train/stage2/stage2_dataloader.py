@@ -232,6 +232,11 @@ class Stage2Dataset(Dataset):
         # ── Build chat messages (Qwen multimodal format) ──────────────────
         frames: List[Image.Image] = s["frames"]
 
+        # Downsample video frames by half
+        if len(frames) > 1:
+            start_idx = 1 if len(frames) % 2 == 0 else 0
+            frames = frames[start_idx::2]
+
         # Ensure 448×448 RGB (already done during materialisation, but guard)
         frames = [
             f.convert("RGB").resize((IMAGE_SIZE, IMAGE_SIZE))
