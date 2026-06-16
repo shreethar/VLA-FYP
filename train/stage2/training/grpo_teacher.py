@@ -835,7 +835,7 @@ class GRPOTeacher(nn.Module):
             mean_kl = raw_kl_val.item() / (self.G * input_ids.shape[0])
             old_kl_coef = self.kl_coef
             if mean_kl > self.target_kl * 1.5:
-                self.kl_coef = min(self.kl_coef * 1.5, 0.5)
+                self.kl_coef = min(self.kl_coef * 1.5, 1.0)
             elif mean_kl < self.target_kl / 1.5:
                 self.kl_coef = max(self.kl_coef / 1.5, 0.001)
             

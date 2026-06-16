@@ -35,8 +35,8 @@ python training/train_stage2.py \
     --warmup_steps 4000 \
     --save_steps 100 \
     --wandb_run "stage2-mini-train" \
-    --batch_size 2 \
-    --grad_accum_steps 1 \
+    --batch_size 4 \
+    --grad_accum_steps 16 \
     --log_steps 1 \
     --max_seq_len 4096 \
     --num_workers 2 2>&1 | tee "$OUTPUT_DIR/training_log_full.txt"
