@@ -23,7 +23,7 @@ echo " Warmup Steps    : 4000"
 echo "============================================================"
 
 # Create the output directory for this test run
-OUTPUT_DIR="checkpoints/stage2"
+OUTPUT_DIR="checkpoints/stage2_1"
 mkdir -p "$OUTPUT_DIR"
 
 python training/train_stage2.py \
