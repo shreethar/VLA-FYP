@@ -24,4 +24,4 @@ rewards = reward_fn(
 print("Hypothesis: [631, 211, 702, 284]")
 print("Reference:  [631, 211, 702, 284]")
 print("ROUGE score:", compute_rouge_score("[631, 211, 702, 284]", "[631, 211, 702, 284]"))
-print("Final Reward:", rewards[0].item())
+print("Final Reward (Expected 1.0):", rewards[0].item())

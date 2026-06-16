@@ -31,5 +31,5 @@ rewards = reward_fn(
     ground_truth=ground_truth
 )
 
-print("Rollout 0 Reward (Expected ~2.0):", rewards[0].item())
-print("Rollout 1 Reward (Expected ~1.15):", rewards[1].item())
+print("Rollout 0 Reward (Expected 1.0):", rewards[0].item())
+print("Rollout 1 Reward (Expected ~0.32):", rewards[1].item())
