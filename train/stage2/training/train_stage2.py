@@ -111,6 +111,8 @@ class Stage2Config:
     bf16:                bool = True
     grad_log_steps:      int  = 100   # how often to log gradient norms
     offload_ref_model:   bool = True
+    mode:                str  = "joint"
+    offline_data_dir:    str  = "checkpoints/stage2_1/offline_data"
 
     # WandB
     wandb_project:       str  = "reasonflow-vla"
@@ -190,9 +192,9 @@ def build_scheduler(optimizer, cfg: Stage2Config, total_steps: int):
 
 def save_checkpoint(
     step: int,
-    teacher: GRPOTeacher,
-    student: LatentStudent,
-    verbalizer: Verbalizer,
+    teacher: Optional[GRPOTeacher],
+    student: Optional[LatentStudent],
+    verbalizer: Optional[Verbalizer],
     teacher_opt, student_opt, verbalizer_opt,
     teacher_sched, student_sched, verbalizer_sched,
     output_dir: str,
@@ -200,39 +202,27 @@ def save_checkpoint(
     ckpt_dir = os.path.join(output_dir, f"step_{step:06d}")
     os.makedirs(ckpt_dir, exist_ok=True)
 
-    # Save LoRA adapters only (not frozen base weights) — saves disk space
-    teacher.vlm.save_pretrained(os.path.join(ckpt_dir, "teacher_lora"))
-    student.vlm.save_pretrained(os.path.join(ckpt_dir, "student_lora"))
-    verbalizer.lm.save_pretrained(os.path.join(ckpt_dir, "verbalizer_lora"))
+    state_dict = {"step": step}
 
-    # Save non-LoRA trainable components
-    torch.save(
-        {
-            "step": step,
-            # Student extras
-            "spatial_tokens": student.spatial_tokens.data,
-            "spatial_mlp":    student.spatial_mlp.state_dict(),
-            # Verbalizer CA blocks
-            "ca_blocks":      verbalizer.ca_blocks.state_dict(),
-            # Optimizers (commented out to save space/time)
-            # "teacher_opt":    teacher_opt.state_dict(),
-            # "student_opt":    student_opt.state_dict(),
-            # "verbalizer_opt": verbalizer_opt.state_dict(),
-            # Schedulers
-            # "teacher_sched":    teacher_sched.state_dict(),
-            # "student_sched":    student_sched.state_dict(),
-            # "verbalizer_sched": verbalizer_sched.state_dict(),
-        },
-        os.path.join(ckpt_dir, "training_state.pt"),
-    )
+    if teacher is not None:
+        teacher.vlm.save_pretrained(os.path.join(ckpt_dir, "teacher_lora"))
+    if student is not None:
+        student.vlm.save_pretrained(os.path.join(ckpt_dir, "student_lora"))
+        state_dict["spatial_tokens"] = student.spatial_tokens.data
+        state_dict["spatial_mlp"] = student.spatial_mlp.state_dict()
+    if verbalizer is not None:
+        verbalizer.lm.save_pretrained(os.path.join(ckpt_dir, "verbalizer_lora"))
+        state_dict["ca_blocks"] = verbalizer.ca_blocks.state_dict()
+
+    torch.save(state_dict, os.path.join(ckpt_dir, "training_state.pt"))
     logger.info(f"Checkpoint saved → {ckpt_dir}")
 
 
 def load_checkpoint(
     ckpt_dir: str,
-    teacher: GRPOTeacher,
-    student: LatentStudent,
-    verbalizer: Verbalizer,
+    teacher: Optional[GRPOTeacher],
+    student: Optional[LatentStudent],
+    verbalizer: Optional[Verbalizer],
     teacher_opt, student_opt, verbalizer_opt,
     teacher_sched, student_sched, verbalizer_sched,
     device: torch.device,
@@ -245,18 +235,12 @@ def load_checkpoint(
     )
     step = state["step"]
 
-    # Restore non-LoRA components
-    student.spatial_tokens.data.copy_(state["spatial_tokens"])
-    student.spatial_mlp.load_state_dict(state["spatial_mlp"])
-    verbalizer.ca_blocks.load_state_dict(state["ca_blocks"])
-
-    # Restore optimizer and scheduler states (commented out)
-    # teacher_opt.load_state_dict(state["teacher_opt"])
-    # student_opt.load_state_dict(state["student_opt"])
-    # verbalizer_opt.load_state_dict(state["verbalizer_opt"])
-    # teacher_sched.load_state_dict(state["teacher_sched"])
-    # student_sched.load_state_dict(state["student_sched"])
-    # verbalizer_sched.load_state_dict(state["verbalizer_sched"])
+    # Restore non-LoRA components if the model is initialized
+    if student is not None and "spatial_tokens" in state:
+        student.spatial_tokens.data.copy_(state["spatial_tokens"])
+        student.spatial_mlp.load_state_dict(state["spatial_mlp"])
+    if verbalizer is not None and "ca_blocks" in state:
+        verbalizer.ca_blocks.load_state_dict(state["ca_blocks"])
 
     logger.info(f"Resumed from checkpoint at step {step}")
     return step
@@ -275,8 +259,8 @@ def log_memory(tag: str):
 
 def train_stage2(
     cfg: Stage2Config,
-    dataloader: DataLoader,
-    reward_fns,                    # List[RewardFunction] — injected from rewards/
+    dataloader: Optional[DataLoader] = None,
+    reward_fns = None,                    # List[RewardFunction] — injected from rewards/
     reward_weights=None,
     resume_from: Optional[str] = None,
     answer_token_id: int = -1,     # set after tokenizer extension
@@ -355,46 +339,48 @@ def train_stage2(
     # ------------------------------------------------------------------
     log_memory("Before loading models")
 
-    logger.info("Building Teacher …")
-    teacher = GRPOTeacher(
-        pretrained_model_name_or_path=cfg.base_model_name,
-        G=cfg.G,
-        answer_token_id=answer_token_id, # This is now the think_end_token_id under the hood
-        lora_rank=cfg.lora_rank,
-        lora_alpha=cfg.lora_alpha,
-        gen_temperature=cfg.gen_temperature,
-        gen_max_new_tokens=cfg.gen_max_new_tokens,
-        kl_coef=cfg.kl_coef,
-        target_kl=cfg.target_kl,
-        offload_ref_model=cfg.offload_ref_model,
-    ).to(device)
+    teacher = None
+    if cfg.mode in ("joint", "teacher_only"):
+        logger.info("Building Teacher …")
+        teacher = GRPOTeacher(
+            pretrained_model_name_or_path=cfg.base_model_name,
+            G=cfg.G,
+            answer_token_id=answer_token_id, # This is now the think_end_token_id under the hood
+            lora_rank=cfg.lora_rank,
+            lora_alpha=cfg.lora_alpha,
+            gen_temperature=cfg.gen_temperature,
+            gen_max_new_tokens=cfg.gen_max_new_tokens,
+            kl_coef=cfg.kl_coef,
+            target_kl=cfg.target_kl,
+            offload_ref_model=cfg.offload_ref_model,
+        ).to(device)
+        log_memory("After Teacher loaded")
 
-    log_memory("After Teacher loaded")
+    student = None
+    if cfg.mode in ("joint", "student_offline"):
+        logger.info("Building Student …")
+        student = LatentStudent(
+            model_name=cfg.base_model_name,
+            M=cfg.M,
+            K=cfg.K,
+            lora_rank=cfg.lora_rank,
+            lora_alpha=cfg.lora_alpha,
+            end_think_token_id=answer_token_id,
+        ).to(device)
+        log_memory("After Student loaded")
 
-    logger.info("Building Student …")
-    student = LatentStudent(
-        model_name=cfg.base_model_name,
-        M=cfg.M,
-        K=cfg.K,
-        lora_rank=cfg.lora_rank,
-        lora_alpha=cfg.lora_alpha,
-        end_think_token_id=answer_token_id,
-    ).to(device)
+    verbalizer = None
+    if cfg.mode in ("joint", "student_offline"):
+        logger.info("Building Verbalizer …")
+        verbalizer = Verbalizer(
+            model_name=cfg.verbalizer_name,
+            student_hidden=student.hidden_dim,
+            lora_rank=cfg.verbalizer_lora_rank,
+            lora_alpha=cfg.verbalizer_lora_rank * 2,
+        ).to(device)
+        log_memory("After Verbalizer loaded")
 
-    log_memory("After Student loaded")
-
-    logger.info("Building Verbalizer …")
-    verbalizer = Verbalizer(
-        model_name=cfg.verbalizer_name,
-        student_hidden=student.hidden_dim,
-        lora_rank=cfg.verbalizer_lora_rank,
-        lora_alpha=cfg.verbalizer_lora_rank * 2,
-    ).to(device)
-
-    log_memory("After Verbalizer loaded")
-
-    # Load Stage 1 checkpoint into both Teacher and Student
-    # (identical init — they diverge from here via their respective objectives)
+    # Load Stage 1 checkpoint into both Teacher and Student if initialized
     if cfg.stage1_ckpt_dir and os.path.isdir(cfg.stage1_ckpt_dir):
         logger.info(f"Loading Stage 1 checkpoint: {cfg.stage1_ckpt_dir}")
         from peft import set_peft_model_state_dict
@@ -403,30 +389,44 @@ def train_stage2(
         s1_state = st.load_file(
             os.path.join(cfg.stage1_ckpt_dir, "adapter_model.safetensors")
         )
-        set_peft_model_state_dict(teacher.vlm, s1_state)
-        set_peft_model_state_dict(student.vlm, s1_state)
-        logger.info("Stage 1 weights loaded into Teacher and Student.")
+        if teacher is not None:
+            set_peft_model_state_dict(teacher.vlm, s1_state)
+        if student is not None:
+            set_peft_model_state_dict(student.vlm, s1_state)
+        logger.info("Stage 1 weights loaded.")
 
     # ------------------------------------------------------------------
     # 3. Loss computer
     # ------------------------------------------------------------------
-    loss_computer = build_student_loss_computer(
-        warmup_steps=cfg.warmup_steps,
-        lambda_distill=cfg.lambda_distill,
-        lambda_ans=cfg.lambda_ans,
-    )
+    loss_computer = None
+    if cfg.mode in ("joint", "student_offline"):
+        loss_computer = build_student_loss_computer(
+            warmup_steps=cfg.warmup_steps,
+            lambda_distill=cfg.lambda_distill,
+            lambda_ans=cfg.lambda_ans,
+        )
 
     # ------------------------------------------------------------------
     # 4. Optimizers + schedulers
     # ------------------------------------------------------------------
-    teacher_opt    = build_teacher_optimizer(teacher, cfg)
-    student_opt    = build_student_optimizer(student, cfg)
-    verbalizer_opt = build_verbalizer_optimizer(verbalizer, cfg)
+    teacher_opt = None
+    teacher_sched = None
+    if teacher is not None:
+        teacher_opt    = build_teacher_optimizer(teacher, cfg)
+        teacher_sched    = build_scheduler(teacher_opt,    cfg, cfg.total_steps)
 
-    teacher_sched    = build_scheduler(teacher_opt,    cfg, cfg.total_steps)
-    student_sched    = build_scheduler(student_opt,    cfg, cfg.total_steps)
-    verbalizer_sched = build_scheduler(verbalizer_opt, cfg, cfg.warmup_steps)
-    # Verbalizer scheduler only runs for warmup_steps; frozen after that
+    student_opt = None
+    student_sched = None
+    if student is not None:
+        student_opt    = build_student_optimizer(student, cfg)
+        student_sched    = build_scheduler(student_opt,    cfg, cfg.total_steps)
+
+    verbalizer_opt = None
+    verbalizer_sched = None
+    if verbalizer is not None:
+        verbalizer_opt = build_verbalizer_optimizer(verbalizer, cfg)
+        verbalizer_sched = build_scheduler(verbalizer_opt, cfg, cfg.warmup_steps)
+        # Verbalizer scheduler only runs for warmup_steps; frozen after that
 
     # ------------------------------------------------------------------
     # 5. Resume from checkpoint if requested
@@ -441,23 +441,27 @@ def train_stage2(
             device,
         )
         # Re-apply freeze state if resuming past warm-up
-        if start_step >= cfg.warmup_steps and not verbalizer.is_frozen():
+        if verbalizer is not None and start_step >= cfg.warmup_steps and not verbalizer.is_frozen():
             verbalizer.freeze_for_student_training()
             logger.info("Verbalizer re-frozen after checkpoint load.")
 
     # ------------------------------------------------------------------
     # 6. Training loop
     # ------------------------------------------------------------------
-    teacher.train()
-    student.train()
-    verbalizer.train()
-
-    teacher_opt.zero_grad()
-    student_opt.zero_grad()
-    verbalizer_opt.zero_grad()
+    if teacher is not None:
+        teacher.train()
+        teacher_opt.zero_grad()
+    if student is not None:
+        student.train()
+        student_opt.zero_grad()
+    if verbalizer is not None:
+        verbalizer.train()
+        verbalizer_opt.zero_grad()
 
     # Infinite dataloader iterator
-    data_iter = iter(dataloader)
+    data_iter = None
+    if dataloader is not None:
+        data_iter = iter(dataloader)
 
     # ── Collapse detection state ────────────────────────────────────────
     reward_zero_streak = 0             # consecutive steps with reward_mean == 0
@@ -468,9 +472,12 @@ def train_stage2(
     for step in range(start_step, cfg.total_steps):
 
         # Reset gradients at start of optimizer step
-        teacher_opt.zero_grad()
-        student_opt.zero_grad()
-        verbalizer_opt.zero_grad()
+        if teacher_opt is not None:
+            teacher_opt.zero_grad()
+        if student_opt is not None:
+            student_opt.zero_grad()
+        if verbalizer_opt is not None:
+            verbalizer_opt.zero_grad()
 
         step_metrics = {}
         last_batch = None
@@ -478,106 +485,195 @@ def train_stage2(
         last_loss_out = None
 
         for accum_idx in range(cfg.grad_accum_steps):
-            # ------ Get next batch (cycle dataloader) ---------------------
-            try:
-                batch = next(data_iter)
-            except StopIteration:
-                data_iter = iter(dataloader)
-                batch = next(data_iter)
+            if cfg.mode == "student_offline":
+                # Load pre-saved inputs and rollout buffer from disk
+                file_path = os.path.join(cfg.offline_data_dir, f"step_{step:06d}_micro_{accum_idx:02d}.pt")
+                if not os.path.exists(file_path):
+                    raise FileNotFoundError(f"Offline training data file not found: {file_path}")
+                data_loaded = torch.load(file_path, map_location="cpu")
 
-            last_batch = batch
+                # Load inputs
+                input_ids = data_loaded["input_ids"].to(device)
+                attention_mask = data_loaded["attention_mask"].to(device)
+                pixel_values = data_loaded["pixel_values"]
+                if pixel_values is not None:
+                    pixel_values = pixel_values.to(device)
+                image_grid_thw = data_loaded["image_grid_thw"]
+                if image_grid_thw is not None:
+                    image_grid_thw = image_grid_thw.to(device)
+                pixel_values_videos = data_loaded["pixel_values_videos"]
+                if pixel_values_videos is not None:
+                    pixel_values_videos = pixel_values_videos.to(device)
+                video_grid_thw = data_loaded["video_grid_thw"]
+                if video_grid_thw is not None:
+                    video_grid_thw = video_grid_thw.to(device)
+                gt_waypoints = data_loaded["gt_waypoints"].to(device)
+                ground_truth = data_loaded["ground_truth"]
 
-            # Move to device
-            input_ids      = batch["input_ids"].to(device)
-            pixel_values   = batch.get("pixel_values")
-            if pixel_values is not None:
-                pixel_values = pixel_values.to(device)
-            image_grid_thw = batch.get("image_grid_thw")
-            if image_grid_thw is not None:
-                image_grid_thw = image_grid_thw.to(device)
-            pixel_values_videos = batch.get("pixel_values_videos")
-            if pixel_values_videos is not None:
-                pixel_values_videos = pixel_values_videos.to(device)
-            video_grid_thw = batch.get("video_grid_thw")
-            if video_grid_thw is not None:
-                video_grid_thw = video_grid_thw.to(device)
-            attention_mask = batch["attention_mask"].to(device)
-            gt_waypoints   = batch["gt_waypoints"].to(device)          # [batch, K, 2]
-            ground_truth   = batch["ground_truth"]                      # dict (stays on CPU)
+                last_batch = {
+                    "input_ids": input_ids,
+                    "attention_mask": attention_mask,
+                    "pixel_values": pixel_values,
+                    "image_grid_thw": image_grid_thw,
+                    "pixel_values_videos": pixel_values_videos,
+                    "video_grid_thw": video_grid_thw,
+                    "gt_waypoints": gt_waypoints,
+                    "ground_truth": ground_truth,
+                }
 
-            is_accum_step = (accum_idx == cfg.grad_accum_steps - 1)
-            effective_accum_step = is_accum_step and not teacher_frozen_by_watchdog
+                # Build dummy RolloutBuffer
+                from training.grpo_teacher import RolloutBuffer
+                buffer = RolloutBuffer()
+                buffer.tau_pos_ids = data_loaded["tau_pos_ids"].to(device)
+                buffer.tau_pos_mask = data_loaded["tau_pos_mask"].to(device)
+                buffer.tau_neg_ids = data_loaded["tau_neg_ids"].to(device)
+                buffer.tau_neg_mask = data_loaded["tau_neg_mask"].to(device)
+                buffer.tau_pos_response_mask = data_loaded["tau_pos_response_mask"].to(device)
+                buffer.tau_neg_response_mask = data_loaded["tau_neg_response_mask"].to(device)
+                buffer.h_T = data_loaded["h_T"].to(device)
+                buffer.rewards = data_loaded["rewards"].to(device)
+                buffer.best_idx = data_loaded["best_idx"].to(device)
+                buffer.rollout_texts = data_loaded["rollout_texts"]
+                # Add basic dummy fields for logging compatibility
+                buffer.advantages = torch.zeros_like(buffer.rewards)
+                buffer.dataset_source = ground_truth.get("dataset", ["unknown"] * input_ids.shape[0])
+                
+                last_buffer = buffer
+            else:
+                # ------ Get next batch (cycle dataloader) ---------------------
+                try:
+                    batch = next(data_iter)
+                except StopIteration:
+                    data_iter = iter(dataloader)
+                    batch = next(data_iter)
 
-            # ----------------------------------------------------------------
-            # B. Teacher GRPO step
-            # ----------------------------------------------------------------
-            buffer: RolloutBuffer = teacher.training_step(
-                input_ids=input_ids,
-                pixel_values=pixel_values,
-                image_grid_thw=image_grid_thw,
-                pixel_values_videos=pixel_values_videos,
-                video_grid_thw=video_grid_thw,
-                attention_mask=attention_mask,
-                ground_truth=ground_truth,
-                reward_fns=reward_fns,
-                reward_weights=reward_weights,
-                optimizer=teacher_opt,
-                tokenizer=tokenizer,
-                grad_clip=cfg.grad_clip,
-                grad_accum_steps=cfg.grad_accum_steps,
-                is_accum_step=effective_accum_step,
-            )
-            last_buffer = buffer
+                last_batch = batch
 
-            if teacher_frozen_by_watchdog:
-                teacher_opt.zero_grad()  # clear any noise
+                # Move to device
+                input_ids      = batch["input_ids"].to(device)
+                pixel_values   = batch.get("pixel_values")
+                if pixel_values is not None:
+                    pixel_values = pixel_values.to(device)
+                image_grid_thw = batch.get("image_grid_thw")
+                if image_grid_thw is not None:
+                    image_grid_thw = image_grid_thw.to(device)
+                pixel_values_videos = batch.get("pixel_values_videos")
+                if pixel_values_videos is not None:
+                    pixel_values_videos = pixel_values_videos.to(device)
+                video_grid_thw = batch.get("video_grid_thw")
+                if video_grid_thw is not None:
+                    video_grid_thw = video_grid_thw.to(device)
+                attention_mask = batch["attention_mask"].to(device)
+                gt_waypoints   = batch["gt_waypoints"].to(device)          # [batch, K, 2]
+                ground_truth   = batch["ground_truth"]                      # dict (stays on CPU)
+
+                is_accum_step = (accum_idx == cfg.grad_accum_steps - 1)
+                effective_accum_step = is_accum_step and not teacher_frozen_by_watchdog
+
+                # ----------------------------------------------------------------
+                # B. Teacher GRPO step
+                # ----------------------------------------------------------------
+                buffer: RolloutBuffer = teacher.training_step(
+                    input_ids=input_ids,
+                    pixel_values=pixel_values,
+                    image_grid_thw=image_grid_thw,
+                    pixel_values_videos=pixel_values_videos,
+                    video_grid_thw=video_grid_thw,
+                    attention_mask=attention_mask,
+                    ground_truth=ground_truth,
+                    reward_fns=reward_fns,
+                    reward_weights=reward_weights,
+                    optimizer=teacher_opt,
+                    tokenizer=tokenizer,
+                    grad_clip=cfg.grad_clip,
+                    grad_accum_steps=cfg.grad_accum_steps,
+                    is_accum_step=effective_accum_step,
+                )
+                last_buffer = buffer
+
+                if teacher_frozen_by_watchdog:
+                    teacher_opt.zero_grad()  # clear any noise
+
+                # If in teacher_only mode, serialize inputs & targets to disk
+                if cfg.mode == "teacher_only":
+                    os.makedirs(cfg.offline_data_dir, exist_ok=True)
+                    data_to_save = {
+                        # Inputs
+                        "input_ids":             input_ids.cpu(),
+                        "attention_mask":        attention_mask.cpu(),
+                        "pixel_values":          pixel_values.cpu() if pixel_values is not None else None,
+                        "image_grid_thw":        image_grid_thw.cpu() if image_grid_thw is not None else None,
+                        "pixel_values_videos":   pixel_values_videos.cpu() if pixel_values_videos is not None else None,
+                        "video_grid_thw":        video_grid_thw.cpu() if video_grid_thw is not None else None,
+                        "gt_waypoints":          gt_waypoints.cpu(),
+                        "ground_truth":          ground_truth,
+                        # Targets
+                        "tau_pos_ids":           buffer.tau_pos_ids.cpu(),
+                        "tau_pos_mask":          buffer.tau_pos_mask.cpu(),
+                        "tau_neg_ids":           buffer.tau_neg_ids.cpu(),
+                        "tau_neg_mask":          buffer.tau_neg_mask.cpu(),
+                        "tau_pos_response_mask": buffer.tau_pos_response_mask.cpu(),
+                        "tau_neg_response_mask": buffer.tau_neg_response_mask.cpu(),
+                        "h_T":                   buffer.h_T.cpu() if buffer.h_T is not None else torch.zeros(input_ids.shape[0], 3584),
+                        "rewards":               buffer.rewards.cpu(),
+                        "best_idx":              buffer.best_idx.cpu(),
+                        "rollout_texts":         buffer.rollout_texts,
+                    }
+                    file_path = os.path.join(cfg.offline_data_dir, f"step_{step:06d}_micro_{accum_idx:02d}.pt")
+                    torch.save(data_to_save, file_path)
 
             # ----------------------------------------------------------------
             # D. Compute all Student (and optionally Verbalizer) losses
             # ----------------------------------------------------------------
-            loss_out = loss_computer.compute(
-                student=student,
-                verbalizer=verbalizer,
-                input_ids=input_ids,
-                pixel_values=pixel_values,
-                image_grid_thw=image_grid_thw,
-                pixel_values_videos=pixel_values_videos,
-                video_grid_thw=video_grid_thw,
-                attention_mask=attention_mask,
-                buffer=buffer,
-                gt_waypoints=gt_waypoints,
-                global_step=step,
-                task_types=ground_truth.get("task_type", None),
-            )
-            last_loss_out = loss_out
-
-            # ----------------------------------------------------------------
-            # E. Backward passes — phase dependent
-            # ----------------------------------------------------------------
             is_warmup = (step < cfg.warmup_steps)
 
-            if is_warmup:
-                # --- E1. Verbalizer backward (LM loss on τ+, z detached) ----
-                loss_lm = loss_out.lm_loss / cfg.grad_accum_steps
-                loss_lm.backward()
+            if cfg.mode in ("joint", "student_offline"):
+                loss_out = loss_computer.compute(
+                    student=student,
+                    verbalizer=verbalizer,
+                    input_ids=input_ids,
+                    pixel_values=pixel_values,
+                    image_grid_thw=image_grid_thw,
+                    pixel_values_videos=pixel_values_videos,
+                    video_grid_thw=video_grid_thw,
+                    attention_mask=attention_mask,
+                    buffer=buffer,
+                    gt_waypoints=gt_waypoints,
+                    global_step=step,
+                    task_types=ground_truth.get("task_type", None),
+                )
+                last_loss_out = loss_out
 
-                # --- E2. Student backward (distill + ans + spatial) ----------
-                loss_student = loss_out.student_total / cfg.grad_accum_steps
-                loss_student.backward()
+                # ----------------------------------------------------------------
+                # E. Backward passes — phase dependent
+                # ----------------------------------------------------------------
+                if is_warmup:
+                    # --- E1. Verbalizer backward (LM loss on τ+, z detached) ----
+                    loss_lm = loss_out.lm_loss / cfg.grad_accum_steps
+                    loss_lm.backward()
+
+                    # --- E2. Student backward (distill + ans + spatial) ----------
+                    loss_student = loss_out.student_total / cfg.grad_accum_steps
+                    loss_student.backward()
+                else:
+                    # --- E3. Student backward (verb + distill + ans + spatial) ---
+                    # Verbalizer is frozen; DPO gradient flows through CA into Student
+                    loss_student = loss_out.student_total / cfg.grad_accum_steps
+                    loss_student.backward()
+
+                # Clear latents from verbalizer to release graph memory
+                verbalizer.clear_latents()
+
+                # Accumulate metrics for logging
+                for k, v in loss_out.metrics.items():
+                    if isinstance(v, torch.Tensor):
+                        v = v.item()
+                    step_metrics[k] = step_metrics.get(k, 0.0) + v / cfg.grad_accum_steps
             else:
-                # --- E3. Student backward (verb + distill + ans + spatial) ---
-                # Verbalizer is frozen; DPO gradient flows through CA into Student
-                loss_student = loss_out.student_total / cfg.grad_accum_steps
-                loss_student.backward()
-
-            # Clear latents from verbalizer to release graph memory
-            verbalizer.clear_latents()
-
-            # Accumulate metrics for logging
-            for k, v in loss_out.metrics.items():
-                if isinstance(v, torch.Tensor):
-                    v = v.item()
-                step_metrics[k] = step_metrics.get(k, 0.0) + v / cfg.grad_accum_steps
+                # teacher_only mode: inject dummy zero metrics for student losses
+                step_metrics["loss/student_total"] = 0.0
+                step_metrics["loss/l_distill"] = 0.0
+                step_metrics["loss/l_ans"] = 0.0
 
             t_stats = GRPOTeacher.log_rollout_stats(buffer)
             for k, v in t_stats.items():
@@ -587,23 +683,24 @@ def train_stage2(
 
         # 4. Step optimizers (only if not frozen / skipped due to NaNs)
         # --- Student step ---
-        from training.student_losses import StudentLossComputer
-        cached_grad_norms = StudentLossComputer.log_student_grad_norms(student)
+        if student_opt is not None:
+            from training.student_losses import StudentLossComputer
+            cached_grad_norms = StudentLossComputer.log_student_grad_norms(student)
 
-        s_norm = nn.utils.clip_grad_norm_(
-            [p for p in student.parameters() if p.requires_grad],
-            cfg.grad_clip,
-        )
-        if torch.isnan(s_norm) or torch.isinf(s_norm):
-            logger.warning(f"[Step {step}] Student gradients are NaN/Inf (norm={s_norm}). Skipping step.")
-            student_opt.zero_grad()
-        else:
-            student_opt.step()
-            student_sched.step()
-            student_opt.zero_grad()
+            s_norm = nn.utils.clip_grad_norm_(
+                [p for p in student.parameters() if p.requires_grad],
+                cfg.grad_clip,
+            )
+            if torch.isnan(s_norm) or torch.isinf(s_norm):
+                logger.warning(f"[Step {step}] Student gradients are NaN/Inf (norm={s_norm}). Skipping step.")
+                student_opt.zero_grad()
+            else:
+                student_opt.step()
+                student_sched.step()
+                student_opt.zero_grad()
 
         # --- Verbalizer step (warmup only) ---
-        if is_warmup:
+        if is_warmup and verbalizer_opt is not None:
             v_norm = nn.utils.clip_grad_norm_(verbalizer.parameters(), cfg.grad_clip)
             lm_loss_avg = step_metrics.get("loss/lm_loss", 0.0)
             if torch.isnan(v_norm) or torch.isinf(v_norm):
@@ -619,15 +716,15 @@ def train_stage2(
                 verbalizer_opt.step()
                 verbalizer_sched.step()
                 verbalizer_opt.zero_grad()
-        else:
+        elif verbalizer_opt is not None:
             verbalizer_opt.zero_grad()
 
         # --- Teacher scheduler step ---
-        if not teacher_frozen_by_watchdog:
+        if teacher_sched is not None and not teacher_frozen_by_watchdog:
             teacher_sched.step()
 
         # --- Transition verbalizer freeze at warmup_steps ---
-        if step == cfg.warmup_steps and not verbalizer.is_frozen():
+        if verbalizer is not None and step == cfg.warmup_steps and not verbalizer.is_frozen():
             verbalizer.freeze_for_student_training()
             logger.info(f"[Step {step}] Verbalizer frozen — DPO phase begins.")
 
@@ -647,7 +744,7 @@ def train_stage2(
                 f"\n{'='*60}\n"
                 f"[WATCHDOG] Reward has been 0.0 for {reward_zero_streak} consecutive steps!\n"
                 f"Freezing teacher optimizer to prevent further corruption.\n"
-                f"L_distill quality gate is also active (distill_gated={last_loss_out.distill_gated}).\n"
+                f"L_distill quality gate is also active (distill_gated={last_loss_out.distill_gated if last_loss_out is not None else False}).\n"
                 f"{'='*60}"
             )
 
@@ -679,7 +776,7 @@ def train_stage2(
                 f"student={m['loss/student_total']:.4f} | "
                 f"distill={m['loss/l_distill']:.4f}"
             )
-            if last_loss_out.distill_gated:
+            if last_loss_out is not None and last_loss_out.distill_gated:
                 log_msg += " [GATED]"
 
             if is_trajectory and "loss/l_ans" in m:
@@ -725,10 +822,10 @@ def train_stage2(
                     "distill/max_reward":       m.get("distill/max_reward",  0.0),
 
                     # ── Learning rates ───────────────────────────────────
-                    "lr/teacher":               teacher_sched.get_last_lr()[0],
-                    "lr/student":               student_sched.get_last_lr()[0],
+                    "lr/teacher":               teacher_sched.get_last_lr()[0] if teacher_sched is not None else 0.0,
+                    "lr/student":               student_sched.get_last_lr()[0] if student_sched is not None else 0.0,
                     "lr/verbalizer":            (verbalizer_sched.get_last_lr()[0]
-                                                 if not verbalizer.is_frozen() else 0.0),
+                                                 if verbalizer is not None and not verbalizer.is_frozen() else 0.0),
                 }
 
                 # Conditionally log trajectory-specific metrics
@@ -759,7 +856,7 @@ def train_stage2(
                         wp_table = wandb.Table(columns=["Batch_Idx", "Dataset", "Pred_Waypoints", "GT_Waypoints"])
                         wp_data = []
                         B_len = last_gt_waypoints.shape[0]
-                        if last_loss_out.pred_waypoints is not None:
+                        if last_loss_out is not None and last_loss_out.pred_waypoints is not None:
                             pred_wp = last_loss_out.pred_waypoints.cpu().tolist()
                             gt_wp = last_gt_waypoints.cpu().tolist()
                             for b in range(B_len):
@@ -819,45 +916,46 @@ def train_stage2(
                         logger.warning(f"Failed to log rollout table: {e}")
 
                     # ── Verbalizer Output Logging ────────────────────────────
-                    try:
-                        verbalizer_table = wandb.Table(columns=["Batch_Idx", "Dataset", "L_lm", "Teacher_Best_Text", "Verbalizer_Text"])
-                        verb_data = []
-                        from transformers import GenerationConfig
-                        gen_cfg = GenerationConfig(
-                            max_new_tokens=128, 
-                            temperature=0.7, 
-                            do_sample=True, 
-                            pad_token_id=tokenizer.pad_token_id, 
-                            eos_token_id=tokenizer.eos_token_id
-                        )
-                        gen_out = verbalizer.generate_from_latents(
-                            input_ids=last_input_ids,
-                            attention_mask=last_attention_mask,
-                            latents=last_loss_out.latents,
-                            generation_config=gen_cfg,
-                        )
-                        prompt_len = last_input_ids.shape[1]
-                        generated_ids = gen_out[:, prompt_len:]
-                        gen_texts = tokenizer.batch_decode(generated_ids, skip_special_tokens=True)
-                        for b, txt in enumerate(gen_texts):
-                            ds_name = datasets[b] if b < len(datasets) else "unknown"
-                            teacher_best = last_buffer.rollout_texts[last_buffer.best_idx[b].item()][b]
-                            lm_loss_val = float(m.get("loss/lm_loss", 0.0))
-                            verbalizer_table.add_data(b, ds_name, lm_loss_val, teacher_best, txt)
-                            verb_data.append({
-                                "Batch_Idx": b,
-                                "Dataset": ds_name,
-                                "L_lm": lm_loss_val,
-                                "Teacher_Best_Text": teacher_best,
-                                "Verbalizer_Text": txt
-                            })
-                        wandb_payload["rollouts/verbalizer_samples"] = verbalizer_table
-                        # Save locally
-                        verb_log_path = os.path.join(log_root, "verbalizer", f"step_{step:06d}.json")
-                        with open(verb_log_path, "w", encoding="utf-8") as f:
-                            json.dump(verb_data, f, indent=2)
-                    except Exception as e:
-                        logger.warning(f"Failed to log verbalizer table: {e}")
+                    if verbalizer is not None and last_loss_out is not None:
+                        try:
+                            verbalizer_table = wandb.Table(columns=["Batch_Idx", "Dataset", "L_lm", "Teacher_Best_Text", "Verbalizer_Text"])
+                            verb_data = []
+                            from transformers import GenerationConfig
+                            gen_cfg = GenerationConfig(
+                                max_new_tokens=128, 
+                                temperature=0.7, 
+                                do_sample=True, 
+                                pad_token_id=tokenizer.pad_token_id, 
+                                eos_token_id=tokenizer.eos_token_id
+                            )
+                            gen_out = verbalizer.generate_from_latents(
+                                input_ids=last_input_ids,
+                                attention_mask=last_attention_mask,
+                                latents=last_loss_out.latents,
+                                generation_config=gen_cfg,
+                            )
+                            prompt_len = last_input_ids.shape[1]
+                            generated_ids = gen_out[:, prompt_len:]
+                            gen_texts = tokenizer.batch_decode(generated_ids, skip_special_tokens=True)
+                            for b, txt in enumerate(gen_texts):
+                                ds_name = datasets[b] if b < len(datasets) else "unknown"
+                                teacher_best = last_buffer.rollout_texts[last_buffer.best_idx[b].item()][b]
+                                lm_loss_val = float(m.get("loss/lm_loss", 0.0))
+                                verbalizer_table.add_data(b, ds_name, lm_loss_val, teacher_best, txt)
+                                verb_data.append({
+                                    "Batch_Idx": b,
+                                    "Dataset": ds_name,
+                                    "L_lm": lm_loss_val,
+                                    "Teacher_Best_Text": teacher_best,
+                                    "Verbalizer_Text": txt
+                                })
+                            wandb_payload["rollouts/verbalizer_samples"] = verbalizer_table
+                            # Save locally
+                            verb_log_path = os.path.join(log_root, "verbalizer", f"step_{step:06d}.json")
+                            with open(verb_log_path, "w", encoding="utf-8") as f:
+                                json.dump(verb_data, f, indent=2)
+                        except Exception as e:
+                            logger.warning(f"Failed to log verbalizer table: {e}")
 
                 # Gradient norm logging
                 grad_norms = cached_grad_norms
@@ -943,6 +1041,11 @@ if __name__ == "__main__":
     parser.add_argument("--wandb_run",     type=str, default="stage2-distillation")
     parser.add_argument("--no_wandb",      action="store_true", help="Disable WandB logging")
     parser.add_argument("--offload_ref_model", type=str, default="True", help="Offload reference model to CPU to save VRAM (True/False)")
+    # Offline Distillation Options
+    parser.add_argument("--mode",          type=str, default="joint", choices=["joint", "teacher_only", "student_offline"],
+                        help="Training mode: joint training (default), teacher_only, or student_offline")
+    parser.add_argument("--offline_data_dir", type=str, default="checkpoints/stage2_1/offline_data",
+                        help="Directory to save (in teacher_only mode) or load (in student_offline mode) rollout buffer data")
     args = parser.parse_args()
 
     offload_ref = args.offload_ref_model.lower() in ("true", "1", "yes")
@@ -960,6 +1063,8 @@ if __name__ == "__main__":
         wandb_run_name=args.wandb_run,
         use_wandb=not args.no_wandb,
         offload_ref_model=offload_ref,
+        mode=args.mode,
+        offline_data_dir=args.offline_data_dir,
     )
 
     # ── Tokenizer ──────────────────────────────────────────────────────────
@@ -975,31 +1080,36 @@ if __name__ == "__main__":
     logger.info(f"Dynamically fetched </think> token ID for distillation target: {answer_token_id}")
 
     # ── Processor & Dataloader ─────────────────────────────────────────────
-    # Import here so the module can be used without these heavy deps
-    import sys, os
-    sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-    from transformers import AutoProcessor
-    from stage2_dataloader import build_stage2_dataloader
+    dataloader = None
+    if cfg.mode != "student_offline":
+        # Import here so the module can be used without these heavy deps
+        import sys, os
+        sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+        from transformers import AutoProcessor
+        from stage2_dataloader import build_stage2_dataloader
 
-    logger.info(f"Loading processor from {cfg.base_model_name} …")
-    processor = AutoProcessor.from_pretrained(cfg.base_model_name, trust_remote_code=True)
+        logger.info(f"Loading processor from {cfg.base_model_name} …")
+        processor = AutoProcessor.from_pretrained(cfg.base_model_name, trust_remote_code=True)
 
-    dataloader = build_stage2_dataloader(
-        processor=processor,
-        hf_repo=args.hf_repo,
-        split=args.split,
-        batch_size=args.batch_size,
-        num_workers=args.num_workers,
-        max_length=args.max_seq_len,
-        subset_ratio=args.subset_ratio,
-    )
-    logger.info(f"DataLoader ready: {len(dataloader.dataset):,} samples.")
+        dataloader = build_stage2_dataloader(
+            processor=processor,
+            hf_repo=args.hf_repo,
+            split=args.split,
+            batch_size=args.batch_size,
+            num_workers=args.num_workers,
+            max_length=args.max_seq_len,
+            subset_ratio=args.subset_ratio,
+        )
+        logger.info(f"DataLoader ready: {len(dataloader.dataset):,} samples.")
 
     # ── Reward functions ───────────────────────────────────────────────────
-    from rewards.action_reward import ActionAlignedReward, CombinedActionReward
-    from rewards.qa_reward     import FormatReward
-    reward_fns     = [CombinedActionReward(ActionAlignedReward(), FormatReward())]
-    reward_weights = [1.0]   # 0.9/0.1 split baked into CombinedActionReward
+    reward_fns = None
+    reward_weights = None
+    if cfg.mode != "student_offline":
+        from rewards.action_reward import ActionAlignedReward, CombinedActionReward
+        from rewards.qa_reward     import FormatReward
+        reward_fns     = [CombinedActionReward(ActionAlignedReward(), FormatReward())]
+        reward_weights = [1.0]   # 0.9/0.1 split baked into CombinedActionReward
 
     # ── Train ──────────────────────────────────────────────────────────────
     train_stage2(
