@@ -95,6 +95,7 @@ class RolloutBuffer:
     grpo_loss: Optional[float] = None    # for logging
     dataset_source: Optional[List[str]] = None
     kl_loss: Optional[float] = None
+    kl_coef: Optional[float] = None
 
 
 # ---------------------------------------------------------------------------
@@ -128,6 +129,7 @@ class GRPOTeacher(nn.Module):
         gen_temperature: float = 0.9,
         gen_max_new_tokens: int = 512,
         kl_coef: float = 0.0,
+        target_kl: float = 0.02,
         use_gradient_checkpointing: bool = True,
     ):
         super().__init__()
@@ -136,6 +138,7 @@ class GRPOTeacher(nn.Module):
         self.gen_temperature  = gen_temperature
         self.gen_max_new_tokens = gen_max_new_tokens
         self.kl_coef = kl_coef
+        self.target_kl = target_kl
 
         # ------------------------------------------------------------------
         # 1. Base VLM
@@ -523,6 +526,7 @@ class GRPOTeacher(nn.Module):
         
         total_rollout_loss = 0.0
         total_kl_loss = 0.0
+        total_raw_kl = 0.0
         
         if self.kl_coef > 0:
             self._ref_model.to(device)
@@ -595,6 +599,7 @@ class GRPOTeacher(nn.Module):
                 
                 # 6. KL Loss
                 kl_gb = torch.tensor(0.0, device=device)
+                raw_kl_val = 0.0
                 if self.kl_coef > 0:
                     with torch.no_grad(), torch.amp.autocast('cuda', dtype=torch.bfloat16):
                         ref_out = self._ref_model(
@@ -609,7 +614,10 @@ class GRPOTeacher(nn.Module):
                         ref_token_p = (ref_target_logits - torch.logsumexp(ref_logits, dim=-1)).clamp(min=-100.0, max=0.0)
                         
                     kl = (token_log_p - ref_token_p.detach()) * resp_mask_shifted
+                    # Clamp individual token KL to be non-negative to avoid negative KL exploits
+                    kl = torch.clamp(kl, min=0.0)
                     kl_per_token = kl.sum(dim=-1) / resp_lens
+                    raw_kl_val = kl_per_token.mean().item()
                     kl_gb = (self.kl_coef * kl_per_token.mean()) / (G * B * grad_accum_steps)
 
                 # 7. NaN guard: skip this chunk if loss is NaN/Inf
@@ -623,6 +631,7 @@ class GRPOTeacher(nn.Module):
                 
                 total_rollout_loss += (loss_gb.item() * G * B * grad_accum_steps) if not torch.isnan(loss_gb) else 0.0
                 total_kl_loss += (kl_gb.item() * G * B * grad_accum_steps) if not torch.isnan(kl_gb) else 0.0
+                total_raw_kl += raw_kl_val
                 
                 # Explicitly delete massive tensors BEFORE next micro-batch!
                 del out, logits, inputs_embeds, logits_shifted, position_ids
@@ -636,7 +645,11 @@ class GRPOTeacher(nn.Module):
             self._ref_model.cpu()
             torch.cuda.empty_cache()
 
-        return torch.tensor(total_rollout_loss, device=device), torch.tensor(total_kl_loss, device=device)
+        return (
+            torch.tensor(total_rollout_loss, device=device),
+            torch.tensor(total_kl_loss, device=device),
+            torch.tensor(total_raw_kl, device=device),
+        )
 
     # -----------------------------------------------------------------------
     # Step 5 + 6: Identify τ+/τ- and extract h_T
@@ -808,13 +821,30 @@ class GRPOTeacher(nn.Module):
 
         # compute_grpo_loss now internally chunks the forward/backward passes 
         # to prevent OOM. Gradients are automatically accumulated.
-        grpo_loss_val, kl_loss_val = self.compute_grpo_loss(
+        grpo_loss_val, kl_loss_val, raw_kl_val = self.compute_grpo_loss(
             all_ids, all_masks, advantages,
             pixel_values, image_grid_thw, prompt_len,
             grad_accum_steps=grad_accum_steps,
             pixel_values_videos=pixel_values_videos,
             video_grid_thw=video_grid_thw,
         )
+
+        # Adaptive KL adjustment
+        if self.kl_coef > 0:
+            # G * B is the total number of sequences in the batch
+            mean_kl = raw_kl_val.item() / (self.G * input_ids.shape[0])
+            old_kl_coef = self.kl_coef
+            if mean_kl > self.target_kl * 1.5:
+                self.kl_coef = min(self.kl_coef * 1.5, 0.5)
+            elif mean_kl < self.target_kl / 1.5:
+                self.kl_coef = max(self.kl_coef / 1.5, 0.001)
+            
+            if self.kl_coef != old_kl_coef:
+                warnings.warn(
+                    f"Adaptive KL: mean_kl={mean_kl:.6f} vs target={self.target_kl} "
+                    f"-> kl_coef adjusted {old_kl_coef:.5f} -> {self.kl_coef:.5f}",
+                    stacklevel=2
+                )
         
         if is_accum_step:
             grad_norm = nn.utils.clip_grad_norm_(self.vlm.parameters(), grad_clip)
@@ -864,6 +894,7 @@ class GRPOTeacher(nn.Module):
             grpo_loss=grpo_loss_val.item(),
             dataset_source=ground_truth.get("dataset", None),
             kl_loss=kl_loss_val.item(),
+            kl_coef=self.kl_coef,
         )
 
         return buffer
@@ -881,6 +912,9 @@ class GRPOTeacher(nn.Module):
         
         if buffer.kl_loss is not None:
             stats["grpo/kl_loss"] = buffer.kl_loss
+            
+        if hasattr(buffer, "kl_coef") and buffer.kl_coef is not None:
+            stats["grpo/kl_coef"] = buffer.kl_coef
             
         if buffer.dataset_source is not None:
             ds_rewards = {}

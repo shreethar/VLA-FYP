@@ -26,6 +26,7 @@ and always at the final step.
 """
 
 import os
+import json
 import math
 import logging
 from dataclasses import dataclass, field
@@ -95,6 +96,7 @@ class Stage2Config:
     gen_temperature:     float = 0.9
     gen_max_new_tokens:  int  = 512
     kl_coef:             float = 0.05
+    target_kl:           float = 0.02
 
     # Architecture
     M:                   int  = 6     # reasoning latents
@@ -362,6 +364,7 @@ def train_stage2(
         gen_temperature=cfg.gen_temperature,
         gen_max_new_tokens=cfg.gen_max_new_tokens,
         kl_coef=cfg.kl_coef,
+        target_kl=cfg.target_kl,
     ).to(device)
 
     log_memory("After Teacher loaded")
@@ -732,8 +735,6 @@ def train_stage2(
                 # ── Rollout Text Logging (every step for first 50 steps, then every 10 steps) ──
                 is_text_log_step = (step < 50) or (step % 10 == 0)
                 if is_text_log_step:
-                    import json
-                    import os
                     log_root = "logs"
                     os.makedirs(os.path.join(log_root, "generation"), exist_ok=True)
                     os.makedirs(os.path.join(log_root, "verbalizer"), exist_ok=True)
