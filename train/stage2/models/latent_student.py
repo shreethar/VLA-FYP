@@ -140,10 +140,10 @@ class SpatialMLP(nn.Module):
             nn.Sigmoid(),
         )
 
-        # Initialize the final linear layer to output near 0.0 before sigmoid.
-        # This prevents the sigmoid from saturating to 1.0 or 0.0 at initialization,
-        # which would cause "dead" zero gradients.
-        nn.init.zeros_(self.net[4].weight)
+        # Initializing weight to exactly 0.0 blocks gradient flow backwards (grad_x = W^T * grad_y = 0).
+        # We use a small normal distribution instead to keep outputs near 0.0 (preventing
+        # sigmoid saturation) while allowing gradients to flow to lower layers.
+        nn.init.normal_(self.net[4].weight, std=0.01)
         nn.init.zeros_(self.net[4].bias)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -259,6 +259,16 @@ class LatentStudent(nn.Module):
         self.spatial_tokens = nn.Parameter(
             torch.randn(K, self.hidden_dim) * 0.02
         )
+        # Semantic Initialization: Give the spatial tokens a massive "head start" 
+        # by initializing them with the embeddings of actual, common tokens 
+        # (rather than complete noise), so the self-attention layers already 
+        # know how to interact with them.
+        with torch.no_grad():
+            try:
+                embed_weight = self.vlm.get_base_model().get_input_embeddings().weight
+                self.spatial_tokens.data.copy_(embed_weight[1000 : 1000 + K].clone())
+            except Exception:
+                pass
 
         # ------------------------------------------------------------------
         # 5. SpatialMLP : spatial hidden states → normalised 2D waypoints
