@@ -319,10 +319,17 @@ class CombinedActionReward:
             task_types = ground_truth.get("task_type", None)
 
         for i in range(batch):
+            text = rollout_text[i]
+            # Extra edit: if there's no </think> tag (or duplicate tags), totally make it 0
+            close_tags = _THINK_CLOSE.findall(text)
+            if len(close_tags) != 1:
+                final_rewards[i] = 0.0
+                continue
+
             tt = task_types[i] if task_types else "trajectory"
             if tt == "qa":
                 final_rewards[i] = r_format[i]
             else:
-                final_rewards[i] = 0.9 * r_visual[i] + 0.1 * r_format[i]
+                final_rewards[i] = 0.8 * r_visual[i] + 0.2 * r_format[i]
 
         return final_rewards

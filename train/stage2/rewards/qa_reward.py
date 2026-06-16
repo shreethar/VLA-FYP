@@ -340,8 +340,8 @@ class FormatReward:
                 else:
                     length_factor = 1.0
 
-                r_format = 1.0 * length_factor
-                rewards[i] = qa_score + r_format
+                r_format = length_factor
+                rewards[i] = 0.8 * qa_score + 0.2 * r_format
             else:
                 rewards[i] = check_structural_format(text, K=self.K)
 
