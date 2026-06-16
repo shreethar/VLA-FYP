@@ -70,6 +70,43 @@ _BRACKET_PAIR = re.compile(
     r'\[\s*\d+(?:\.\d+)?\s*,\s*\d+(?:\.\d+)?\s*\]',
 )
 
+# Bounding box pattern: [xmin, ymin, xmax, ymax]
+_BBOX_RE = re.compile(
+    r'\[\s*(\d+(?:\.\d+)?)\s*,\s*(\d+(?:\.\d+)?)\s*,\s*(\d+(?:\.\d+)?)\s*,\s*(\d+(?:\.\d+)?)\s*\]'
+)
+
+def parse_bbox(text: str) -> Optional[List[float]]:
+    m = _BBOX_RE.search(text)
+    if not m:
+        return None
+    try:
+        return [float(m.group(1)), float(m.group(2)), float(m.group(3)), float(m.group(4))]
+    except Exception:
+        return None
+
+def compute_iou(box1: List[float], box2: List[float]) -> float:
+    """Computes Intersection over Union (IoU) between two boxes."""
+    xmin1, ymin1, xmax1, ymax1 = box1
+    xmin2, ymin2, xmax2, ymax2 = box2
+
+    x_left = max(xmin1, xmin2)
+    y_top = max(ymin1, ymin2)
+    x_right = min(xmax1, xmax2)
+    y_bottom = min(ymax1, ymax2)
+
+    if x_right < x_left or y_bottom < y_top:
+        return 0.0
+
+    intersection_area = (x_right - x_left) * (y_bottom - y_top)
+    box1_area = (xmax1 - xmin1) * (ymax1 - ymin1)
+    box2_area = (xmax2 - xmin2) * (ymax2 - ymin2)
+
+    union_area = box1_area + box2_area - intersection_area
+    if union_area <= 0.0:
+        return 0.0
+
+    return intersection_area / union_area
+
 
 # ---------------------------------------------------------------------------
 # Structural format checker
@@ -108,7 +145,11 @@ def check_structural_format(text: str, K: int = 5) -> float:
         return 0.0
 
     # --- Soft length penalty ---
-    char_len = len(text)
+    clean_text = text
+    for stop_token in ["<|im_end|>", "<|vision_pad|>", "<|pad|>", "<|endoftext|>"]:
+        clean_text = clean_text.split(stop_token)[0]
+    char_len = len(clean_text.strip())
+
     if char_len > 4000:
         length_factor = 0.5
     elif char_len > 2000:
@@ -117,10 +158,10 @@ def check_structural_format(text: str, K: int = 5) -> float:
     else:
         length_factor = 1.0
 
-    # --- Duplicate </think> penalty (×0.8 per extra occurrence) ---
+    # --- Duplicate </think> penalty (strict 0.0) ---
     num_close_tags = len(_THINK_CLOSE.findall(text))
     if num_close_tags > 1:
-        length_factor *= 0.8 ** (num_close_tags - 1)
+        return 0.0
 
     # --- Level 1 / 2: check for answer block after </think> ---
     after_think = parts[1]
@@ -236,9 +277,11 @@ class FormatReward:
 
         task_types = None
         qa_answers = None
+        datasets = None
         if ground_truth is not None:
             task_types = ground_truth.get("task_type", None)
             qa_answers = ground_truth.get("qa_answer",  None)
+            datasets   = ground_truth.get("dataset",    None)
 
         for i, text in enumerate(rollout_text):
             is_qa = (
@@ -248,8 +291,9 @@ class FormatReward:
             )
 
             if is_qa:
-                # Require valid think structure before awarding ROUGE score
-                if not _THINK_CLOSE.search(text):
+                # Require EXACTLY ONE valid think structure before awarding ROUGE score
+                close_tags = _THINK_CLOSE.findall(text)
+                if len(close_tags) != 1:
                     rewards[i] = 0.0
                     continue
                 parts = re.split(r'</think>', text, maxsplit=1, flags=re.IGNORECASE)
@@ -264,12 +308,31 @@ class FormatReward:
                 reference  = (
                     qa_answers[i] if isinstance(qa_answers, list) else qa_answers
                 )
-                try:
-                    rouge_score = compute_rouge_score(hypothesis, reference)
-                except Exception:
-                    rouge_score = 0.0
+                
+                is_affordance = (
+                    datasets is not None
+                    and i < len(datasets)
+                    and datasets[i] == "sharerobot_affordance"
+                )
 
-                char_len = len(text)
+                if is_affordance:
+                    box_hyp = parse_bbox(hypothesis)
+                    box_ref = parse_bbox(reference)
+                    if box_hyp is not None and box_ref is not None:
+                        qa_score = compute_iou(box_hyp, box_ref)
+                    else:
+                        qa_score = 0.0
+                else:
+                    try:
+                        qa_score = compute_rouge_score(hypothesis, reference)
+                    except Exception:
+                        qa_score = 0.0
+
+                clean_text = text
+                for stop_token in ["<|im_end|>", "<|vision_pad|>", "<|pad|>", "<|endoftext|>"]:
+                    clean_text = clean_text.split(stop_token)[0]
+                char_len = len(clean_text.strip())
+
                 if char_len > 4000:
                     length_factor = 0.5
                 elif char_len > 2000:
@@ -278,7 +341,7 @@ class FormatReward:
                     length_factor = 1.0
 
                 r_format = 1.0 * length_factor
-                rewards[i] = rouge_score + r_format
+                rewards[i] = qa_score + r_format
             else:
                 rewards[i] = check_structural_format(text, K=self.K)
 

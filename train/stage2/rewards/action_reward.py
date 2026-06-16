@@ -140,8 +140,9 @@ def parse_waypoints(text: str, K: int = 5) -> Optional[np.ndarray]:
 
     Supports both <ans>x,y;...</ans> (preferred) and [x,y] bracket format.
     """
-    # 1. End think tag required
-    if not _THINK_CLOSE.search(text):
+    # 1. End think tag required (and must be exactly one)
+    close_tags = _THINK_CLOSE.findall(text)
+    if len(close_tags) != 1:
         return None
 
     # 2. Non-trivial think content
