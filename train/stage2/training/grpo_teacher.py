@@ -131,6 +131,7 @@ class GRPOTeacher(nn.Module):
         kl_coef: float = 0.0,
         target_kl: float = 0.02,
         use_gradient_checkpointing: bool = True,
+        offload_ref_model: bool = True,
     ):
         super().__init__()
         self.G = G
@@ -139,6 +140,7 @@ class GRPOTeacher(nn.Module):
         self.gen_max_new_tokens = gen_max_new_tokens
         self.kl_coef = kl_coef
         self.target_kl = target_kl
+        self.offload_ref_model = offload_ref_model
 
         # ------------------------------------------------------------------
         # 1. Base VLM
@@ -197,6 +199,9 @@ class GRPOTeacher(nn.Module):
         for p in self._ref_model.parameters():
             p.requires_grad = False
         self._ref_model.eval()
+        if not self.offload_ref_model:
+            device = next(self.vlm.parameters()).device
+            self._ref_model.to(device)
 
     # -----------------------------------------------------------------------
     # Internal helpers
@@ -528,7 +533,7 @@ class GRPOTeacher(nn.Module):
         total_kl_loss = 0.0
         total_raw_kl = 0.0
         
-        if self.kl_coef > 0:
+        if self.kl_coef > 0 and self.offload_ref_model:
             self._ref_model.to(device)
 
         for g in range(G):
@@ -641,7 +646,7 @@ class GRPOTeacher(nn.Module):
                 
                 torch.cuda.empty_cache()
 
-        if self.kl_coef > 0:
+        if self.kl_coef > 0 and self.offload_ref_model:
             self._ref_model.cpu()
             torch.cuda.empty_cache()
 

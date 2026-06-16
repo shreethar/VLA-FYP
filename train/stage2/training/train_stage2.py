@@ -110,6 +110,7 @@ class Stage2Config:
     seed:                int  = 42
     bf16:                bool = True
     grad_log_steps:      int  = 100   # how often to log gradient norms
+    offload_ref_model:   bool = True
 
     # WandB
     wandb_project:       str  = "reasonflow-vla"
@@ -365,6 +366,7 @@ def train_stage2(
         gen_max_new_tokens=cfg.gen_max_new_tokens,
         kl_coef=cfg.kl_coef,
         target_kl=cfg.target_kl,
+        offload_ref_model=cfg.offload_ref_model,
     ).to(device)
 
     log_memory("After Teacher loaded")
@@ -928,8 +930,10 @@ if __name__ == "__main__":
     # WandB
     parser.add_argument("--wandb_project", type=str, default="reasonflow-vla")
     parser.add_argument("--wandb_run",     type=str, default="stage2-distillation")
-    parser.add_argument("--no_wandb",      action="store_true", help="Disable WandB logging")
+    parser.add_argument("--offload_ref_model", type=str, default="True", help="Offload reference model to CPU to save VRAM (True/False)")
     args = parser.parse_args()
+
+    offload_ref = args.offload_ref_model.lower() in ("true", "1", "yes")
 
     # ── Config ─────────────────────────────────────────────────────────────
     cfg = Stage2Config(
@@ -943,6 +947,7 @@ if __name__ == "__main__":
         wandb_project=args.wandb_project,
         wandb_run_name=args.wandb_run,
         use_wandb=not args.no_wandb,
+        offload_ref_model=offload_ref,
     )
 
     # ── Tokenizer ──────────────────────────────────────────────────────────
