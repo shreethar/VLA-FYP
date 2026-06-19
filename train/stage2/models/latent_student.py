@@ -210,7 +210,6 @@ class LatentStudent(nn.Module):
             model_name,
             dtype=torch.bfloat16,
             attn_implementation="flash_attention_2",
-            device_map="cuda",
             trust_remote_code=True,
         )
 
