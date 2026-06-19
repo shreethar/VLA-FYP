@@ -65,30 +65,30 @@ class RolloutBuffer:
     Passed from GRPOTeacher.training_step() to student_losses.py.
     """
     # Tokenised rollouts: list of G tensors, each [batch, seq_g]
-    rollout_ids:       List[torch.Tensor]
-    rollout_texts:     List[List[str]]    # decoded; outer=G, inner=batch
-    attention_masks:   List[torch.Tensor]
+    rollout_ids:       Optional[List[torch.Tensor]] = None
+    rollout_texts:     Optional[List[List[str]]] = None    # decoded; outer=G, inner=batch
+    attention_masks:   Optional[List[torch.Tensor]] = None
 
     # Per-rollout scalars: shape [G, batch]
-    rewards:           torch.Tensor
-    advantages:        torch.Tensor
+    rewards:           Optional[torch.Tensor] = None
+    advantages:        Optional[torch.Tensor] = None
 
     # Best / worst indices into the G dimension (per batch item)
-    best_idx:          torch.Tensor       # [batch]  int64
-    worst_idx:         torch.Tensor       # [batch]  int64
+    best_idx:          Optional[torch.Tensor] = None       # [batch]  int64
+    worst_idx:         Optional[torch.Tensor] = None       # [batch]  int64
 
     # τ+ and τ- token ids and masks (best/worst selected per batch item)
-    tau_pos_ids:       torch.Tensor       # [batch, seq_pos]
-    tau_neg_ids:       torch.Tensor       # [batch, seq_neg]
-    tau_pos_mask:      torch.Tensor
-    tau_neg_mask:      torch.Tensor
+    tau_pos_ids:       Optional[torch.Tensor] = None       # [batch, seq_pos]
+    tau_neg_ids:       Optional[torch.Tensor] = None       # [batch, seq_neg]
+    tau_pos_mask:      Optional[torch.Tensor] = None
+    tau_neg_mask:      Optional[torch.Tensor] = None
 
     # Response-only masks (1 on generated tokens, 0 on prompt)
-    tau_pos_response_mask: torch.Tensor   # [batch, seq_pos]
-    tau_neg_response_mask: torch.Tensor   # [batch, seq_neg]
+    tau_pos_response_mask: Optional[torch.Tensor] = None   # [batch, seq_pos]
+    tau_neg_response_mask: Optional[torch.Tensor] = None   # [batch, seq_neg]
 
     # Answer token positions in τ+ (for L_distill)
-    answer_token_pos:  torch.Tensor       # [batch]  int64
+    answer_token_pos:  Optional[torch.Tensor] = None       # [batch]  int64
 
     # Teacher's <answer> hidden state from the post-update forward pass
     h_T: Optional[torch.Tensor] = None   # [batch, d_teacher]; filled after update
@@ -132,6 +132,7 @@ class GRPOTeacher(nn.Module):
         target_kl: float = 0.02,
         use_gradient_checkpointing: bool = True,
         offload_ref_model: bool = True,
+        backward_batch_size: int = 1,
     ):
         super().__init__()
         self.G = G
@@ -141,6 +142,7 @@ class GRPOTeacher(nn.Module):
         self.kl_coef = kl_coef
         self.target_kl = target_kl
         self.offload_ref_model = offload_ref_model
+        self.backward_batch_size = backward_batch_size
 
         # ------------------------------------------------------------------
         # 1. Base VLM
@@ -533,47 +535,55 @@ class GRPOTeacher(nn.Module):
         total_kl_loss = 0.0
         total_raw_kl = 0.0
         
+        chunk_size = getattr(self, "backward_batch_size", 1)
+
         if self.kl_coef > 0 and self.offload_ref_model:
             self._ref_model.to(device)
 
         for g in range(G):
-            for b_idx in range(B):
-                # 1. Slice rollout to EXACTLY 1 sequence (Absolute minimum peak VRAM)
-                batch_id = all_ids[g][b_idx:b_idx+1]      # [1, seq_g]
-                batch_mask = all_masks[g][b_idx:b_idx+1]  # [1, seq_g]
+            for chunk_start in range(0, B, chunk_size):
+                chunk_end = min(chunk_start + chunk_size, B)
+                chunk_len = chunk_end - chunk_start
+                
+                # 1. Slice rollout to chunk size
+                batch_id = all_ids[g][chunk_start:chunk_end]      # [chunk_len, seq_g]
+                batch_mask = all_masks[g][chunk_start:chunk_end]  # [chunk_len, seq_g]
                 
                 # Response mask & lengths
                 resp_mask = torch.zeros_like(batch_id, dtype=torch.float)
                 resp_mask[:, prompt_len:] = (batch_id[:, prompt_len:] != 0).float()
-                resp_lens = resp_mask.sum(dim=-1).clamp(min=1)  # [1]
+                resp_lens = resp_mask.sum(dim=-1).clamp(min=1)  # [chunk_len]
 
                 # 2. Correctly slice the flattened image/video patches
-                #    Only pass pixel_values if THIS batch item has image tokens.
-                if pixel_values is not None and has_image[b_idx]:
-                    # Count how many image-bearing items precede b_idx
-                    img_row = sum(has_image[:b_idx])
-                    thw = image_grid_thw[img_row:img_row+1]  # [1, 3]
-                    num_patches = thw.prod(dim=-1).item()
-                    offset = int(image_grid_thw[:img_row].prod(dim=-1).sum().item()) if img_row > 0 else 0
+                # Count how many image-bearing items precede chunk_start
+                pre_img_count = sum(has_image[:chunk_start])
+                chunk_img_count = sum(has_image[chunk_start:chunk_end])
+                
+                if chunk_img_count > 0:
+                    thw = image_grid_thw[pre_img_count : pre_img_count + chunk_img_count]
+                    num_patches = thw.prod(dim=-1).sum().item()
+                    offset = int(image_grid_thw[:pre_img_count].prod(dim=-1).sum().item()) if pre_img_count > 0 else 0
                     pv = pixel_values[offset : offset + num_patches]
                 else:
                     pv = None
                     thw = None
 
-                if pixel_values_videos is not None and has_video[b_idx]:
-                    vid_row = sum(has_video[:b_idx])
-                    v_thw = video_grid_thw[vid_row:vid_row+1]
-                    num_patches = v_thw.prod(dim=-1).item()
-                    offset = int(video_grid_thw[:vid_row].prod(dim=-1).sum().item()) if vid_row > 0 else 0
+                # Videos
+                pre_vid_count = sum(has_video[:chunk_start])
+                chunk_vid_count = sum(has_video[chunk_start:chunk_end])
+                
+                if chunk_vid_count > 0:
+                    v_thw = video_grid_thw[pre_vid_count : pre_vid_count + chunk_vid_count]
+                    num_patches = v_thw.prod(dim=-1).sum().item()
+                    offset = int(video_grid_thw[:pre_vid_count].prod(dim=-1).sum().item()) if pre_vid_count > 0 else 0
                     pv_v = pixel_values_videos[offset : offset + num_patches]
                 else:
                     pv_v = None
                     v_thw = None
 
-                # 3. Forward pass for just ONE sequence
+                # 3. Forward pass for the chunk
                 inputs_embeds = self._build_input_embeds(batch_id, pv, thw, pv_v, v_thw)
                 
-                # Explicitly compute position_ids to bypass Qwen3.5 RoPE bug when inputs_embeds is used
                 position_ids = batch_mask.long().cumsum(-1) - 1
                 position_ids.masked_fill_(batch_mask == 0, 1)
 
@@ -584,23 +594,22 @@ class GRPOTeacher(nn.Module):
                     use_cache=False,
                     return_dict=True,
                 )
-                logits = out.logits.float()  # [1, seq_g, vocab]
+                logits = out.logits.float()  # [chunk_len, seq_g, vocab]
 
-                # 4. Log-probs (with numerical stability clamps on log-probs only)
+                # 4. Log-probs
                 target_ids = batch_id[:, 1:]
                 logits_shifted = logits[:, :-1, :]
                 target_logits = logits_shifted.gather(dim=-1, index=target_ids.unsqueeze(-1)).squeeze(-1)
-                token_log_p = target_logits - torch.logsumexp(logits_shifted, dim=-1) # [1, seq-1]
-                # Clamp log-probs to valid range (log-probs should be ≤ 0)
+                token_log_p = target_logits - torch.logsumexp(logits_shifted, dim=-1) # [chunk_len, seq-1]
                 token_log_p = token_log_p.clamp(min=-100.0, max=0.0)
 
                 # Mean log-prob per response
                 resp_mask_shifted = resp_mask[:, 1:]
-                mean_log_p = (token_log_p * resp_mask_shifted).sum(dim=-1) / resp_lens  # [1]
+                mean_log_p = (token_log_p * resp_mask_shifted).sum(dim=-1) / resp_lens  # [chunk_len]
 
                 # 5. Rollout Loss
-                adv_g = advantages[g, b_idx:b_idx+1]  # [1]
-                loss_gb = -(adv_g * mean_log_p).mean() / (G * B * grad_accum_steps)
+                adv_g = advantages[g, chunk_start:chunk_end]  # [chunk_len]
+                loss_gb = -(adv_g * mean_log_p).mean() * chunk_len / (G * B * grad_accum_steps)
                 
                 # 6. KL Loss
                 kl_gb = torch.tensor(0.0, device=device)
@@ -619,24 +628,22 @@ class GRPOTeacher(nn.Module):
                         ref_token_p = (ref_target_logits - torch.logsumexp(ref_logits, dim=-1)).clamp(min=-100.0, max=0.0)
                         
                     kl = (token_log_p - ref_token_p.detach()) * resp_mask_shifted
-                    # Clamp individual token KL to be non-negative to avoid negative KL exploits
                     kl = torch.clamp(kl, min=0.0)
                     kl_per_token = kl.sum(dim=-1) / resp_lens
                     raw_kl_val = kl_per_token.mean().item()
-                    kl_gb = (self.kl_coef * kl_per_token.mean()) / (G * B * grad_accum_steps)
+                    kl_gb = (self.kl_coef * kl_per_token.mean()) * chunk_len / (G * B * grad_accum_steps)
 
                 # 7. NaN guard: skip this chunk if loss is NaN/Inf
                 chunk_loss = loss_gb + kl_gb
                 if torch.isnan(chunk_loss) or torch.isinf(chunk_loss):
-                    # Zero out gradients from this corrupted chunk
                     chunk_loss = torch.tensor(0.0, device=device, requires_grad=True)
-                    chunk_loss.backward()  # no-op backward to keep graph consistent
+                    chunk_loss.backward()
                 else:
                     chunk_loss.backward()
                 
                 total_rollout_loss += (loss_gb.item() * G * B * grad_accum_steps) if not torch.isnan(loss_gb) else 0.0
                 total_kl_loss += (kl_gb.item() * G * B * grad_accum_steps) if not torch.isnan(kl_gb) else 0.0
-                total_raw_kl += raw_kl_val
+                total_raw_kl += raw_kl_val * chunk_len
                 
                 # Explicitly delete massive tensors BEFORE next micro-batch!
                 del out, logits, inputs_embeds, logits_shifted, position_ids
@@ -839,10 +846,12 @@ class GRPOTeacher(nn.Module):
             # G * B is the total number of sequences in the batch
             mean_kl = raw_kl_val.item() / (self.G * input_ids.shape[0])
             old_kl_coef = self.kl_coef
-            if mean_kl > self.target_kl * 1.5:
-                self.kl_coef = min(self.kl_coef * 1.5, 1.0)
-            elif mean_kl < self.target_kl / 1.5:
-                self.kl_coef = max(self.kl_coef / 1.5, 0.001)
+            if mean_kl > self.target_kl * 2.0:
+                self.kl_coef = min(self.kl_coef * 2.0, 1.0)  # Aggressive recovery
+            elif mean_kl > self.target_kl * 1.2:
+                self.kl_coef = min(self.kl_coef * 1.2, 1.0)
+            elif mean_kl < self.target_kl / 1.2:
+                self.kl_coef = max(self.kl_coef / 1.2, 0.01) # Hard floor at 0.01
             
             if self.kl_coef != old_kl_coef:
                 warnings.warn(

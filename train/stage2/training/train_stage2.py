@@ -97,6 +97,7 @@ class Stage2Config:
     gen_max_new_tokens:  int  = 512
     kl_coef:             float = 0.05
     target_kl:           float = 0.02
+    grpo_backward_batch_size: int = 1
 
     # Architecture
     M:                   int  = 6     # reasoning latents
@@ -251,11 +252,20 @@ def load_checkpoint(
 # ---------------------------------------------------------------------------
 
 def log_memory(tag: str):
-    pass # Commented out to reduce console spam now that OOM issues are resolved
-    # if torch.cuda.is_available():
-    #     allocated = torch.cuda.memory_allocated() / (1024**3)
-    #     reserved = torch.cuda.memory_reserved() / (1024**3)
-    #     logger.info(f"[Memory] {tag}: Allocated={allocated:.2f} GB | Reserved={reserved:.2f} GB")
+    msg = f"[Memory] {tag}:"
+    if torch.cuda.is_available():
+        allocated = torch.cuda.memory_allocated() / (1024**3)
+        reserved = torch.cuda.memory_reserved() / (1024**3)
+        msg += f" GPU_Allocated={allocated:.2f} GB | GPU_Reserved={reserved:.2f} GB"
+    try:
+        import psutil
+        virtual_mem = psutil.virtual_memory()
+        used_ram = virtual_mem.used / (1024**3)
+        total_ram = virtual_mem.total / (1024**3)
+        msg += f" | RAM_Used={used_ram:.2f} GB / {total_ram:.2f} GB ({virtual_mem.percent}%)"
+    except ImportError:
+        pass
+    logger.info(msg)
 
 def train_stage2(
     cfg: Stage2Config,
@@ -353,6 +363,7 @@ def train_stage2(
             kl_coef=cfg.kl_coef,
             target_kl=cfg.target_kl,
             offload_ref_model=cfg.offload_ref_model,
+            backward_batch_size=cfg.grpo_backward_batch_size,
         ).to(device)
         log_memory("After Teacher loaded")
 
@@ -394,6 +405,7 @@ def train_stage2(
         if student is not None:
             set_peft_model_state_dict(student.vlm, s1_state)
         logger.info("Stage 1 weights loaded.")
+        log_memory("After Stage 1 weights loaded")
 
     # ------------------------------------------------------------------
     # 3. Loss computer
@@ -427,6 +439,7 @@ def train_stage2(
         verbalizer_opt = build_verbalizer_optimizer(verbalizer, cfg)
         verbalizer_sched = build_scheduler(verbalizer_opt, cfg, cfg.warmup_steps)
         # Verbalizer scheduler only runs for warmup_steps; frozen after that
+    log_memory("After Optimizers initialized")
 
     # ------------------------------------------------------------------
     # 5. Resume from checkpoint if requested
@@ -509,6 +522,7 @@ def train_stage2(
                     video_grid_thw = video_grid_thw.to(device)
                 gt_waypoints = data_loaded["gt_waypoints"].to(device)
                 ground_truth = data_loaded["ground_truth"]
+                sample_ids = data_loaded.get("sample_ids")
 
                 last_batch = {
                     "input_ids": input_ids,
@@ -519,6 +533,7 @@ def train_stage2(
                     "video_grid_thw": video_grid_thw,
                     "gt_waypoints": gt_waypoints,
                     "ground_truth": ground_truth,
+                    "sample_ids": sample_ids,
                 }
 
                 # Build dummy RolloutBuffer
@@ -530,7 +545,9 @@ def train_stage2(
                 buffer.tau_neg_mask = data_loaded["tau_neg_mask"].to(device)
                 buffer.tau_pos_response_mask = data_loaded["tau_pos_response_mask"].to(device)
                 buffer.tau_neg_response_mask = data_loaded["tau_neg_response_mask"].to(device)
-                buffer.h_T = data_loaded["h_T"].to(device)
+                buffer.h_T = data_loaded["h_T"]
+                if buffer.h_T is not None:
+                    buffer.h_T = buffer.h_T.to(device).to(torch.bfloat16)
                 buffer.rewards = data_loaded["rewards"].to(device)
                 buffer.best_idx = data_loaded["best_idx"].to(device)
                 buffer.rollout_texts = data_loaded["rollout_texts"]
@@ -598,23 +615,37 @@ def train_stage2(
                 if cfg.mode == "teacher_only":
                     os.makedirs(cfg.offline_data_dir, exist_ok=True)
                     data_to_save = {
-                        # Inputs
+                        # identifiers
+                        "global_step":           step,
+                        "micro_step":            accum_idx,
+                        "sample_ids":            batch.get("sample_ids"),
+
+                        # student prompt
                         "input_ids":             input_ids.cpu(),
                         "attention_mask":        attention_mask.cpu(),
-                        "pixel_values":          pixel_values.cpu() if pixel_values is not None else None,
                         "image_grid_thw":        image_grid_thw.cpu() if image_grid_thw is not None else None,
-                        "pixel_values_videos":   pixel_values_videos.cpu() if pixel_values_videos is not None else None,
                         "video_grid_thw":        video_grid_thw.cpu() if video_grid_thw is not None else None,
+
+                        # prefer paths, not processed pixels
+                        "pixel_values":          pixel_values.cpu() if pixel_values is not None else None,
+                        "pixel_values_videos":   pixel_values_videos.cpu() if pixel_values_videos is not None else None,
+
+                        # supervision
                         "gt_waypoints":          gt_waypoints.cpu(),
                         "ground_truth":          ground_truth,
-                        # Targets
+
+                        # teacher preference targets
                         "tau_pos_ids":           buffer.tau_pos_ids.cpu(),
                         "tau_pos_mask":          buffer.tau_pos_mask.cpu(),
                         "tau_neg_ids":           buffer.tau_neg_ids.cpu(),
                         "tau_neg_mask":          buffer.tau_neg_mask.cpu(),
                         "tau_pos_response_mask": buffer.tau_pos_response_mask.cpu(),
                         "tau_neg_response_mask": buffer.tau_neg_response_mask.cpu(),
-                        "h_T":                   buffer.h_T.cpu() if buffer.h_T is not None else torch.zeros(input_ids.shape[0], 3584),
+
+                        # distillation target
+                        "h_T":                   buffer.h_T.cpu().to(torch.bfloat16) if buffer.h_T is not None else torch.zeros(input_ids.shape[0], 3584, dtype=torch.bfloat16),
+
+                        # metadata/debugging
                         "rewards":               buffer.rewards.cpu(),
                         "best_idx":              buffer.best_idx.cpu(),
                         "rollout_texts":         buffer.rollout_texts,
@@ -1030,6 +1061,10 @@ if __name__ == "__main__":
                         help="HuggingFace dataset split to use (e.g. train, test)")
     parser.add_argument("--subset_ratio",  type=float, default=1.0,
                         help="Train on a smaller percentage of the dataset (e.g. 0.15 for 15%)")
+    parser.add_argument("--G",             type=int, default=5,
+                        help="Number of rollouts per prompt in GRPO (default: 5)")
+    parser.add_argument("--grpo_backward_batch_size", type=int, default=1,
+                        help="Sub-batch size for GRPO policy gradient/backward pass (default: 1 for maximum VRAM safety, increase for speed)")
     # Training schedule
     parser.add_argument("--total_steps",   type=int, default=4500)
     parser.add_argument("--warmup_steps",  type=int, default=3000)
@@ -1065,6 +1100,8 @@ if __name__ == "__main__":
         offload_ref_model=offload_ref,
         mode=args.mode,
         offline_data_dir=args.offline_data_dir,
+        G=args.G,
+        grpo_backward_batch_size=args.grpo_backward_batch_size,
     )
 
     # ── Tokenizer ──────────────────────────────────────────────────────────
