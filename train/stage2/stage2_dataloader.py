@@ -206,8 +206,12 @@ class Stage2Dataset(Dataset):
                 wpts = torch.zeros((K_WAYPOINTS, 2), dtype=torch.float32)
                 human_text = _reformat_qa_prompt(row["human"])
                 qa_answer = row.get("qa_answer", row.get("assistant"))
+            sample_id = row.get("id", row.get("uuid", None))
+            if sample_id is None:
+                sample_id = f"{row.get('dataset', 'unknown')}_{len(self.samples)}"
 
             self.samples.append({
+                "id":        sample_id,
                 "frames":    row["frames"],
                 "human":     human_text,
                 "assistant": row["assistant"],
@@ -289,6 +293,7 @@ class Stage2Dataset(Dataset):
             "task_type":      s["task_type"],
             "qa_answer":      s["qa_answer"],
             "dataset":        s["dataset"],
+            "sample_id":      s["id"],
         }
 
 
@@ -333,6 +338,7 @@ def collate_stage2_batch(samples: List[dict]) -> dict:
     task_types = [s["task_type"] for s in samples]
     qa_answers = [s["qa_answer"] for s in samples]
     datasets   = [s["dataset"] for s in samples]
+    sample_ids = [s["sample_id"] for s in samples]
 
     return {
         "input_ids":      input_ids_padded,
@@ -342,12 +348,14 @@ def collate_stage2_batch(samples: List[dict]) -> dict:
         "pixel_values_videos": pixel_values_videos,
         "video_grid_thw": video_grid_thw,
         "gt_waypoints":   gt_waypoints,
+        "sample_ids":     sample_ids,
         # ground_truth dict stays on CPU — used by reward functions
         "ground_truth":   {
             "gt_waypoints": gt_waypoints.clone(),
             "task_type": task_types,
             "qa_answer": qa_answers,
             "dataset": datasets,
+            "sample_ids": sample_ids,
         },
     }
 

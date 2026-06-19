@@ -75,7 +75,13 @@ _BBOX_RE = re.compile(
     r'\[\s*(\d+(?:\.\d+)?)\s*,\s*(\d+(?:\.\d+)?)\s*,\s*(\d+(?:\.\d+)?)\s*,\s*(\d+(?:\.\d+)?)\s*\]'
 )
 
-def parse_bbox(text: str) -> Optional[List[float]]:
+def parse_bbox(text) -> Optional[List[float]]:
+    if isinstance(text, (list, tuple)):
+        if len(text) == 4 and all(isinstance(x, (int, float)) for x in text):
+            return [float(x) for x in text]
+        return None
+    if not text or not isinstance(text, str):
+        return None
     m = _BBOX_RE.search(text)
     if not m:
         return None
@@ -219,6 +225,8 @@ def _get_scorer():
 
 def compute_rouge_score(hypothesis: str, reference: str) -> float:
     """Average of ROUGE-1, ROUGE-2, ROUGE-L F1.  Returns float in [0, 1]."""
+    if not hypothesis or not reference or not isinstance(hypothesis, str) or not isinstance(reference, str):
+        return 0.0
     scorer = _get_scorer()
     scores = scorer.score(reference, hypothesis)
     return (

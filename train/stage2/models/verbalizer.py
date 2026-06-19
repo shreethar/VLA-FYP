@@ -162,7 +162,6 @@ class Verbalizer(nn.Module):
         base = AutoModelForImageTextToText.from_pretrained(
             model_name,
             dtype=torch.bfloat16,
-            device_map="cuda",
             trust_remote_code=True,
         )
 
@@ -186,6 +185,13 @@ class Verbalizer(nn.Module):
             bias="none",
         )
         self.lm = get_peft_model(base, lora_cfg)
+
+        # Explicitly enable gradient checkpointing for the Verbalizer
+        self.lm.enable_input_require_grads()
+        self.lm.gradient_checkpointing_enable(
+            gradient_checkpointing_kwargs={"use_reentrant": False}
+        )
+        self.lm.config.use_cache = False
 
         # Resize embedding table to match extended tokenizer (<answer> token)
         if new_vocab_size > 0:
