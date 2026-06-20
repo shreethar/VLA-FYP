@@ -236,10 +236,19 @@ class Stage2Dataset(Dataset):
         # ── Build chat messages (Qwen multimodal format) ──────────────────
         frames: List[Image.Image] = s["frames"]
 
-        # Downsample video frames by half
+        # Limit video frames to fit inside max_length to prevent truncation-induced NaNs
         if len(frames) > 1:
+            max_vision_tokens = self.max_length - 400  # Leave 400 tokens for text
+            max_frames = max(1, max_vision_tokens // 256) # 256 patches per 448x448 frame
+            
+            # Initial downsample by half
             start_idx = 1 if len(frames) % 2 == 0 else 0
             frames = frames[start_idx::2]
+            
+            # If still too long, uniformly subsample to fit exactly inside context
+            if len(frames) > max_frames:
+                step = len(frames) / max_frames
+                frames = [frames[int(i * step)] for i in range(max_frames)]
 
         # Ensure 448×448 RGB (already done during materialisation, but guard)
         frames = [

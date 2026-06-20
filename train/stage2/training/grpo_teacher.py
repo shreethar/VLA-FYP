@@ -627,8 +627,11 @@ class GRPOTeacher(nn.Module):
                         ref_target_logits = ref_logits.gather(dim=-1, index=target_ids.unsqueeze(-1)).squeeze(-1)
                         ref_token_p = (ref_target_logits - torch.logsumexp(ref_logits, dim=-1)).clamp(min=-100.0, max=0.0)
                         
-                    kl = (token_log_p - ref_token_p.detach()) * resp_mask_shifted
-                    kl = torch.clamp(kl, min=0.0)
+                    log_ratio = token_log_p - ref_token_p.detach()
+                    # Clamp log_ratio to prevent exp() overflow in bfloat16
+                    log_ratio = torch.clamp(log_ratio, min=-20.0, max=20.0)
+                    # Exact unbiased KL estimator (DeepSeek GRPO)
+                    kl = (torch.exp(log_ratio) - log_ratio - 1.0) * resp_mask_shifted
                     kl_per_token = kl.sum(dim=-1) / resp_lens
                     raw_kl_val = kl_per_token.mean().item()
                     kl_gb = (self.kl_coef * kl_per_token.mean()) * chunk_len / (G * B * grad_accum_steps)

@@ -81,7 +81,7 @@ class Stage2Config:
     grad_accum_steps:    int  = 32
 
     # Optimizers
-    teacher_lr:          float = 0.5e-4
+    teacher_lr:          float = 0.5e-5
     student_lr:          float = 1e-4
     verbalizer_lr:       float = 2.5e-4
     weight_decay:        float = 0.01
