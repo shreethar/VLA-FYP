@@ -81,7 +81,7 @@ class Stage2Config:
     grad_accum_steps:    int  = 32
 
     # Optimizers
-    teacher_lr:          float = 0.5e-4
+    teacher_lr:          float = 0.5e-5
     student_lr:          float = 1e-4
     verbalizer_lr:       float = 2.5e-4
     weight_decay:        float = 0.01
@@ -123,7 +123,7 @@ class Stage2Config:
     use_wandb:           bool = True
 
     # Collapse detection
-    reward_collapse_window:  int   = 20    # freeze teacher if reward=0 for this many consecutive steps
+    reward_collapse_window:  int   = 5     # freeze teacher if reward drops for this many consecutive steps
     lm_collapse_threshold:   float = 0.01  # skip verbalizer update if LM loss falls below this
 
 
@@ -133,7 +133,8 @@ class Stage2Config:
 
 def build_teacher_optimizer(teacher: GRPOTeacher, cfg: Stage2Config):
     params = [p for p in teacher.vlm.parameters() if p.requires_grad]
-    return torch.optim.AdamW(params, lr=cfg.teacher_lr, weight_decay=cfg.weight_decay)
+    # β1=0.85 instead of 0.9: less momentum memory → less overshoot when policy converges
+    return torch.optim.AdamW(params, lr=cfg.teacher_lr, betas=(0.85, 0.999), weight_decay=cfg.weight_decay)
 
 
 def build_student_optimizer(student: LatentStudent, cfg: Stage2Config):
@@ -477,10 +478,11 @@ def train_stage2(
         data_iter = iter(dataloader)
 
     # ── Collapse detection state ────────────────────────────────────────
-    reward_zero_streak = 0             # consecutive steps with reward_mean == 0
+    reward_zero_streak = 0             # consecutive steps with reward declining
     teacher_frozen_by_watchdog = False # set True when watchdog freezes teacher
     lm_collapse_streak = 0            # consecutive steps with lm_loss < threshold
     cached_grad_norms = {}            # captured BEFORE zero_grad for correct logging
+    _prev_reward = None               # for decline detection
 
     for step in range(start_step, cfg.total_steps):
 
@@ -759,23 +761,27 @@ def train_stage2(
             verbalizer.freeze_for_student_training()
             logger.info(f"[Step {step}] Verbalizer frozen — DPO phase begins.")
 
-        # 5. Watchdog updates
+        # 5. Watchdog updates — triggers on DECLINING reward, not just zero
         reward_mean_avg = step_metrics.get("grpo/reward_mean", 0.0)
-        if reward_mean_avg <= 0.0:
+        if _prev_reward is not None and reward_mean_avg < _prev_reward - 0.02:
+            # Reward dropped by more than 0.02 in a single step
+            reward_zero_streak += 1
+        elif reward_mean_avg <= 0.05:
+            # Or reward is near-zero absolute
             reward_zero_streak += 1
         else:
             reward_zero_streak = 0
             if teacher_frozen_by_watchdog:
                 teacher_frozen_by_watchdog = False
                 logger.info(f"[Step {step}] Reward recovered ({reward_mean_avg:.4f}) — unfreezing teacher.")
+        _prev_reward = reward_mean_avg
 
         if reward_zero_streak >= cfg.reward_collapse_window and not teacher_frozen_by_watchdog:
             teacher_frozen_by_watchdog = True
             logger.warning(
                 f"\n{'='*60}\n"
-                f"[WATCHDOG] Reward has been 0.0 for {reward_zero_streak} consecutive steps!\n"
-                f"Freezing teacher optimizer to prevent further corruption.\n"
-                f"L_distill quality gate is also active (distill_gated={last_loss_out.distill_gated if last_loss_out is not None else False}).\n"
+                f"[WATCHDOG] Reward declining/collapsed for {reward_zero_streak} consecutive steps!\n"
+                f"Current reward={reward_mean_avg:.4f}. Freezing teacher optimizer.\n"
                 f"{'='*60}"
             )
 

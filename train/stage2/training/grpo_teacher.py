@@ -465,7 +465,9 @@ class GRPOTeacher(nn.Module):
                 f"checking your reward function.",
                 stacklevel=2,
             )
-        return (rewards - mean) / (std + eps)      # [G, batch]
+        advantages = (rewards - mean) / (std + eps)   # [G, batch]
+        # Clip to prevent any single outlier rollout from dominating the gradient
+        return torch.clamp(advantages, min=-5.0, max=5.0)
 
     # -----------------------------------------------------------------------
     # Step 4: GRPO policy-gradient loss  +  Teacher update
@@ -504,19 +506,12 @@ class GRPOTeacher(nn.Module):
         G     = len(all_ids)
         B     = all_ids[0].shape[0]
         device = all_ids[0].device
+        chunk_size = getattr(self, "backward_batch_size", 1)
 
         # ── Pre-compute per-batch-item image/video ownership ──────────────
-        # image_grid_thw / video_grid_thw only contain entries for samples
-        # that actually have images / videos.  We must map b_idx → the
-        # correct row in those tensors (not a 1:1 b_idx mapping).
         image_token_id = getattr(self.vlm.config, "image_token_id", None)
         video_token_id = getattr(self.vlm.config, "video_token_id", 248057)
-
-        # Use the FIRST rollout's prompt portion (identical across all G)
-        # to detect which batch items carry image vs video tokens.
         ref_ids = all_ids[0]  # [B, seq]
-
-        # has_image[b] / has_video[b] = True if batch item b has those tokens
         has_image = [False] * B
         has_video = [False] * B
         if pixel_values is not None and image_token_id is not None:
@@ -526,16 +521,51 @@ class GRPOTeacher(nn.Module):
             for b in range(B):
                 has_video[b] = (ref_ids[b] == video_token_id).any().item()
 
-        # ── Step B: Chunked Forward & Backward Pass ───────────────────────
-        # By processing one rollout group (B sequences) at a time and calling 
-        # .backward(), PyTorch instantly frees the massive activation memory and 
-        # gradient tensors. Peak VRAM becomes B instead of G*B!
-        
+        # ── Pre-compute log_p_old (policy at generation time) for PPO-Clip ─
+        # Called BEFORE any .backward(), so weights == weights at generation.
+        all_log_probs_old = []  # List[G] of [B] mean response log-prob (detached)
+        with torch.no_grad():
+            for g_pre in range(G):
+                log_probs_g = torch.zeros(B, device=device)
+                for cs in range(0, B, chunk_size):
+                    ce = min(cs + chunk_size, B)
+                    bid = all_ids[g_pre][cs:ce]
+                    bmask = all_masks[g_pre][cs:ce]
+                    rmask = torch.zeros_like(bid, dtype=torch.float)
+                    rmask[:, prompt_len:] = (bid[:, prompt_len:] != 0).float()
+                    rlens = rmask.sum(dim=-1).clamp(min=1)
+                    # Image/video slicing
+                    n_img_pre = sum(has_image[:cs])
+                    c_img_pre = sum(has_image[cs:ce])
+                    pv_pre = thw_pre = pv_v_pre = v_thw_pre = None
+                    if c_img_pre > 0:
+                        thw_pre = image_grid_thw[n_img_pre:n_img_pre + c_img_pre]
+                        n_pat = thw_pre.prod(dim=-1).sum().item()
+                        off = int(image_grid_thw[:n_img_pre].prod(dim=-1).sum().item()) if n_img_pre > 0 else 0
+                        pv_pre = pixel_values[off:off + n_pat]
+                    n_vid_pre = sum(has_video[:cs])
+                    c_vid_pre = sum(has_video[cs:ce])
+                    if c_vid_pre > 0:
+                        v_thw_pre = video_grid_thw[n_vid_pre:n_vid_pre + c_vid_pre]
+                        n_pat_v = v_thw_pre.prod(dim=-1).sum().item()
+                        off_v = int(video_grid_thw[:n_vid_pre].prod(dim=-1).sum().item()) if n_vid_pre > 0 else 0
+                        pv_v_pre = pixel_values_videos[off_v:off_v + n_pat_v]
+                    emb_pre = self._build_input_embeds(bid, pv_pre, thw_pre, pv_v_pre, v_thw_pre)
+                    pos_pre = bmask.long().cumsum(-1) - 1
+                    pos_pre.masked_fill_(bmask == 0, 1)
+                    out_pre = self.vlm(inputs_embeds=emb_pre, attention_mask=bmask,
+                                       position_ids=pos_pre, use_cache=False, return_dict=True)
+                    lg = out_pre.logits.float()[:, :-1, :]
+                    tid = bid[:, 1:]
+                    tlp = (lg.gather(-1, tid.unsqueeze(-1)).squeeze(-1) - torch.logsumexp(lg, dim=-1)).clamp(min=-100.0, max=0.0)
+                    log_probs_g[cs:ce] = ((tlp * rmask[:, 1:]).sum(-1) / rlens).detach()
+                    del out_pre, lg, emb_pre
+                all_log_probs_old.append(log_probs_g)
+
+        # ── Chunked Forward & Backward Pass ───────────────────────────────
         total_rollout_loss = 0.0
         total_kl_loss = 0.0
         total_raw_kl = 0.0
-        
-        chunk_size = getattr(self, "backward_batch_size", 1)
 
         if self.kl_coef > 0 and self.offload_ref_model:
             self._ref_model.to(device)
@@ -607,9 +637,16 @@ class GRPOTeacher(nn.Module):
                 resp_mask_shifted = resp_mask[:, 1:]
                 mean_log_p = (token_log_p * resp_mask_shifted).sum(dim=-1) / resp_lens  # [chunk_len]
 
-                # 5. Rollout Loss
+                # 5. PPO-Clip Rollout Loss
                 adv_g = advantages[g, chunk_start:chunk_end]  # [chunk_len]
-                loss_gb = -(adv_g * mean_log_p).mean() * chunk_len / (G * B * grad_accum_steps)
+                old_mean_log_p = all_log_probs_old[g][chunk_start:chunk_end]  # [chunk_len]
+                log_ratio = (mean_log_p - old_mean_log_p).clamp(min=-10.0, max=10.0)
+                ratio = torch.exp(log_ratio)
+                clipped_ratio = torch.clamp(ratio, 1.0 - 0.2, 1.0 + 0.2)
+                # Take the pessimistic (minimum) surrogate to prevent over-optimistic updates
+                surr1 = ratio * adv_g
+                surr2 = clipped_ratio * adv_g
+                loss_gb = -torch.min(surr1, surr2).mean() * chunk_len / (G * B * grad_accum_steps)
                 
                 # 6. KL Loss
                 kl_gb = torch.tensor(0.0, device=device)
@@ -627,8 +664,11 @@ class GRPOTeacher(nn.Module):
                         ref_target_logits = ref_logits.gather(dim=-1, index=target_ids.unsqueeze(-1)).squeeze(-1)
                         ref_token_p = (ref_target_logits - torch.logsumexp(ref_logits, dim=-1)).clamp(min=-100.0, max=0.0)
                         
-                    kl = (token_log_p - ref_token_p.detach()) * resp_mask_shifted
-                    kl = torch.clamp(kl, min=0.0)
+                    log_ratio = token_log_p - ref_token_p.detach()
+                    # Clamp log_ratio to prevent exp() overflow in bfloat16
+                    log_ratio = torch.clamp(log_ratio, min=-20.0, max=20.0)
+                    # Exact unbiased KL estimator (DeepSeek GRPO)
+                    kl = (torch.exp(log_ratio) - log_ratio - 1.0) * resp_mask_shifted
                     kl_per_token = kl.sum(dim=-1) / resp_lens
                     raw_kl_val = kl_per_token.mean().item()
                     kl_gb = (self.kl_coef * kl_per_token.mean()) * chunk_len / (G * B * grad_accum_steps)
@@ -841,23 +881,15 @@ class GRPOTeacher(nn.Module):
             video_grid_thw=video_grid_thw,
         )
 
-        # Adaptive KL adjustment
+        # KL is fixed — no adaptive adjustment. PPO-Clip is the primary policy constraint.
         if self.kl_coef > 0:
-            # G * B is the total number of sequences in the batch
             mean_kl = raw_kl_val.item() / (self.G * input_ids.shape[0])
-            old_kl_coef = self.kl_coef
-            if mean_kl > self.target_kl * 2.0:
-                self.kl_coef = min(self.kl_coef * 2.0, 1.0)  # Aggressive recovery
-            elif mean_kl > self.target_kl * 1.2:
-                self.kl_coef = min(self.kl_coef * 1.2, 1.0)
-            elif mean_kl < self.target_kl / 1.2:
-                self.kl_coef = max(self.kl_coef / 1.2, 0.01) # Hard floor at 0.01
-            
-            if self.kl_coef != old_kl_coef:
+            if mean_kl > self.target_kl * 3.0:
+                # Emergency log-only warning: KL is very large, indicating possible instability
                 warnings.warn(
-                    f"Adaptive KL: mean_kl={mean_kl:.6f} vs target={self.target_kl} "
-                    f"-> kl_coef adjusted {old_kl_coef:.5f} -> {self.kl_coef:.5f}",
-                    stacklevel=2
+                    f"HIGH KL ALERT: mean_kl={mean_kl:.4f} >> target={self.target_kl}. "
+                    f"PPO-Clip should have prevented this. Check for data anomalies.",
+                    stacklevel=2,
                 )
         
         if is_accum_step:
