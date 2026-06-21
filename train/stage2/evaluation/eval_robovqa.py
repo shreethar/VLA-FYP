@@ -14,7 +14,10 @@ import sys
 import random
 from typing import List, Tuple, Dict, Any
 
+# Disable GPU for TensorFlow immediately to prevent it from pre-allocating GPU memory
 import tensorflow as tf
+tf.config.set_visible_devices([], 'GPU')
+
 import torch
 import sacrebleu
 from tqdm import tqdm
@@ -24,6 +27,14 @@ from absl import logging
 # Disable tensorflow logs to keep output clean unless needed
 os.environ["TF_CPP_MIN_LOG_LEVEL"] = "3"
 logging.set_verbosity(logging.ERROR)
+
+STAGE2_QA_SYSTEM = (
+    "You are a robot manipulation assistant. Answer questions about robot tasks, "
+    "object affordances, spatial relationships, and manipulation strategies based "
+    "on the provided image or video frame. "
+    "If reasoning, think step-by-step. "
+    "Finally, output the answer after </think> without wrapping it in any brackets or tags."
+)
 
 # ==============================================================================
 # Task Parsing Utilities (ported from RoboVQA Evaluation notebook)
@@ -201,6 +212,13 @@ def clean_prediction(pred_raw: str) -> str:
     if final_answer.lower().startswith('a:'):
         final_answer = final_answer[len('a:'):].strip()
 
+    # Strip wrapping angle brackets if the model wrapped the output (e.g. <place the orange in the bowl> or <yes>)
+    while final_answer.startswith('<') and final_answer.endswith('>'):
+        final_answer = final_answer[1:-1].strip()
+
+    # Also remove any remaining single `<` or `>` characters
+    final_answer = final_answer.replace('<', '').replace('>', '').strip()
+
     return final_answer
 
 
@@ -211,17 +229,69 @@ def evaluate_model(
     device: str,
     max_new_tokens: int,
     batch_size: int,
+    base_model_path: str = None,
+    default_prompt: bool = True,
+    max_num_frames: int = 6,
+    enable_thinking: bool = False,
+    repetition_penalty: float = None,
 ) -> None:
     """Loads VLA model, processes validation TFRecords, runs inference in batches, and prints stats."""
+    if repetition_penalty is None:
+        repetition_penalty = 1.0 if enable_thinking else 1.2
+    print(f"[*] Dynamic repetition penalty configured: {repetition_penalty}")
     
-    print(f"[*] Loading model and processor from: {model_path} ...")
+    print(f"[*] Loading model and processor...")
     try:
-        processor = AutoProcessor.from_pretrained(model_path)
-        model = AutoModelForImageTextToText.from_pretrained(
-            model_path,
-            torch_dtype=torch.bfloat16 if device == "cuda" else torch.float32,
-            device_map=device
-        )
+        import json
+        is_lora = False
+        adapter_path = None
+        base_path = base_model_path
+
+        # Determine if model_path is a LoRA adapter directory or contains one
+        if os.path.isdir(model_path):
+            if os.path.exists(os.path.join(model_path, "adapter_config.json")):
+                is_lora = True
+                adapter_path = model_path
+            elif os.path.exists(os.path.join(model_path, "teacher_lora", "adapter_config.json")):
+                is_lora = True
+                adapter_path = os.path.join(model_path, "teacher_lora")
+
+        if is_lora:
+            print(f"[*] Detected LoRA adapter at: {adapter_path}")
+            # Try to read base_model_name_or_path from adapter_config.json
+            config_file = os.path.join(adapter_path, "adapter_config.json")
+            try:
+                with open(config_file, "r") as f:
+                    adapter_config = json.load(f)
+                config_base = adapter_config.get("base_model_name_or_path")
+                if config_base and not base_path:
+                    base_path = config_base
+            except Exception as ce:
+                print(f"[!] Warning: Could not read adapter config: {ce}")
+            
+            if not base_path:
+                base_path = "shreethar/stage1_unsloth"
+                
+            print(f"[*] Loading base model and processor from: {base_path} ...")
+            processor = AutoProcessor.from_pretrained(base_path)
+            processor.video_processor.do_sample_frames = False
+            base_model = AutoModelForImageTextToText.from_pretrained(
+                base_path,
+                torch_dtype=torch.bfloat16 if device == "cuda" else torch.float32,
+                device_map=device
+            )
+            
+            from peft import PeftModel
+            print(f"[*] Loading LoRA adapter from: {adapter_path} ...")
+            model = PeftModel.from_pretrained(base_model, adapter_path)
+        else:
+            print(f"[*] Loading full model and processor from: {model_path} ...")
+            processor = AutoProcessor.from_pretrained(model_path)
+            model = AutoModelForImageTextToText.from_pretrained(
+                model_path,
+                torch_dtype=torch.bfloat16 if device == "cuda" else torch.float32,
+                device_map=device
+            )
     except Exception as e:
         print(f"[!] Error loading model: {e}", file=sys.stderr)
         sys.exit(1)
@@ -269,7 +339,7 @@ def evaluate_model(
             add_generation_prompt=True,
             return_tensors="pt",
             padding=True,
-            enable_thinking=False,
+            enable_thinking=enable_thinking,
         )
 
         # Move inputs to correct device
@@ -286,8 +356,10 @@ def evaluate_model(
                 max_new_tokens=max_new_tokens,
                 stop_strings=["<|im_end|>"],
                 eos_token_id=processor.tokenizer.convert_tokens_to_ids("<|im_end|>"),
-                repetition_penalty=1.2,
-                tokenizer=processor.tokenizer
+                repetition_penalty=repetition_penalty,
+                tokenizer=processor.tokenizer,
+                do_sample=True,
+                temperature=0.1,
             )
 
         # Decode and evaluate batch items
@@ -299,8 +371,8 @@ def evaluate_model(
             pred_answer = clean_prediction(pred_raw)
             reference_answer = batch_references[idx]
 
-            # Calculate BLEU score
-            bleu_result = sacrebleu.sentence_bleu(pred_answer, [reference_answer])
+            # Calculate BLEU score (case-insensitive to avoid penalizing case discrepancies)
+            bleu_result = sacrebleu.sentence_bleu(pred_answer, [reference_answer], lowercase=True)
             bleu_score = bleu_result.score
             total_bleu += bleu_score
 
@@ -329,6 +401,11 @@ def evaluate_model(
                 image = tf.image.decode_jpeg(code).numpy()
                 images.append(image)
 
+            # Subsample frames to prevent context window bloat and speed up generation
+            if len(images) > max_num_frames:
+                step = len(images) / max_num_frames
+                images = [images[int(i * step)] for i in range(max_num_frames)]
+
             # Get raw VQA script text and extract question-answer pairs
             texts_feature = example.feature_lists.feature_list.get("texts")
             if not texts_feature or not texts_feature.feature:
@@ -338,12 +415,25 @@ def evaluate_model(
             qa_list = fetch_question_answer(raw_text)
 
             for _, task_type, question, answer in qa_list:
+                if default_prompt:
+                    if enable_thinking:
+                        prompt_text = f"{STAGE2_QA_SYSTEM}\n\n{question}"
+                    else:
+                        prompt_text = question
+                else:
+                    prompt_text = (
+                        "Output your final answer concisely, you may reason, but the final output should contain "
+                        "</think> yes/no/place the paper on the table <|im_end|> etc, no need to give explanation on final answer. "
+                        "Do not wrap your final answer in any brackets or tags (like < >). "
+                        f"output within 10 words\nTask Instruction: {question}"
+                    )
+
                 batch_messages.append([
                     {
                         "role": "user",
                         "content": [
                             {"type": "video", "video": images},
-                            {"type": "text", "text": question}
+                            {"type": "text", "text": prompt_text}
                         ]
                     }
                 ])
@@ -389,9 +479,7 @@ def evaluate_model(
     print("="*80)
     for pair in evaluated_pairs[:10]:  # Show up to first 10 examples
         print(f"\n--- Example {pair['index']} [{pair['task_type']}] ---")
-        print(f"Question:  {pair['question']}")
         print(f"Reference: {pair['reference']}")
-        print(f"Raw Pred:  {pair['pred_raw']}")
         print(f"Cleaned:   {pair['pred_cleaned']}")
         print(f"BLEU:      {pair['bleu']:.2f}%")
 
@@ -450,6 +538,36 @@ def main():
         default=16,
         help="Batch size for model inference."
     )
+    parser.add_argument(
+        "--base_model_path",
+        type=str,
+        default=None,
+        help="Path or HuggingFace hub ID of the base model if evaluating a LoRA adapter."
+    )
+    parser.add_argument(
+        "--default_prompt",
+        type=lambda x: str(x).lower() not in ("false", "0", "no"),
+        default=True,
+        help="Whether to use the default prompt from TFRecord (default: True). If False, a custom prompt format is used."
+    )
+    parser.add_argument(
+        "--max_num_frames",
+        type=int,
+        default=6,
+        help="Maximum number of video frames to retain per record via uniform subsampling (default: 6)."
+    )
+    parser.add_argument(
+        "--enable_thinking",
+        type=lambda x: str(x).lower() not in ("false", "0", "no"),
+        default=False,
+        help="Whether to enable thinking mode during processor template application (default: False)."
+    )
+    parser.add_argument(
+        "--repetition_penalty",
+        type=float,
+        default=None,
+        help="Repetition penalty for generation. Defaults to 1.0 if enable_thinking is True, else 1.2."
+    )
 
     args = parser.parse_args()
     
@@ -459,7 +577,12 @@ def main():
         num_examples=args.num_examples,
         device=args.device,
         max_new_tokens=args.max_new_tokens,
-        batch_size=args.batch_size
+        batch_size=args.batch_size,
+        base_model_path=args.base_model_path,
+        default_prompt=args.default_prompt,
+        max_num_frames=args.max_num_frames,
+        enable_thinking=args.enable_thinking,
+        repetition_penalty=args.repetition_penalty,
     )
 
 

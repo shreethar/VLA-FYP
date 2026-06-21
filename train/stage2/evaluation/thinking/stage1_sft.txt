@@ -1,0 +1,60 @@
+================================================================================
+ EVALUATION RESULTS (SAMPLES)
+================================================================================
+
+--- Example 1 [<task:planning:freeform>] ---
+Reference: place the packet on the table
+Cleaned:   take out the orange packet from the tray
+BLEU:      7.27%
+
+--- Example 2 [<task:affordance:discriminative:discrete:True>] ---
+Reference: yes
+Cleaned:   The action that was most recently done is place the packet on the table.
+BLEU:      0.00%
+
+--- Example 3 [<task:affordance:generative:positive:freeform>] ---
+Reference: place the packet on the table
+Cleaned:   put packet on the table Q: possible right now?
+BLEU:      23.46%
+
+--- Example 4 [<task:affordance:discriminative:discrete:True>] ---
+Reference: yes
+Cleaned:   yes
+BLEU:      100.00%
+
+--- Example 5 [<task:immediate_planning_with_context20:freeform>] ---
+Reference: place the packet on the table
+Cleaned:   1- Remove the next packet from the basket and place it on the table.
+BLEU:      10.83%
+
+--- Example 6 [<task:affordance:discriminative:discrete:False>] ---
+Reference: no
+Cleaned:   place the apple on the table
+BLEU:      0.00%
+
+--- Example 7 [<task:past_description:freeform>] ---
+Reference: Place the orange inside the white bowl
+Cleaned:   put orange in the bowl
+BLEU:      9.42%
+
+--- Example 8 [<task:future_prediction:freeform>] ---
+Reference: Place the orange inside the white bowl
+Cleaned:   place the orange on the table
+BLEU:      27.48%
+
+--- Example 9 [<task:affordance:discriminative:discrete:False>] ---
+Reference: no
+Cleaned:   no
+BLEU:      100.00%
+
+--- Example 10 [<task:affordance:discriminative:discrete:True>] ---
+Reference: yes
+Cleaned:   yes
+BLEU:      100.00%
+
+================================================================================
+ SUMMARY
+================================================================================
+Total QA Pairs Evaluated: 1921
+Mean BLEU Score:          39.40%
+================================================================================

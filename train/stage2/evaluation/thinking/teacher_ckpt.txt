@@ -1,0 +1,60 @@
+================================================================================
+ EVALUATION RESULTS (SAMPLES)
+================================================================================
+
+--- Example 1 [<task:planning:freeform>] ---
+Reference: place the packet on the table
+Cleaned:   place the packet on the table
+BLEU:      100.00%
+
+--- Example 2 [<task:affordance:discriminative:discrete:True>] ---
+Reference: yes
+Cleaned:   yes
+BLEU:      100.00%
+
+--- Example 3 [<task:affordance:generative:positive:freeform>] ---
+Reference: place the packet on the table
+Cleaned:   place the pip corn packet on the table
+BLEU:      41.11%
+
+--- Example 4 [<task:affordance:discriminative:discrete:True>] ---
+Reference: yes
+Cleaned:   yes
+BLEU:      100.00%
+
+--- Example 5 [<task:immediate_planning_with_context20:freeform>] ---
+Reference: place the packet on the table
+Cleaned:   place the packet on the table
+BLEU:      100.00%
+
+--- Example 6 [<task:affordance:discriminative:discrete:False>] ---
+Reference: no
+Cleaned:   no
+BLEU:      100.00%
+
+--- Example 7 [<task:past_description:freeform>] ---
+Reference: Place the orange inside the white bowl
+Cleaned:   place the orange in the bowl
+BLEU:      29.06%
+
+--- Example 8 [<task:future_prediction:freeform>] ---
+Reference: Place the orange inside the white bowl
+Cleaned:   place the orange on the table
+BLEU:      27.48%
+
+--- Example 9 [<task:affordance:discriminative:discrete:False>] ---
+Reference: no
+Cleaned:   No
+BLEU:      100.00%
+
+--- Example 10 [<task:affordance:discriminative:discrete:True>] ---
+Reference: yes
+Cleaned:   yes
+BLEU:      100.00%
+
+================================================================================
+ SUMMARY
+================================================================================
+Total QA Pairs Evaluated: 1921
+Mean BLEU Score:          46.65%
+================================================================================

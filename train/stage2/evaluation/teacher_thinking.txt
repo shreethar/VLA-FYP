@@ -1,0 +1,71 @@
+[*] Dynamic repetition penalty configured: 1.0
+[*] Loading model and processor...
+[*] Detected LoRA adapter at: checkpoints/stage2_decoupled_mini/step_000100/teacher_lora
+[*] Loading base model and processor from: shreethar/stage1_unsloth ...
+[*] Loading LoRA adapter from: checkpoints/stage2_decoupled_mini/step_000100/teacher_lora ...
+[*] Locating evaluation files using pattern: gs://gdm-robovqa/tfrecord/val/val* ...
+[*] Found 9 TFRecord file(s). Creating dataset ...
+[*] Starting batched evaluation (batch size: 2) on up to 10 QA pairs ...
+
+
+================================================================================
+ EVALUATION RESULTS (SAMPLES)
+================================================================================
+
+--- Example 1 [<task:planning:freeform>] ---
+Reference: place the packet on the table
+Cleaned:   place the packet on the table
+BLEU:      100.00%
+
+--- Example 2 [<task:affordance:discriminative:discrete:True>] ---
+Reference: yes
+Cleaned:   yes
+BLEU:      100.00%
+
+--- Example 3 [<task:affordance:generative:positive:freeform>] ---
+Reference: place the packet on the table
+Cleaned:   done
+BLEU:      0.00%
+
+--- Example 4 [<task:affordance:discriminative:discrete:True>] ---
+Reference: yes
+Cleaned:   yes
+BLEU:      100.00%
+
+--- Example 5 [<task:immediate_planning_with_context20:freeform>] ---
+Reference: place the packet on the table
+Cleaned:   place the packet on the table
+BLEU:      100.00%
+
+--- Example 6 [<task:affordance:discriminative:discrete:False>] ---
+Reference: no
+Cleaned:   no
+BLEU:      100.00%
+
+--- Example 7 [<task:past_description:freeform>] ---
+Reference: Place the orange inside the white bowl
+Cleaned:   place the orange in the bowl
+BLEU:      29.06%
+
+--- Example 8 [<task:future_prediction:freeform>] ---
+Reference: Place the orange inside the white bowl
+Cleaned:   close the drawer
+BLEU:      7.25%
+
+--- Example 9 [<task:affordance:discriminative:discrete:False>] ---
+Reference: no
+Cleaned:   open the drawer
+BLEU:      0.00%
+
+--- Example 10 [<task:affordance:discriminative:discrete:True>] ---
+Reference: yes
+Cleaned:   yes
+BLEU:      100.00%
+
+================================================================================
+ SUMMARY
+================================================================================
+Total QA Pairs Evaluated: 10
+Mean BLEU Score:          63.63%
+================================================================================
+
