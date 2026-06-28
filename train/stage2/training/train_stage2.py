@@ -77,14 +77,14 @@ class Stage2Config:
     lr_warmup_steps:     int  = 200                             # LR scheduler warm-up
     save_steps:          int  = 100                             # was 500 — more recovery points
     log_steps:           int  = 10
-    grad_clip:           float = 1.0
+    grad_clip:           float = 0.1                        # TRL default — 10x more conservative than 1.0
     grad_accum_steps:    int  = 32
 
     # Optimizers
     teacher_lr:          float = 0.5e-5
     student_lr:          float = 1e-4
     verbalizer_lr:       float = 2.5e-4
-    weight_decay:        float = 0.01
+    weight_decay:        float = 0.1                         # TRL default
 
     # LoRA
     lora_rank:           int  = 64
@@ -93,9 +93,9 @@ class Stage2Config:
 
     # GRPO
     G:                   int  = 5
-    gen_temperature:     float = 0.9
+    gen_temperature:     float = 1.0
     gen_max_new_tokens:  int  = 512
-    kl_coef:             float = 0.05
+    kl_coef:             float = 0.2                          # Increased from 0.05; KL was hitting 0.8 vs target 0.02
     target_kl:           float = 0.02
     grpo_backward_batch_size: int = 1
 
@@ -133,8 +133,8 @@ class Stage2Config:
 
 def build_teacher_optimizer(teacher: GRPOTeacher, cfg: Stage2Config):
     params = [p for p in teacher.vlm.parameters() if p.requires_grad]
-    # β1=0.85 instead of 0.9: less momentum memory → less overshoot when policy converges
-    return torch.optim.AdamW(params, lr=cfg.teacher_lr, betas=(0.85, 0.999), weight_decay=cfg.weight_decay)
+    # β1=0.9, β2=0.99: matches TRL/Unsloth defaults for stable GRPO training
+    return torch.optim.AdamW(params, lr=cfg.teacher_lr, betas=(0.9, 0.99), weight_decay=cfg.weight_decay)
 
 
 def build_student_optimizer(student: LatentStudent, cfg: Stage2Config):
@@ -216,6 +216,21 @@ def save_checkpoint(
         verbalizer.lm.save_pretrained(os.path.join(ckpt_dir, "verbalizer_lora"))
         state_dict["ca_blocks"] = verbalizer.ca_blocks.state_dict()
 
+    if teacher_opt is not None:
+        state_dict["teacher_opt"] = teacher_opt.state_dict()
+        if teacher_sched is not None:
+            state_dict["teacher_sched"] = teacher_sched.state_dict()
+
+    if student_opt is not None:
+        state_dict["student_opt"] = student_opt.state_dict()
+        if student_sched is not None:
+            state_dict["student_sched"] = student_sched.state_dict()
+
+    if verbalizer_opt is not None:
+        state_dict["verbalizer_opt"] = verbalizer_opt.state_dict()
+        if verbalizer_sched is not None:
+            state_dict["verbalizer_sched"] = verbalizer_sched.state_dict()
+
     torch.save(state_dict, os.path.join(ckpt_dir, "training_state.pt"))
     logger.info(f"Checkpoint saved → {ckpt_dir}")
 
@@ -244,12 +259,79 @@ def load_checkpoint(
     if verbalizer is not None and "ca_blocks" in state:
         verbalizer.ca_blocks.load_state_dict(state["ca_blocks"])
 
+    # Helper to load optimizer while preserving the fresh learning rate from config
+    def load_opt_state(opt, opt_key):
+        if opt is not None and opt_key in state:
+            fresh_lrs = [group["lr"] for group in opt.param_groups]
+            opt.load_state_dict(state[opt_key])
+            for group, lr in zip(opt.param_groups, fresh_lrs):
+                group["lr"] = lr
+
+    # Helper to load scheduler while preserving fresh base learning rates
+    def load_sched_state(sched, sched_key):
+        if sched is not None and sched_key in state:
+            fresh_base_lrs = getattr(sched, "base_lrs", [])
+            sched.load_state_dict(state[sched_key])
+            if fresh_base_lrs:
+                sched.base_lrs = fresh_base_lrs
+
+    load_opt_state(teacher_opt, "teacher_opt")
+    load_sched_state(teacher_sched, "teacher_sched")
+    
+    load_opt_state(student_opt, "student_opt")
+    load_sched_state(student_sched, "student_sched")
+    
+    load_opt_state(verbalizer_opt, "verbalizer_opt")
+    load_sched_state(verbalizer_sched, "verbalizer_sched")
+
     logger.info(f"Resumed from checkpoint at step {step}")
     return step
 
 
+def cleanup_rolling_checkpoints(output_dir: str, current_step: int, save_steps: int):
+    """
+    Deletes all old step_XXXXXX directories except for:
+    - The 2 most recent steps (to protect against power cuts mid-save)
+    - Any step that is a multiple of save_steps (persistent milestones)
+    """
+    import glob
+    import shutil
+
+    step_dirs = glob.glob(os.path.join(output_dir, "step_*"))
+    steps = []
+    for d in step_dirs:
+        try:
+            s = int(os.path.basename(d).split("_")[1])
+            steps.append((s, d))
+        except ValueError:
+            pass
+
+    if not steps:
+        return
+
+    # Sort by step number
+    steps.sort(key=lambda x: x[0])
+    
+    # Identify the 2 largest steps
+    largest_steps = [s[0] for s in steps[-2:]]
+
+    for s, d in steps:
+        # Keep the 2 most recent steps
+        if s in largest_steps:
+            continue
+        # Keep milestones
+        if s > 0 and s % save_steps == 0:
+            continue
+        
+        # Delete old rolling checkpoint
+        try:
+            shutil.rmtree(d)
+            logger.info(f"Deleted old rolling checkpoint: {d}")
+        except Exception as e:
+            logger.warning(f"Failed to delete old checkpoint {d}: {e}")
+
 # ---------------------------------------------------------------------------
-# Main training function
+# Training Loop
 # ---------------------------------------------------------------------------
 
 def log_memory(tag: str):
@@ -1009,23 +1091,27 @@ def train_stage2(
         # ----------------------------------------------------------------
         # G. Checkpointing
         # ----------------------------------------------------------------
+        # Save every step to act as a rolling buffer against power cuts
+        save_checkpoint(
+            step=step,
+            teacher=teacher,
+            student=student,
+            verbalizer=verbalizer,
+            teacher_opt=teacher_opt,
+            student_opt=student_opt,
+            verbalizer_opt=verbalizer_opt,
+            teacher_sched=teacher_sched,
+            student_sched=student_sched,
+            verbalizer_sched=verbalizer_sched,
+            output_dir=cfg.output_dir,
+        )
+        
+        cleanup_rolling_checkpoints(cfg.output_dir, current_step=step, save_steps=cfg.save_steps)
+        
         is_ckpt_step = (step > 0 and step % cfg.save_steps == 0) or step == cfg.total_steps - 1
         if is_ckpt_step:
-            save_checkpoint(
-                step=step,
-                teacher=teacher,
-                student=student,
-                verbalizer=verbalizer,
-                teacher_opt=teacher_opt,
-                student_opt=student_opt,
-                verbalizer_opt=verbalizer_opt,
-                teacher_sched=teacher_sched,
-                student_sched=student_sched,
-                verbalizer_sched=verbalizer_sched,
-                output_dir=cfg.output_dir,
-            )
             if use_wandb:
-                # Log checkpoint as a WandB artifact so you can restore any step
+                # Log milestone checkpoints as WandB artifacts
                 ckpt_dir = os.path.join(cfg.output_dir, f"step_{step:06d}")
                 artifact = wandb.Artifact(
                     name=f"stage2-ckpt-step{step}",

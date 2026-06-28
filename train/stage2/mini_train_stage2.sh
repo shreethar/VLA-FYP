@@ -46,7 +46,7 @@ if [[ "$MODE" == "teacher" || "$MODE" == "all" ]]; then
         --subset_ratio 1.0 \
         --total_steps 675 \
         --warmup_steps 450 \
-        --save_steps 50 \
+        --save_steps 20 \
         --wandb_project "VLA-FYP-Teacher" \
         --wandb_run "stage2-mini-teacher" \
         --batch_size 12 \
@@ -54,7 +54,7 @@ if [[ "$MODE" == "teacher" || "$MODE" == "all" ]]; then
         --grpo_backward_batch_size 2 \
         --grad_accum_steps 4 \
         --log_steps 1 \
-        --max_seq_len 2048 \
+        --max_seq_len 2560 \
         --offload_ref_model False \
         --num_workers 2 \
         --mode "teacher_only" \
@@ -71,7 +71,7 @@ if [[ "$MODE" == "student" || "$MODE" == "all" ]]; then
         --output_dir "$OUTPUT_DIR" \
         --total_steps 600 \
         --warmup_steps 400 \
-        --save_steps 50 \
+        --save_steps 20 \
         --wandb_project "VLA-FYP" \
         --wandb_run "stage2-mini-student" \
         --batch_size 8 \
