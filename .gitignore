@@ -65,3 +65,5 @@ train/stage2/test/image.jpg
 train/stage2/gen1.json
 train/stage2/gen0.json
 train/stage2/logs
+train/stage2/checkpoints/
+train/stage2/merged_latent_student/
