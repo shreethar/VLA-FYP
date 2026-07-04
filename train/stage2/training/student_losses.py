@@ -29,7 +29,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from dataclasses import dataclass, field
-from typing import Optional
+from typing import Optional, Tuple
 
 
 # ---------------------------------------------------------------------------
@@ -92,15 +92,19 @@ class StudentLossComputer(nn.Module):
 
     def __init__(
         self,
-        warmup_steps: int = 3000,
+        warmup_steps: int,
         lambda_distill: float = 1.0,
         lambda_ans: float = 1.0,
+        end_think_token_id: int = 248069,
+        im_end_token_id: int = 248046,
         distill_clamp_max: float = 10.0,
     ):
         super().__init__()
         self.warmup_steps = warmup_steps
         self.lambda_distill = lambda_distill
         self.lambda_ans = lambda_ans
+        self.end_think_token_id = end_think_token_id
+        self.im_end_token_id = im_end_token_id
         self.distill_clamp_max = distill_clamp_max
 
     # -----------------------------------------------------------------------
@@ -244,11 +248,18 @@ class StudentLossComputer(nn.Module):
 
         if is_warmup:
             # -- Warm-up: Verbalizer LM loss on τ+ (latents DETACHED) ------
+            labels, loss_weights = self._make_lm_labels_and_weights(
+                buffer.tau_pos_ids, 
+                prompt_len,
+                self.end_think_token_id,
+                self.im_end_token_id
+            )
             lm_loss = verbalizer.compute_lm_loss(
                 input_ids=buffer.tau_pos_ids,
                 attention_mask=buffer.tau_pos_mask,
                 latents=z.detach(),          # ← critical: no gradient into Student
-                labels=self._make_lm_labels(buffer.tau_pos_ids, prompt_len),
+                labels=labels,
+                loss_weights=loss_weights,
             )
 
             # Student total = L_distill + L_ans (no L_verb)
@@ -312,17 +323,46 @@ class StudentLossComputer(nn.Module):
     # -----------------------------------------------------------------------
 
     @staticmethod
-    def _make_lm_labels(
+    def _make_lm_labels_and_weights(
         input_ids: torch.Tensor,   # [batch, seq]  full τ+ sequence
         prompt_len: int,
-    ) -> torch.Tensor:
+        end_think_token_id: int,
+        im_end_token_id: int,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
         """
         Labels for LM loss: -100 on prompt tokens (no loss there),
-        real token ids on response tokens (the τ+ chain-of-thought).
+        real token ids on response tokens.
+        Weights for LM loss:
+          - before </think>: 0.2
+          - </think>: 1.0
+          - after </think>: 2.5
+          - <|im_end|>: 0.5
         """
         labels = input_ids.clone()
         labels[:, :prompt_len] = -100
-        return labels
+        
+        weights = torch.ones_like(input_ids, dtype=torch.float32)
+        batch_size = input_ids.shape[0]
+        
+        for i in range(batch_size):
+            matches = (input_ids[i] == end_think_token_id).nonzero(as_tuple=False)
+            if matches.numel() > 0:
+                think_idx = matches[0, 0].item()
+                # Before </think>
+                weights[i, prompt_len:think_idx] = 0.2
+                # </think>
+                weights[i, think_idx] = 1.0
+                # After </think>
+                weights[i, think_idx+1:] = 2.5
+            else:
+                weights[i, prompt_len:] = 0.2
+                
+            im_end_matches = (input_ids[i] == im_end_token_id).nonzero(as_tuple=False)
+            if im_end_matches.numel() > 0:
+                im_end_idx = im_end_matches[0, 0].item()
+                weights[i, im_end_idx] = 0.5
+                
+        return labels, weights
 
     # -----------------------------------------------------------------------
     # Diagnostic: log gradient norms on Student parameters (call after backward)
@@ -357,14 +397,18 @@ class StudentLossComputer(nn.Module):
 # ---------------------------------------------------------------------------
 
 def build_student_loss_computer(
-    warmup_steps: int = 3000,
+    warmup_steps: int,
     lambda_distill: float = 1.0,
     lambda_ans: float = 1.0,
+    end_think_token_id: int = 151649,
+    im_end_token_id: int = 151645,
     distill_clamp_max: float = 10.0,
 ) -> StudentLossComputer:
     return StudentLossComputer(
         warmup_steps=warmup_steps,
         lambda_distill=lambda_distill,
         lambda_ans=lambda_ans,
+        end_think_token_id=end_think_token_id,
+        im_end_token_id=im_end_token_id,
         distill_clamp_max=distill_clamp_max,
     )
