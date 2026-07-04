@@ -87,6 +87,8 @@ from typing import List, Optional, Tuple
 
 from transformers import AutoModelForImageTextToText
 from peft import LoraConfig, TaskType, get_peft_model
+from huggingface_hub import hf_hub_download
+import os
 
 
 # ---------------------------------------------------------------------------
@@ -189,6 +191,7 @@ class LatentStudent(nn.Module):
         lora_dropout: float = 0.05,
         new_vocab_size: int = -1,
         end_think_token_id: Optional[int] = None,
+        use_lora: bool = True,
     ):
         super().__init__()
         self.M = M
@@ -214,25 +217,27 @@ class LatentStudent(nn.Module):
         )
 
         # ------------------------------------------------------------------
-        # 2. Wrap with LoRA — all projection types targeted
+        # 2. Wrap with LoRA or keep base model
         # ------------------------------------------------------------------
-        lora_cfg = LoraConfig(
-            task_type=TaskType.CAUSAL_LM,
-            r=lora_rank,
-            lora_alpha=lora_alpha,
-            lora_dropout=lora_dropout,
-            target_modules=QWEN35_LORA_TARGETS,
-            bias="none",
-        )
-        self.vlm = get_peft_model(base, lora_cfg)
+        if use_lora:
+            lora_cfg = LoraConfig(
+                task_type=TaskType.CAUSAL_LM,
+                r=lora_rank,
+                lora_alpha=lora_alpha,
+                lora_dropout=lora_dropout,
+                target_modules=QWEN35_LORA_TARGETS,
+                bias="none",
+            )
+            self.vlm = get_peft_model(base, lora_cfg)
 
-        # Explicitly enable gradient checkpointing for the Student
-        # The enable_input_require_grads() is MANDATORY because PEFT freezes the embedding
-        # layer, which otherwise causes PyTorch to silently skip checkpointing entirely!
-        self.vlm.enable_input_require_grads()
-        self.vlm.gradient_checkpointing_enable(
-            gradient_checkpointing_kwargs={"use_reentrant": False}
-        )
+            # Explicitly enable gradient checkpointing for the Student
+            self.vlm.enable_input_require_grads()
+            self.vlm.gradient_checkpointing_enable(
+                gradient_checkpointing_kwargs={"use_reentrant": False}
+            )
+        else:
+            self.vlm = base
+            
         self.vlm.config.use_cache = False
 
         if new_vocab_size > 0:
@@ -242,14 +247,14 @@ class LatentStudent(nn.Module):
         # 3. Read architecture constants from config
         # ------------------------------------------------------------------
         text_cfg = getattr(
-            self.vlm.model.model.config, "text_config", self.vlm.model.model.config
+            base.model.config, "text_config", base.model.config
         )
         self.hidden_dim: int    = getattr(text_cfg, "hidden_size",      QWEN35_4B_HIDDEN_DIM)
         self.num_layers: int    = getattr(text_cfg, "num_hidden_layers", QWEN35_4B_NUM_LAYERS)
         self.mid_layer_idx: int = self.num_layers // 2    # 16 for 32-layer 4B model
 
         self._image_token_id: Optional[int] = getattr(
-            self.vlm.model.model.config, "image_token_id", None
+            base.model.config, "image_token_id", None
         )
 
         # ------------------------------------------------------------------
@@ -264,7 +269,7 @@ class LatentStudent(nn.Module):
         # know how to interact with them.
         with torch.no_grad():
             try:
-                embed_weight = self.vlm.get_base_model().get_input_embeddings().weight
+                embed_weight = base.get_input_embeddings().weight
                 self.spatial_tokens.data.copy_(embed_weight[1000 : 1000 + K].clone())
             except Exception:
                 pass
@@ -285,9 +290,9 @@ class LatentStudent(nn.Module):
     def _language_model(self) -> nn.Module:
         """
         The transformer stack inside the Qwen3.5 model.
-        vlm.model.model.language_model contains embed_tokens and layers.
         """
-        return self.vlm.model.model.language_model
+        base_model = self.vlm.get_base_model() if hasattr(self.vlm, "get_base_model") else self.vlm
+        return base_model.model.language_model
 
     @property
     def _embed_tokens(self) -> nn.Embedding:
@@ -297,7 +302,8 @@ class LatentStudent(nn.Module):
     @property
     def _visual_encoder(self) -> nn.Module:
         """Vision encoder — trains via LoRA (NOT frozen for Student)."""
-        return self.vlm.model.model.visual
+        base_model = self.vlm.get_base_model() if hasattr(self.vlm, "get_base_model") else self.vlm
+        return base_model.model.visual
 
     # -----------------------------------------------------------------------
     # Input embedding construction
@@ -684,7 +690,8 @@ class LatentStudent(nn.Module):
 
     def print_trainable_parameters(self):
         """Print LoRA trainable parameter counts and architecture info."""
-        self.vlm.print_trainable_parameters()
+        if hasattr(self.vlm, "print_trainable_parameters"):
+            self.vlm.print_trainable_parameters()
         sp_tok = self.spatial_tokens.numel()
         sp_mlp = sum(p.numel() for p in self.spatial_mlp.parameters())
         print(f"  spatial_tokens  : {sp_tok:,} params  [TRAINABLE]")
@@ -694,3 +701,42 @@ class LatentStudent(nn.Module):
         print(f"  M (latents)     : {self.M}")
         print(f"  K (spatial)     : {self.K}")
         print(f"  end_think_id    : {self.end_think_token_id}")
+
+    # -----------------------------------------------------------------------
+    # HuggingFace Hub Integration
+    # -----------------------------------------------------------------------
+    
+    @classmethod
+    def from_pretrained(
+        cls, 
+        repo_id: str, 
+        end_think_token_id: int, 
+        M: int = 6, 
+        K: int = 5,
+        **kwargs
+    ):
+        """
+        Load a fully merged LatentStudent model directly from HuggingFace Hub.
+        Downloads the merged VLM base weights and the custom spatial parameters.
+        """
+        # 1. Initialize without LoRA (base model will be loaded directly from repo_id)
+        model = cls(
+            model_name=repo_id,
+            M=M,
+            K=K,
+            use_lora=False,
+            end_think_token_id=end_think_token_id,
+            **kwargs
+        )
+        
+        # 2. Download and load custom spatial parameters
+        try:
+            custom_weights_path = hf_hub_download(repo_id=repo_id, filename="spatial_parameters.pt")
+            state = torch.load(custom_weights_path, map_location="cpu")
+            model.spatial_tokens.data.copy_(state["spatial_tokens"])
+            model.spatial_mlp.load_state_dict(state["spatial_mlp"])
+            print(f"Successfully loaded spatial parameters from {repo_id}")
+        except Exception as e:
+            print(f"Warning: Could not load spatial_parameters.pt from {repo_id}. Ensure it was uploaded. Error: {e}")
+            
+        return model
