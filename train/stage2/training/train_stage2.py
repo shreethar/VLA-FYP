@@ -98,6 +98,7 @@ class Stage2Config:
     kl_coef:             float = 0.2                          # Increased from 0.05; KL was hitting 0.8 vs target 0.02
     target_kl:           float = 0.02
     grpo_backward_batch_size: int = 1
+    student_backward_batch_size: int = 2
 
     # Architecture
     M:                   int  = 6     # reasoning latents
@@ -354,9 +355,10 @@ def train_stage2(
     cfg: Stage2Config,
     dataloader: Optional[DataLoader] = None,
     reward_fns = None,                    # List[RewardFunction] — injected from rewards/
-    reward_weights=None,
+    reward_weights: Optional[List[float]] = None,
     resume_from: Optional[str] = None,
-    answer_token_id: int = -1,     # set after tokenizer extension
+    answer_token_id: int = 151649,
+    im_end_token_id: int = 151645,
 ):
     """
     Full Stage 2 training loop.
@@ -499,6 +501,8 @@ def train_stage2(
             warmup_steps=cfg.warmup_steps,
             lambda_distill=cfg.lambda_distill,
             lambda_ans=cfg.lambda_ans,
+            end_think_token_id=answer_token_id,
+            im_end_token_id=im_end_token_id,
         )
 
     # ------------------------------------------------------------------
@@ -743,47 +747,123 @@ def train_stage2(
             is_warmup = (step < cfg.warmup_steps)
 
             if cfg.mode in ("joint", "student_offline"):
-                loss_out = loss_computer.compute(
-                    student=student,
-                    verbalizer=verbalizer,
-                    input_ids=input_ids,
-                    pixel_values=pixel_values,
-                    image_grid_thw=image_grid_thw,
-                    pixel_values_videos=pixel_values_videos,
-                    video_grid_thw=video_grid_thw,
-                    attention_mask=attention_mask,
-                    buffer=buffer,
-                    gt_waypoints=gt_waypoints,
-                    global_step=step,
-                    task_types=ground_truth.get("task_type", None),
-                )
-                last_loss_out = loss_out
+                B = input_ids.shape[0]
+                chunk_size = getattr(cfg, "student_backward_batch_size", 2)
+                
+                # Pre-compute per-batch-item image/video ownership
+                image_token_id = getattr(student.vlm.config, "image_token_id", None)
+                video_token_id = getattr(student.vlm.config, "video_token_id", 248057)
+                has_image = [False] * B
+                has_video = [False] * B
+                if pixel_values is not None and image_token_id is not None:
+                    for b in range(B):
+                        has_image[b] = (input_ids[b] == image_token_id).any().item()
+                if pixel_values_videos is not None:
+                    for b in range(B):
+                        has_video[b] = (input_ids[b] == video_token_id).any().item()
 
-                # ----------------------------------------------------------------
-                # E. Backward passes — phase dependent
-                # ----------------------------------------------------------------
-                if is_warmup:
-                    # --- E1. Verbalizer backward (LM loss on τ+, z detached) ----
-                    loss_lm = loss_out.lm_loss / cfg.grad_accum_steps
-                    loss_lm.backward()
+                all_pred_waypoints = []
+                all_latents = []
 
-                    # --- E2. Student backward (distill + ans + spatial) ----------
-                    loss_student = loss_out.student_total / cfg.grad_accum_steps
-                    loss_student.backward()
-                else:
-                    # --- E3. Student backward (verb + distill + ans + spatial) ---
-                    # Verbalizer is frozen; DPO gradient flows through CA into Student
-                    loss_student = loss_out.student_total / cfg.grad_accum_steps
-                    loss_student.backward()
+                for chunk_start in range(0, B, chunk_size):
+                    chunk_end = min(chunk_start + chunk_size, B)
+                    chunk_len = chunk_end - chunk_start
+                    
+                    c_input_ids = input_ids[chunk_start:chunk_end]
+                    c_attention_mask = attention_mask[chunk_start:chunk_end]
+                    c_gt_waypoints = gt_waypoints[chunk_start:chunk_end]
+                    c_task_types = ground_truth.get("task_type")[chunk_start:chunk_end] if ground_truth.get("task_type") else None
+                    
+                    # Slice images
+                    pre_img_count = sum(has_image[:chunk_start])
+                    chunk_img_count = sum(has_image[chunk_start:chunk_end])
+                    if chunk_img_count > 0:
+                        c_thw = image_grid_thw[pre_img_count : pre_img_count + chunk_img_count]
+                        num_patches = c_thw.prod(dim=-1).sum().item()
+                        offset = int(image_grid_thw[:pre_img_count].prod(dim=-1).sum().item()) if pre_img_count > 0 else 0
+                        c_pv = pixel_values[offset : offset + num_patches]
+                    else:
+                        c_pv = None
+                        c_thw = None
 
-                # Clear latents from verbalizer to release graph memory
-                verbalizer.clear_latents()
+                    # Slice videos
+                    pre_vid_count = sum(has_video[:chunk_start])
+                    chunk_vid_count = sum(has_video[chunk_start:chunk_end])
+                    if chunk_vid_count > 0:
+                        c_v_thw = video_grid_thw[pre_vid_count : pre_vid_count + chunk_vid_count]
+                        num_patches = c_v_thw.prod(dim=-1).sum().item()
+                        offset = int(video_grid_thw[:pre_vid_count].prod(dim=-1).sum().item()) if pre_vid_count > 0 else 0
+                        c_pv_v = pixel_values_videos[offset : offset + num_patches]
+                    else:
+                        c_pv_v = None
+                        c_v_thw = None
 
-                # Accumulate metrics for logging
-                for k, v in loss_out.metrics.items():
-                    if isinstance(v, torch.Tensor):
-                        v = v.item()
-                    step_metrics[k] = step_metrics.get(k, 0.0) + v / cfg.grad_accum_steps
+                    # Slice buffer
+                    c_buffer = RolloutBuffer()
+                    c_buffer.tau_pos_ids = buffer.tau_pos_ids[chunk_start:chunk_end]
+                    c_buffer.tau_pos_mask = buffer.tau_pos_mask[chunk_start:chunk_end]
+                    c_buffer.tau_neg_ids = buffer.tau_neg_ids[chunk_start:chunk_end]
+                    c_buffer.tau_neg_mask = buffer.tau_neg_mask[chunk_start:chunk_end]
+                    c_buffer.tau_pos_response_mask = buffer.tau_pos_response_mask[chunk_start:chunk_end]
+                    c_buffer.tau_neg_response_mask = buffer.tau_neg_response_mask[chunk_start:chunk_end]
+                    c_buffer.h_T = buffer.h_T[chunk_start:chunk_end] if buffer.h_T is not None else None
+                    c_buffer.rewards = buffer.rewards[:, chunk_start:chunk_end]
+                    c_buffer.best_idx = buffer.best_idx[chunk_start:chunk_end]
+                    c_buffer.rollout_texts = [lst[chunk_start:chunk_end] for lst in buffer.rollout_texts] if hasattr(buffer, 'rollout_texts') and buffer.rollout_texts else None
+
+                    loss_out = loss_computer.compute(
+                        student=student,
+                        verbalizer=verbalizer,
+                        input_ids=c_input_ids,
+                        pixel_values=c_pv,
+                        image_grid_thw=c_thw,
+                        pixel_values_videos=c_pv_v,
+                        video_grid_thw=c_v_thw,
+                        attention_mask=c_attention_mask,
+                        buffer=c_buffer,
+                        gt_waypoints=c_gt_waypoints,
+                        global_step=step,
+                        task_types=c_task_types,
+                    )
+                    last_loss_out = loss_out
+
+                    # ----------------------------------------------------------------
+                    # E. Backward passes — phase dependent
+                    # ----------------------------------------------------------------
+                    scale = (chunk_len / B) / cfg.grad_accum_steps
+                    if is_warmup:
+                        loss_lm = loss_out.lm_loss * scale
+                        loss_lm.backward()
+
+                        loss_student = loss_out.student_total * scale
+                        loss_student.backward()
+                    else:
+                        loss_student = loss_out.student_total * scale
+                        loss_student.backward()
+
+                    # Clear latents from verbalizer to release graph memory
+                    verbalizer.clear_latents()
+
+                    # Accumulate metrics for logging
+                    for k, v in loss_out.metrics.items():
+                        if isinstance(v, torch.Tensor):
+                            v = v.item()
+                        step_metrics[k] = step_metrics.get(k, 0.0) + v * scale
+
+                    # Accumulate outputs for logging
+                    if loss_out.pred_waypoints is not None:
+                        all_pred_waypoints.append(loss_out.pred_waypoints.detach())
+                        
+                    if loss_out.latents is not None:
+                        all_latents.append(loss_out.latents.detach())
+
+                # Reassemble chunked outputs for correct logging dimensions
+                if last_loss_out is not None:
+                    if all_pred_waypoints:
+                        last_loss_out.pred_waypoints = torch.cat(all_pred_waypoints, dim=0)
+                    if all_latents:
+                        last_loss_out.latents = torch.cat(all_latents, dim=0)
+                    
             else:
                 # teacher_only mode: inject dummy zero metrics for student losses
                 step_metrics["loss/student_total"] = 0.0
@@ -1206,7 +1286,13 @@ if __name__ == "__main__":
         think_end_token_id = tok.encode("</think>", add_special_tokens=False)[-1]
     
     answer_token_id = think_end_token_id
+    
+    im_end_token_id = tok.convert_tokens_to_ids("<|im_end|>")
+    if im_end_token_id is None or im_end_token_id == tok.unk_token_id:
+        im_end_token_id = 151645
+        
     logger.info(f"Dynamically fetched </think> token ID for distillation target: {answer_token_id}")
+    logger.info(f"Dynamically fetched <|im_end|> token ID: {im_end_token_id}")
 
     # ── Processor & Dataloader ─────────────────────────────────────────────
     dataloader = None
@@ -1248,4 +1334,5 @@ if __name__ == "__main__":
         reward_weights=reward_weights,
         resume_from=args.resume_from,
         answer_token_id=answer_token_id,
+        im_end_token_id=im_end_token_id,
     )
