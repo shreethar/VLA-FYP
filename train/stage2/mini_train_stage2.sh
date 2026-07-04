@@ -65,22 +65,23 @@ if [[ "$MODE" == "student" || "$MODE" == "all" ]]; then
     echo "------------------------------------------------------------"
     echo " PHASE B: STUDENT + VERBALIZER TRAINING"
     echo "------------------------------------------------------------"
+    mkdir -p "${OUTPUT_DIR}_student"
     # We run the student to train on the generated offline data.
     python3 training/train_stage2.py \
         --stage1_ckpt "$STAGE1_CKPT" \
-        --output_dir "$OUTPUT_DIR" \
-        --total_steps 600 \
-        --warmup_steps 400 \
-        --save_steps 20 \
-        --wandb_project "VLA-FYP" \
+        --output_dir "${OUTPUT_DIR}_student_2" \
+        --total_steps 620 \
+        --warmup_steps 415 \
+        --save_steps 50 \
+        --wandb_project "VLA-FYP-Student" \
         --wandb_run "stage2-mini-student" \
-        --batch_size 8 \
+        --batch_size 12 \
         --G 8 \
         --grad_accum_steps 4 \
         --log_steps 1 \
-        --max_seq_len 2048 \
+        --max_seq_len 2560 \
         --mode "student_offline" \
-        --offline_data_dir "$OFFLINE_DATA_DIR" 2>&1 | tee "$OUTPUT_DIR/student_log.txt"
+        --offline_data_dir "$OFFLINE_DATA_DIR" 2>&1 | tee "${OUTPUT_DIR}_student/student_log.txt"
 fi
 
 echo "============================================================"
