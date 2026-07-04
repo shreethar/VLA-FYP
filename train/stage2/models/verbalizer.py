@@ -407,9 +407,10 @@ class Verbalizer(nn.Module):
         attention_mask: torch.Tensor,
         latents: torch.Tensor,         # pass z.detach() during warm-up
         labels: torch.Tensor,          # -100 on prompt tokens, real ids on response
+        loss_weights: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """
-        Warm-up loss: cross-entropy on τ+ tokens.
+        Warm-up loss: cross-entropy on τ+ tokens with optional per-token weighting.
 
         The Verbalizer's CA blocks and LoRA learn to translate Student latents
         into high-quality reasoning text. Passing latents.detach() ensures
@@ -420,7 +421,24 @@ class Verbalizer(nn.Module):
         -------
         lm_loss : scalar
         """
-        _, loss = self._lm_forward(input_ids, attention_mask, latents, labels=labels)
+        logits, _ = self._lm_forward(input_ids, attention_mask, latents)
+        
+        # Shift logits and labels for next-token prediction
+        shift_logits = logits[..., :-1, :].contiguous()
+        shift_labels = labels[..., 1:].contiguous()
+        
+        loss_fct = nn.CrossEntropyLoss(reduction='none')
+        loss = loss_fct(shift_logits.view(-1, shift_logits.size(-1)), shift_labels.view(-1))
+        
+        # Apply token-specific weights if provided
+        if loss_weights is not None:
+            shift_weights = loss_weights[..., 1:].contiguous().view(-1)
+            loss = loss * shift_weights
+            
+        # Average over valid (non-padding) tokens
+        valid_tokens = (shift_labels != -100)
+        loss = loss.sum() / valid_tokens.sum().clamp(min=1.0)
+        
         return loss
 
     # -----------------------------------------------------------------------
