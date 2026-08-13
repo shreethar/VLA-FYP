@@ -231,9 +231,11 @@ def resolve_processor_geometry(processor, student) -> dict[str, Any]:
 
 
 def load_hf_split(repo: str, config: str, split: str):
-    from datasets import load_dataset
+    from datasets import Image as HFImage, load_dataset
 
-    return load_dataset(repo, config, split=split, streaming=True)
+    dataset = load_dataset(repo, config, split=split, streaming=True)
+    dataset = dataset.cast_column("primary", HFImage(decode=False))
+    return dataset.cast_column("wrist", HFImage(decode=False))
 
 
 def modality_details(
@@ -474,6 +476,11 @@ def main() -> None:
     parser.add_argument("--hf_repo", default=DEFAULT_HF_REPO)
     parser.add_argument("--hf_config", default=DEFAULT_HF_CONFIG)
     parser.add_argument("--split", default="train")
+    parser.add_argument(
+        "--data_partition",
+        choices=("train", "validation", "test"),
+        default="train",
+    )
     parser.add_argument("--sample_indices", type=parse_indices, default=[0])
     parser.add_argument(
         "--sample_ratio",
@@ -546,6 +553,7 @@ def main() -> None:
         max_length=args.max_seq_len,
         sample_ratio=args.sample_ratio,
         seed=args.seed,
+        data_partition=args.data_partition,
     )
 
     wanted = set(args.sample_indices)
@@ -582,6 +590,7 @@ def main() -> None:
         "hf_repo": args.hf_repo,
         "hf_config": args.hf_config,
         "sample_ratio": args.sample_ratio,
+        "data_partition": args.data_partition,
         "seed": args.seed,
         "device": str(device),
         "samples": reports,

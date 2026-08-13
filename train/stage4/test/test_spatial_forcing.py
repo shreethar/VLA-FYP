@@ -1,4 +1,5 @@
 import torch
+import torch.nn as nn
 from PIL import Image
 
 from train.stage4.losses import (
@@ -20,8 +21,11 @@ from train.stage4.stage4_dataloader import (
     MolmoActStage4Dataset,
     build_trajectory_prompt,
     extract_task_name,
+    is_sampled_fingerprint,
     parse_molmoact_annotation,
+    partition_for_fingerprint,
 )
+from train.stage4.train_stage4 import Stage4Config, _build_optimizer_groups
 
 
 def test_latent_preservation_is_zero_for_identical_states():
@@ -64,6 +68,8 @@ def test_spatial_alignment_is_tokenwise_and_differentiable():
     loss.backward()
     assert student.grad is not None
     assert torch.isfinite(student.grad).all()
+    assert isinstance(alignment.projector.input_norm, nn.BatchNorm1d)
+    assert int(alignment.projector.input_norm.num_batches_tracked.item()) == 1
 
 
 def test_spatial_alignment_uses_only_the_selected_planner_view():
@@ -195,7 +201,10 @@ def test_molmoact_students_get_primary_while_vggt_gets_both_views():
         "annotation": [[10, 20], [20, 30], [30, 40], [40, 50], [50, 60]],
     }
     dataset = MolmoActStage4Dataset(
-        [row], processor=processor, sample_ratio=1.0
+        [row],
+        processor=processor,
+        sample_ratio=1.0,
+        split_ratios=(1.0, 0.0, 0.0),
     )
     sample = next(iter(dataset))
 
@@ -206,3 +215,46 @@ def test_molmoact_students_get_primary_while_vggt_gets_both_views():
     assert sample["vggt_images"][0, 2].mean() < 0.01
     assert sample["vggt_images"][1, 2].mean() > 0.99
     assert sample["planner_view_index"] == 0
+
+
+def test_streaming_partitions_are_deterministic_disjoint_and_approximately_70_15_15():
+    fingerprints = [f"record-{index}" for index in range(10_000)]
+    assignments = [partition_for_fingerprint(value, seed=42) for value in fingerprints]
+    assert assignments == [
+        partition_for_fingerprint(value, seed=42) for value in fingerprints
+    ]
+    counts = {name: assignments.count(name) for name in ("train", "validation", "test")}
+    assert 0.68 <= counts["train"] / len(assignments) <= 0.72
+    assert 0.13 <= counts["validation"] / len(assignments) <= 0.17
+    assert 0.13 <= counts["test"] / len(assignments) <= 0.17
+    assert partition_for_fingerprint("exact-duplicate") == partition_for_fingerprint(
+        "exact-duplicate"
+    )
+    assert is_sampled_fingerprint("row", 1.0)
+
+
+def test_optimizer_uses_requested_layer_dependent_groups():
+    class FakeStudent(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.language_model = nn.Module()
+            self.language_model.layers = nn.ModuleList(
+                [nn.Linear(1, 1, bias=False) for _ in range(32)]
+            )
+            self.spatial_mlp = nn.Linear(1, 2)
+            self.spatial_tokens = nn.Parameter(
+                torch.zeros(5, 1), requires_grad=False
+            )
+
+    config = Stage4Config()
+    projector = nn.Linear(1, 1)
+    optimizer_groups, grouped = _build_optimizer_groups(
+        FakeStudent(), projector, config
+    )
+    by_name = {group["group_name"]: group for group in optimizer_groups}
+    assert len(grouped["qwen_layers_0_7"]) == 8
+    assert len(grouped["qwen_layers_8_31"]) == 24
+    assert by_name["qwen_layers_0_7"]["lr"] == 1e-5
+    assert by_name["qwen_layers_8_31"]["lr"] == 1e-6
+    assert by_name["waypoint_head"]["lr"] == 1e-5
+    assert by_name["sf_projector"]["lr"] == 1e-4

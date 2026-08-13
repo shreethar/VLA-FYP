@@ -5,10 +5,10 @@ Each selected sample has two deliberately different visual paths:
 * the reference and trainable latent students receive only ``primary``;
 * frozen VGGT jointly receives ``[primary, wrist]`` in that order.
 
-The dataset is streamed because the full MolmoAct mixture is very large.  Rows
-are first validated (task, two images, and five waypoints), then retained by a
-seeded Bernoulli sample.  Thus ``sample_ratio=0.1`` is a reproducible random
-approximately-10% sample of usable rows without materialising the dataset.
+The dataset is streamed because the full MolmoAct mixture is very large. Rows
+are first validated, then content-hashed for reproducible 10% sampling and a
+leakage-resistant 70/15/15 train/validation/test partition. No full local copy
+or preliminary counting pass is required.
 """
 
 from __future__ import annotations
@@ -17,7 +17,6 @@ import ast
 import hashlib
 import io
 import logging
-import random
 import re
 from typing import Any, Iterable, Iterator, List, Optional
 
@@ -36,6 +35,8 @@ VGGT_IMAGE_SIZE = 518
 K_WAYPOINTS = 5
 ANNOTATION_MIN = 1.0
 ANNOTATION_MAX = 256.0
+PARTITIONS = ("train", "validation", "test")
+DEFAULT_SPLIT_RATIOS = (0.70, 0.15, 0.15)
 
 TRAJECTORY_PROMPT = (
     "You are a robot manipulation assistant. Given an observation image and a "
@@ -157,7 +158,92 @@ def parse_molmoact_annotation(annotation: Any) -> Optional[torch.Tensor]:
     return (waypoints - ANNOTATION_MIN) / (ANNOTATION_MAX - ANNOTATION_MIN)
 
 
-def _sharded_rows(rows: Iterable[dict], seed: int) -> tuple[Iterable[dict], random.Random]:
+def _update_hash_with_image(hasher, value: Any) -> None:
+    """Hash image content without depending on cache paths or worker ordering."""
+    if isinstance(value, dict):
+        if value.get("bytes") is not None:
+            hasher.update(value["bytes"])
+            return
+        if value.get("path"):
+            with open(value["path"], "rb") as image_file:
+                for chunk in iter(lambda: image_file.read(1024 * 1024), b""):
+                    hasher.update(chunk)
+            return
+    if isinstance(value, Image.Image):
+        hasher.update(f"{value.mode}:{value.size}".encode("utf-8"))
+        hasher.update(value.tobytes())
+        return
+    if isinstance(value, np.ndarray):
+        hasher.update(f"{value.dtype}:{value.shape}".encode("utf-8"))
+        hasher.update(value.tobytes())
+        return
+    if isinstance(value, bytes):
+        hasher.update(value)
+        return
+    if isinstance(value, str):
+        with open(value, "rb") as image_file:
+            for chunk in iter(lambda: image_file.read(1024 * 1024), b""):
+                hasher.update(chunk)
+        return
+    raise TypeError(f"Unsupported image value for fingerprint: {type(value).__name__}")
+
+
+def molmoact_row_fingerprint(row: dict, task_name: str) -> str:
+    """Stable content ID used for sampling, partitioning, and logging.
+
+    The planner image is included so repeated task/trajectory annotations on
+    different observations remain distinct. Exact duplicates intentionally get
+    the same ID and therefore cannot leak across dataset partitions.
+    """
+    explicit_id = row.get("id", row.get("uuid"))
+    hasher = hashlib.blake2b(digest_size=16, person=b"stage4-row-v1")
+    if explicit_id is not None:
+        hasher.update(f"id:{explicit_id}".encode("utf-8"))
+    else:
+        hasher.update(task_name.encode("utf-8"))
+        hasher.update(repr(row.get("annotation")).encode("utf-8"))
+        _update_hash_with_image(hasher, row["primary"])
+    return hasher.hexdigest()
+
+
+def _hash_fraction(fingerprint: str, seed: int, purpose: str) -> float:
+    digest = hashlib.blake2b(
+        f"{seed}:{purpose}:{fingerprint}".encode("utf-8"),
+        digest_size=8,
+        person=b"stage4-split",
+    ).digest()
+    return int.from_bytes(digest, "big") / 2**64
+
+
+def partition_for_fingerprint(
+    fingerprint: str,
+    seed: int = 42,
+    split_ratios: tuple[float, float, float] = DEFAULT_SPLIT_RATIOS,
+) -> str:
+    """Assign a stable content fingerprint to train/validation/test."""
+    if len(split_ratios) != 3 or any(ratio < 0.0 for ratio in split_ratios):
+        raise ValueError("split_ratios must contain three non-negative values")
+    if not np.isclose(sum(split_ratios), 1.0):
+        raise ValueError("split_ratios must sum to 1.0")
+    value = _hash_fraction(fingerprint, seed, "partition")
+    if value < split_ratios[0]:
+        return "train"
+    if value < split_ratios[0] + split_ratios[1]:
+        return "validation"
+    return "test"
+
+
+def is_sampled_fingerprint(
+    fingerprint: str,
+    sample_ratio: float,
+    seed: int = 42,
+) -> bool:
+    return sample_ratio >= 1.0 or (
+        _hash_fraction(fingerprint, seed, "sample") < sample_ratio
+    )
+
+
+def _sharded_rows(rows: Iterable[dict]) -> Iterable[dict]:
     """Shard an HF iterable across distributed ranks and DataLoader workers."""
     worker = get_worker_info()
     workers = worker.num_workers if worker is not None else 1
@@ -183,7 +269,7 @@ def _sharded_rows(rows: Iterable[dict], seed: int) -> tuple[Iterable[dict], rand
         rows = (
             row for index, row in enumerate(rows) if index % shard_count == shard_index
         )
-    return rows, random.Random(seed + 1_000_003 * shard_index)
+    return rows
 
 
 class MolmoActStage4Dataset(IterableDataset):
@@ -196,25 +282,34 @@ class MolmoActStage4Dataset(IterableDataset):
         max_length: int = 1024,
         sample_ratio: float = 0.1,
         seed: int = 42,
+        data_partition: str = "train",
+        split_ratios: tuple[float, float, float] = DEFAULT_SPLIT_RATIOS,
     ) -> None:
         super().__init__()
         if not 0.0 < sample_ratio <= 1.0:
             raise ValueError("sample_ratio must be in (0,1]")
+        if data_partition not in PARTITIONS:
+            raise ValueError(f"data_partition must be one of {PARTITIONS}")
+        # Validate once at construction rather than on every row.
+        partition_for_fingerprint("validation", seed, split_ratios)
         self.hf_split = hf_split
         self.processor = processor
         self.max_length = max_length
         self.sample_ratio = sample_ratio
         self.seed = seed
+        self.data_partition = data_partition
+        self.split_ratios = split_ratios
 
-    def _convert_row(self, row: dict, row_index: int) -> Optional[dict]:
+    def _convert_row(
+        self,
+        row: dict,
+        row_index: int,
+        task_name: str,
+        fingerprint: str,
+    ) -> Optional[dict]:
         waypoints = parse_molmoact_annotation(row.get("annotation"))
         if waypoints is None:
             return None
-        conversation = row.get("conversations", row.get("conversation"))
-        task_name = extract_task_name(conversation)
-        if task_name is None:
-            return None
-
         # Official schema is ``wrist``; tolerate the typo used in early notes.
         wrist_value = row.get("wrist", row.get("wrirst"))
         if row.get("primary") is None or wrist_value is None:
@@ -248,13 +343,6 @@ class MolmoActStage4Dataset(IterableDataset):
             max_length=self.max_length,
             padding=False,
         )
-        sample_id = row.get("id", row.get("uuid"))
-        if sample_id is None:
-            fingerprint = hashlib.blake2b(
-                f"{task_name}|{row.get('annotation')}".encode("utf-8"),
-                digest_size=8,
-            ).hexdigest()
-            sample_id = f"molmoact_{fingerprint}"
         return {
             "input_ids": inputs["input_ids"].squeeze(0),
             "attention_mask": inputs["attention_mask"].squeeze(0),
@@ -266,7 +354,8 @@ class MolmoActStage4Dataset(IterableDataset):
             "task_type": "trajectory",
             "qa_answer": None,
             "dataset": DEFAULT_HF_CONFIG,
-            "sample_id": sample_id,
+            "data_partition": self.data_partition,
+            "sample_id": f"molmoact_{fingerprint}",
             "task_name": task_name,
             # View order is part of the training contract: 0=planner, 1=context.
             "vggt_images": torch.stack(
@@ -277,19 +366,29 @@ class MolmoActStage4Dataset(IterableDataset):
         }
 
     def __iter__(self) -> Iterator[dict]:
-        rows, rng = _sharded_rows(self.hf_split, self.seed)
+        rows = _sharded_rows(self.hf_split)
         for row_index, row in enumerate(rows):
             # Validate cheap fields before sampling and image preprocessing.
             if parse_molmoact_annotation(row.get("annotation")) is None:
                 continue
             conversation = row.get("conversations", row.get("conversation"))
-            if extract_task_name(conversation) is None:
+            task_name = extract_task_name(conversation)
+            if task_name is None:
                 continue
             if row.get("primary") is None or row.get("wrist", row.get("wrirst")) is None:
                 continue
-            if self.sample_ratio < 1.0 and rng.random() >= self.sample_ratio:
+            try:
+                fingerprint = molmoact_row_fingerprint(row, task_name)
+            except (OSError, TypeError, ValueError):
+                logger.warning("Skipping row %d that cannot be fingerprinted", row_index)
                 continue
-            sample = self._convert_row(row, row_index)
+            if not is_sampled_fingerprint(fingerprint, self.sample_ratio, self.seed):
+                continue
+            if partition_for_fingerprint(
+                fingerprint, self.seed, self.split_ratios
+            ) != self.data_partition:
+                continue
+            sample = self._convert_row(row, row_index, task_name, fingerprint)
             if sample is not None:
                 yield sample
 
@@ -313,6 +412,7 @@ def collate_stage4_batch(samples: List[dict]) -> dict:
     batch["vggt_view_mask"] = torch.ones(len(samples), 2, dtype=torch.bool)
     batch["planner_view_indices"] = torch.zeros(len(samples), dtype=torch.long)
     batch["task_names"] = [sample["task_name"] for sample in samples]
+    batch["data_partitions"] = [sample["data_partition"] for sample in samples]
     batch["original_frame_sizes"] = [
         sample["original_frame_sizes"] for sample in samples
     ]
@@ -324,15 +424,19 @@ def build_stage4_dataloader(
     hf_repo: str = DEFAULT_HF_REPO,
     hf_config: str = DEFAULT_HF_CONFIG,
     split: str = "train",
-    batch_size: int = 1,
+    data_partition: str = "train",
+    split_ratios: tuple[float, float, float] = DEFAULT_SPLIT_RATIOS,
+    batch_size: int = 16,
     num_workers: int = 2,
     max_length: int = 1024,
     sample_ratio: float = 0.1,
     seed: int = 42,
     hf_split=None,
+    drop_last: Optional[bool] = None,
 ) -> DataLoader:
     if hf_split is None:
         from datasets import load_dataset
+        from datasets import Image as HFImage
 
         hf_split = load_dataset(
             hf_repo,
@@ -340,6 +444,9 @@ def build_stage4_dataloader(
             split=split,
             streaming=True,
         )
+        # Preserve compressed image bytes until the selected row is decoded.
+        hf_split = hf_split.cast_column("primary", HFImage(decode=False))
+        hf_split = hf_split.cast_column("wrist", HFImage(decode=False))
 
     dataset = MolmoActStage4Dataset(
         hf_split,
@@ -347,7 +454,11 @@ def build_stage4_dataloader(
         max_length=max_length,
         sample_ratio=sample_ratio,
         seed=seed,
+        data_partition=data_partition,
+        split_ratios=split_ratios,
     )
+    if drop_last is None:
+        drop_last = data_partition == "train"
     return DataLoader(
         dataset,
         batch_size=batch_size,
@@ -355,6 +466,18 @@ def build_stage4_dataloader(
         num_workers=num_workers,
         collate_fn=collate_stage4_batch,
         pin_memory=torch.cuda.is_available(),
-        drop_last=True,
+        drop_last=drop_last,
         persistent_workers=num_workers > 0,
     )
+
+
+def build_stage4_partition_dataloaders(**kwargs) -> dict[str, DataLoader]:
+    """Build independent streaming loaders for the fixed 70/15/15 partitions."""
+    return {
+        partition: build_stage4_dataloader(
+            data_partition=partition,
+            drop_last=partition == "train",
+            **kwargs,
+        )
+        for partition in PARTITIONS
+    }

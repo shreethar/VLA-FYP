@@ -16,6 +16,7 @@ from __future__ import annotations
 import argparse
 import logging
 import math
+import re
 import sys
 from contextlib import nullcontext
 from dataclasses import dataclass
@@ -61,9 +62,13 @@ class Stage4Config:
     processor_name: Optional[str] = None
     vggt_checkpoint: str = "facebook/VGGT-1B"
     split: str = "train"
+    data_partition: str = "train"
+    train_ratio: float = 0.70
+    validation_ratio: float = 0.15
+    test_ratio: float = 0.15
     sample_ratio: float = 0.1
     max_seq_len: int = 1024
-    batch_size: int = 1
+    batch_size: int = 16
     num_workers: int = 2
     M: int = 6
     K: int = 5
@@ -72,17 +77,21 @@ class Stage4Config:
     alpha: float = 1.0
     beta: float = 1.0
     gamma: float = 0.5
-    student_lr: float = 1e-5
+    qwen_layers_0_7_lr: float = 1e-5
+    qwen_layers_8_31_lr: float = 1e-6
+    waypoint_head_lr: float = 1e-5
     projector_lr: float = 1e-4
+    adam_beta1: float = 0.9
+    adam_beta2: float = 0.95
     weight_decay: float = 0.01
-    warmup_steps: int = 100
-    max_steps: int = 5000
+    warmup_steps: int = 500
+    max_steps: int = 10000
     gradient_accumulation_steps: int = 1
     grad_clip: float = 1.0
     save_steps: int = 500
     log_steps: int = 10
     seed: int = 42
-    use_input_norm: bool = False
+    projector_normalization: str = "batchnorm"
     use_vggt_position_embedding: bool = False
 
 
@@ -158,6 +167,68 @@ def _resolve_qwen_spatial_merge_size(student) -> int:
     )
 
 
+_QWEN_LAYER_RE = re.compile(
+    r"(?:^|\.)(?:language_model|text_model)\.layers\.(\d+)(?:\.|$)"
+)
+
+
+def _build_optimizer_groups(student, spatial_alignment, config: Stage4Config):
+    """Create strict, non-overlapping parameter groups for the requested LRs."""
+    grouped: dict[str, list[torch.nn.Parameter]] = {
+        "qwen_layers_0_7": [],
+        "qwen_layers_8_31": [],
+        "waypoint_head": [],
+        "sf_projector": list(spatial_alignment.parameters()),
+    }
+    unclassified: list[str] = []
+
+    for name, parameter in student.named_parameters():
+        if not parameter.requires_grad:
+            continue
+        if name == "spatial_tokens":
+            raise RuntimeError("Spatial-token embeddings unexpectedly require gradients")
+        if name.startswith("spatial_mlp."):
+            grouped["waypoint_head"].append(parameter)
+            continue
+        match = _QWEN_LAYER_RE.search(name)
+        if match is None:
+            unclassified.append(name)
+            continue
+        layer_index = int(match.group(1))
+        if not 0 <= layer_index < 32:
+            unclassified.append(name)
+        elif layer_index <= 7:
+            grouped["qwen_layers_0_7"].append(parameter)
+        else:
+            grouped["qwen_layers_8_31"].append(parameter)
+
+    if unclassified:
+        preview = "\n  ".join(unclassified[:20])
+        raise RuntimeError(
+            "Trainable student parameters do not match the requested Qwen-layer/"
+            f"waypoint-head LR policy:\n  {preview}"
+        )
+    empty = [name for name, parameters in grouped.items() if not parameters]
+    if empty:
+        raise RuntimeError(f"Optimizer parameter groups are empty: {empty}")
+
+    learning_rates = {
+        "qwen_layers_0_7": config.qwen_layers_0_7_lr,
+        "qwen_layers_8_31": config.qwen_layers_8_31_lr,
+        "waypoint_head": config.waypoint_head_lr,
+        "sf_projector": config.projector_lr,
+    }
+    optimizer_groups = [
+        {
+            "params": parameters,
+            "lr": learning_rates[name],
+            "group_name": name,
+        }
+        for name, parameters in grouped.items()
+    ]
+    return optimizer_groups, grouped
+
+
 def _validate_config(config: Stage4Config) -> None:
     if config.M != 6:
         raise ValueError("This Stage 4 recipe requires the checkpoint's six latent slots")
@@ -165,6 +236,21 @@ def _validate_config(config: Stage4Config) -> None:
         raise ValueError("MolmoAct Stage 4 requires exactly five spatial slots")
     if not 0.0 < config.sample_ratio <= 1.0:
         raise ValueError("sample_ratio must be in (0,1]")
+    split_ratios = (
+        config.train_ratio,
+        config.validation_ratio,
+        config.test_ratio,
+    )
+    if any(ratio < 0.0 for ratio in split_ratios) or not math.isclose(
+        sum(split_ratios), 1.0, rel_tol=0.0, abs_tol=1e-9
+    ):
+        raise ValueError("train/validation/test ratios must be non-negative and sum to 1")
+    if config.data_partition not in {"train", "validation", "test"}:
+        raise ValueError("data_partition must be train, validation, or test")
+    if config.projector_normalization != "batchnorm":
+        raise ValueError("This recipe requires projector_normalization=batchnorm")
+    if not 0.0 <= config.adam_beta1 < 1.0 or not 0.0 <= config.adam_beta2 < 1.0:
+        raise ValueError("AdamW beta values must be in [0,1)")
     if config.gradient_accumulation_steps < 1:
         raise ValueError("gradient_accumulation_steps must be positive")
 
@@ -226,24 +312,22 @@ def train(config: Stage4Config, dataloader=None) -> None:
     spatial_alignment = SpatialForcingAlignment(
         student_dim=student.hidden_dim,
         vggt_dim=vggt.output_dim,
-        use_input_norm=config.use_input_norm,
+        normalization=config.projector_normalization,
         use_vggt_position_embedding=config.use_vggt_position_embedding,
     ).to(device)
     qwen_spatial_merge_size = _resolve_qwen_spatial_merge_size(student)
 
-    student_parameters = [
-        parameter for parameter in student.parameters() if parameter.requires_grad
-    ]
-    if not student_parameters:
-        raise RuntimeError("The trainable student has no trainable parameters")
+    optimizer_groups, grouped_parameters = _build_optimizer_groups(
+        student, spatial_alignment, config
+    )
+    student_parameters = (
+        grouped_parameters["qwen_layers_0_7"]
+        + grouped_parameters["qwen_layers_8_31"]
+        + grouped_parameters["waypoint_head"]
+    )
     optimizer = torch.optim.AdamW(
-        [
-            {"params": student_parameters, "lr": config.student_lr},
-            {
-                "params": spatial_alignment.parameters(),
-                "lr": config.projector_lr,
-            },
-        ],
+        optimizer_groups,
+        betas=(config.adam_beta1, config.adam_beta2),
         weight_decay=config.weight_decay,
     )
     scheduler = _build_scheduler(
@@ -271,6 +355,12 @@ def train(config: Stage4Config, dataloader=None) -> None:
             hf_repo=config.hf_repo,
             hf_config=config.hf_config,
             split=config.split,
+            data_partition=config.data_partition,
+            split_ratios=(
+                config.train_ratio,
+                config.validation_ratio,
+                config.test_ratio,
+            ),
             batch_size=config.batch_size,
             num_workers=config.num_workers,
             max_length=config.max_seq_len,
@@ -279,9 +369,12 @@ def train(config: Stage4Config, dataloader=None) -> None:
         )
 
     logger.info(
-        "Trainable parameters: student=%s projector=%s; spatial slots frozen=%s",
-        f"{sum(p.numel() for p in student_parameters):,}",
-        f"{sum(p.numel() for p in spatial_alignment.parameters()):,}",
+        "Trainable parameters: qwen[0:7]=%s qwen[8:31]=%s waypoint=%s "
+        "projector=%s; spatial slots frozen=%s",
+        f"{sum(p.numel() for p in grouped_parameters['qwen_layers_0_7']):,}",
+        f"{sum(p.numel() for p in grouped_parameters['qwen_layers_8_31']):,}",
+        f"{sum(p.numel() for p in grouped_parameters['waypoint_head']):,}",
+        f"{sum(p.numel() for p in grouped_parameters['sf_projector']):,}",
         not student.spatial_tokens.requires_grad,
     )
     logger.info(
@@ -293,11 +386,29 @@ def train(config: Stage4Config, dataloader=None) -> None:
         config.vggt_layer,
     )
     logger.info(
-        "Dataset: %s[%s], valid-row sample ratio=%g; Qwen spatial merge=%d",
+        "Dataset: %s[%s] streaming partition=%s ratios=%g/%g/%g, "
+        "valid-row sample ratio=%g; Qwen spatial merge=%d",
         config.hf_repo,
         config.hf_config,
+        config.data_partition,
+        config.train_ratio,
+        config.validation_ratio,
+        config.test_ratio,
         config.sample_ratio,
         qwen_spatial_merge_size,
+    )
+    logger.info(
+        "AdamW betas=(%g,%g) weight_decay=%g; LRs qwen[0:7]=%g "
+        "qwen[8:31]=%g waypoint=%g projector=%g; cosine warmup=%d/%d",
+        config.adam_beta1,
+        config.adam_beta2,
+        config.weight_decay,
+        config.qwen_layers_0_7_lr,
+        config.qwen_layers_8_31_lr,
+        config.waypoint_head_lr,
+        config.projector_lr,
+        config.warmup_steps,
+        config.max_steps,
     )
 
     reference.eval()
@@ -406,16 +517,22 @@ def train(config: Stage4Config, dataloader=None) -> None:
         if step % config.log_steps == 0 or step == start_step + 1:
             denom = config.gradient_accumulation_steps
             metrics = {key: value / denom for key, value in metric_sums.items()}
+            current_lrs = {
+                group["group_name"]: group["lr"] for group in optimizer.param_groups
+            }
             logger.info(
                 "step=%d total=%.6f latent=%.6f waypoint=%.6f sf=%.6f "
-                "sf_cos=%.6f lr=%.3e",
+                "sf_cos=%.6f lr_q0_7=%.3e lr_q8_31=%.3e lr_wp=%.3e lr_sf=%.3e",
                 step,
                 metrics["loss/total"],
                 metrics["loss/latent"],
                 metrics["loss/waypoint"],
                 metrics["loss/spatial_forcing"],
                 metrics["spatial/cosine"],
-                optimizer.param_groups[0]["lr"],
+                current_lrs["qwen_layers_0_7"],
+                current_lrs["qwen_layers_8_31"],
+                current_lrs["waypoint_head"],
+                current_lrs["sf_projector"],
             )
 
         if step % config.save_steps == 0:
@@ -456,13 +573,21 @@ def parse_args() -> Stage4Config:
     parser.add_argument("--hf_repo", default=DEFAULT_HF_REPO)
     parser.add_argument("--hf_config", default=DEFAULT_HF_CONFIG)
     parser.add_argument("--split", default="train")
+    parser.add_argument(
+        "--data_partition",
+        choices=("train", "validation", "test"),
+        default="train",
+    )
+    parser.add_argument("--train_ratio", type=float, default=0.70)
+    parser.add_argument("--validation_ratio", type=float, default=0.15)
+    parser.add_argument("--test_ratio", type=float, default=0.15)
     parser.add_argument("--output_dir", default="checkpoints/stage4")
     parser.add_argument("--vggt_checkpoint", default="facebook/VGGT-1B")
     parser.add_argument(
         "--sample_ratio", "--subset_ratio", dest="sample_ratio", type=float, default=0.1
     )
     parser.add_argument("--max_seq_len", type=int, default=1024)
-    parser.add_argument("--batch_size", type=int, default=1)
+    parser.add_argument("--batch_size", type=int, default=16)
     parser.add_argument("--num_workers", type=int, default=2)
     parser.add_argument("--M", type=int, default=6)
     parser.add_argument("--K", type=int, default=5)
@@ -471,17 +596,25 @@ def parse_args() -> Stage4Config:
     parser.add_argument("--alpha", type=float, default=1.0)
     parser.add_argument("--beta", type=float, default=1.0)
     parser.add_argument("--gamma", type=float, default=0.5)
-    parser.add_argument("--student_lr", type=float, default=1e-5)
+    parser.add_argument("--qwen_layers_0_7_lr", type=float, default=1e-5)
+    parser.add_argument("--qwen_layers_8_31_lr", type=float, default=1e-6)
+    parser.add_argument("--waypoint_head_lr", type=float, default=1e-5)
     parser.add_argument("--projector_lr", type=float, default=1e-4)
+    parser.add_argument("--adam_beta1", type=float, default=0.9)
+    parser.add_argument("--adam_beta2", type=float, default=0.95)
     parser.add_argument("--weight_decay", type=float, default=0.01)
-    parser.add_argument("--warmup_steps", type=int, default=100)
-    parser.add_argument("--max_steps", type=int, default=5000)
+    parser.add_argument("--warmup_steps", type=int, default=500)
+    parser.add_argument("--max_steps", type=int, default=10000)
     parser.add_argument("--gradient_accumulation_steps", type=int, default=1)
     parser.add_argument("--grad_clip", type=float, default=1.0)
     parser.add_argument("--save_steps", type=int, default=500)
     parser.add_argument("--log_steps", type=int, default=10)
     parser.add_argument("--seed", type=int, default=42)
-    parser.add_argument("--use_input_norm", action="store_true")
+    parser.add_argument(
+        "--projector_normalization",
+        choices=("batchnorm",),
+        default="batchnorm",
+    )
     parser.add_argument("--use_vggt_position_embedding", action="store_true")
     args = parser.parse_args()
     return Stage4Config(**vars(args))

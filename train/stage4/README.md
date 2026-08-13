@@ -46,13 +46,19 @@ streaming mode. Rows are processed in this order:
 1. reject null/malformed annotations and annotations with fewer than five pairs;
 2. reject rows without both `primary` and `wrist` images;
 3. extract only the task name from the first human `The task is ...` sentence;
-4. retain each valid row with probability `--sample_ratio` (default `0.1`);
-5. normalize the first five coordinates from `[1,256]` to `[0,1]` using
+4. content-hash the task, annotation, and primary image;
+5. retain approximately 10% by a seeded hash threshold;
+6. assign retained rows by a second hash to train/validation/test with
+   probabilities 70%/15%/15%;
+7. normalize the first five coordinates from `[1,256]` to `[0,1]` using
    `(coordinate - 1) / 255`.
 
-Sampling is seeded and reproducible for a fixed worker/distributed setup. It is
-a Bernoulli sample of approximately 10% of usable rows; computing an exact 10%
-would require a full counting pass over this very large dataset.
+Sampling and partition membership are stable across worker counts and runs.
+Exact duplicate planner samples receive the same fingerprint, so they cannot
+leak between partitions. Both the 10% sample and 70/15/15 proportions are
+approximate: exact counts would require a full preliminary scan/materialization.
+The default training stream therefore contains approximately 7% of all usable
+rows; validation and test each contain approximately 1.5%.
 
 The students receive only the resized `primary` image. VGGT receives exactly
 `[primary, wrist]` jointly and must return `[B,2,N,D]`; only `features[:,0]` is
@@ -63,6 +69,30 @@ Qwen/VGGT correspondence is metadata-driven. Qwen's target height and width are
 read from `image_grid_thw` and divided by its actual `spatial_merge_size`. The
 single VGGT primary-view patch map is then bilinearly resized to that explicit
 grid. Token-count factorization is not used by training.
+
+The SF projector applies `BatchNorm1d` to the concatenated valid visual tokens
+from the complete optimizer batch, followed by `Linear -> GELU -> Linear` and
+tokenwise cosine alignment.
+
+## Optimization recipe
+
+The trainable Qwen parameters are LoRA adapters and are separated by decoder
+layer. Unrecognized trainable parameters abort startup rather than receiving an
+accidental learning rate.
+
+```text
+optimizer                         AdamW
+betas                             (0.9, 0.95)
+weight decay                      0.01
+Qwen decoder layers 0-7           1e-5
+Qwen decoder layers 8-31          1e-6
+waypoint head (SpatialMLP)         1e-5
+SF projector + BatchNorm           1e-4
+five learned spatial embeddings    frozen
+scheduler                          cosine decay
+warmup                             500 / 10,000 steps (5%)
+optimizer batch size               16
+```
 
 ## Checkpoint formats
 
@@ -81,9 +111,7 @@ random spatial slots.
 
 ```bash
 python train/stage4/train_stage4.py \
-  --output_dir checkpoints/stage4 \
-  --batch_size 1 \
-  --max_steps 5000
+  --output_dir checkpoints/stage4
 ```
 
 This uses the requested defaults:
@@ -93,8 +121,10 @@ checkpoint    shreethar/LatentStudent-ckpt-400
 dataset       allenai/MolmoAct-Midtraining-Mixture
 config        molmoact_tabletop_primary
 sample ratio  0.1 after validation
+partitions     70/15/15 streaming hash split (training selects train)
 layers        Qwen 8 / VGGT 8 (zero-based)
 loss weights  alpha=1.0, beta=1.0, gamma=0.5
+steps/batch    10000 / 16
 ```
 
 To resume, retain the original Stage 2 checkpoint as

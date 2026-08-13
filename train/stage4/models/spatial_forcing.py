@@ -25,16 +25,26 @@ import torch.nn.functional as F
 
 
 class AlignmentProjector(nn.Module):
-    """Two-layer projector matching the official Spatial-Forcing design."""
+    """Normalization followed by the two-layer Spatial-Forcing MLP."""
 
     def __init__(
         self,
         student_dim: int,
         target_dim: int,
-        use_input_norm: bool = False,
+        normalization: str = "batchnorm",
     ) -> None:
         super().__init__()
-        self.input_norm = nn.LayerNorm(student_dim) if use_input_norm else nn.Identity()
+        if normalization == "batchnorm":
+            self.input_norm = nn.BatchNorm1d(student_dim)
+        elif normalization == "layernorm":
+            self.input_norm = nn.LayerNorm(student_dim)
+        elif normalization == "none":
+            self.input_norm = nn.Identity()
+        else:
+            raise ValueError(
+                "normalization must be one of: batchnorm, layernorm, none"
+            )
+        self.normalization = normalization
         self.fc1 = nn.Linear(student_dim, target_dim, bias=True)
         self.fc2 = nn.Linear(target_dim, target_dim, bias=True)
         self.activation = nn.GELU()
@@ -257,14 +267,14 @@ class SpatialForcingAlignment(nn.Module):
         self,
         student_dim: int,
         vggt_dim: int,
-        use_input_norm: bool = False,
+        normalization: str = "batchnorm",
         use_vggt_position_embedding: bool = False,
     ) -> None:
         super().__init__()
         self.projector = AlignmentProjector(
             student_dim=student_dim,
             target_dim=vggt_dim,
-            use_input_norm=use_input_norm,
+            normalization=normalization,
         )
         self.use_vggt_position_embedding = use_vggt_position_embedding
 
@@ -342,7 +352,8 @@ class SpatialForcingAlignment(nn.Module):
         if planner_view_indices.shape != (student_visual.shape[0],):
             raise ValueError("planner_view_indices must have shape [B]")
 
-        sample_similarities: List[torch.Tensor] = []
+        valid_students: List[torch.Tensor] = []
+        target_resampled_per_sample: List[torch.Tensor] = []
         for batch_idx, target in enumerate(vggt_features.features):
             valid_student = student_visual[batch_idx, student_visual_mask[batch_idx]]
             if valid_student.shape[0] == 0:
@@ -373,13 +384,27 @@ class SpatialForcingAlignment(nn.Module):
                     f"layer={valid_student.shape[0]}, grid={merged_grid} "
                     f"({expected_tokens} tokens)"
                 )
-            projected = self.projector(valid_student.float())
             target_resampled = self._resample_target(
                 target[planner_view].detach(),
                 vggt_features.patch_grid,
                 merged_grid,
                 vggt_patch_size,
             )
+            valid_students.append(valid_student)
+            target_resampled_per_sample.append(target_resampled)
+
+        # Project once so BatchNorm observes all visual tokens in the optimizer
+        # batch and updates its running statistics once per training step.
+        token_counts = [tokens.shape[0] for tokens in valid_students]
+        projected_batch = self.projector(
+            torch.cat(valid_students, dim=0).float()
+        )
+        projected_per_sample = projected_batch.split(token_counts, dim=0)
+
+        sample_similarities: List[torch.Tensor] = []
+        for projected, target_resampled in zip(
+            projected_per_sample, target_resampled_per_sample
+        ):
             cosine = F.cosine_similarity(
                 projected,
                 target_resampled.to(projected.device, dtype=projected.dtype),
