@@ -458,6 +458,7 @@ def build_stage4_dataloader(
     sample_ratio: float = 0.1,
     seed: int = 42,
     materialized_data_dir: Optional[str] = None,
+    allow_incomplete_materialized: bool = False,
     hf_split=None,
     drop_last: Optional[bool] = None,
 ) -> DataLoader:
@@ -471,21 +472,42 @@ def build_stage4_dataloader(
         if materialized_data_dir is not None:
             data_root = Path(materialized_data_dir).expanduser().resolve()
             manifest_path = data_root / "manifest.json"
-            if not manifest_path.is_file():
-                raise FileNotFoundError(
-                    f"Completed materialized manifest not found: {manifest_path}"
+            if manifest_path.is_file():
+                manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+                _validate_materialized_manifest(
+                    manifest,
+                    sample_ratio=sample_ratio,
+                    seed=seed,
+                    split_ratios=split_ratios,
                 )
-            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-            _validate_materialized_manifest(
-                manifest,
-                sample_ratio=sample_ratio,
-                seed=seed,
-                split_ratios=split_ratios,
-            )
+            elif not allow_incomplete_materialized:
+                raise FileNotFoundError(
+                    f"Completed materialized manifest not found: {manifest_path}. "
+                    "Pass allow_incomplete_materialized=True only if you "
+                    "intentionally want to train from completed shards of an "
+                    "interrupted materialization."
+                )
             parquet_files = sorted((data_root / data_partition).glob("*.parquet"))
             if not parquet_files:
                 raise FileNotFoundError(
                     f"No Parquet shards found for {data_partition}: {data_root}"
+                )
+            if not manifest_path.is_file():
+                row_count = _validate_incomplete_parquet_shards(
+                    parquet_files, expected_partition=data_partition
+                )
+                ignored_temporary_files = len(
+                    list((data_root / data_partition).glob("*.tmp"))
+                )
+                logger.warning(
+                    "INCOMPLETE DATASET OPT-IN: training from %d validated "
+                    "completed %s shards (%d rows) in %s. The source scan did "
+                    "not finish; %d temporary files are ignored.",
+                    len(parquet_files),
+                    data_partition,
+                    row_count,
+                    data_root,
+                    ignored_temporary_files,
                 )
             # ``streaming=True`` here means streaming from local Parquet only;
             # unlike the remote path, it performs no HTTP GET requests.
@@ -576,6 +598,44 @@ def _validate_materialized_manifest(
             "Materialized split ratios do not match training: "
             f"{saved_ratios} != {split_ratios}"
         )
+
+
+def _validate_incomplete_parquet_shards(
+    parquet_files: list[Path],
+    *,
+    expected_partition: str,
+) -> int:
+    """Read every footer before accepting shards from an interrupted scan."""
+    import pyarrow.parquet as pq
+
+    required_columns = {
+        "fingerprint",
+        "task_name",
+        "annotation",
+        "primary",
+        "wrist",
+        "data_partition",
+    }
+    row_count = 0
+    for path in parquet_files:
+        try:
+            parquet_file = pq.ParquetFile(path)
+            columns = set(parquet_file.schema_arrow.names)
+            missing = required_columns - columns
+            if missing:
+                raise ValueError(
+                    f"missing required columns: {', '.join(sorted(missing))}"
+                )
+            row_count += parquet_file.metadata.num_rows
+        except Exception as error:
+            raise ValueError(
+                f"Invalid incomplete Parquet shard {path}: {error}"
+            ) from error
+    if row_count == 0:
+        raise ValueError(
+            f"Incomplete materialized {expected_partition} partition has no rows"
+        )
+    return row_count
 
 
 def build_stage4_partition_dataloaders(**kwargs) -> dict[str, DataLoader]:

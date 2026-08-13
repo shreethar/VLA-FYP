@@ -102,6 +102,29 @@ during training. The manifest is checked against the requested sample ratio,
 seed, and 70/15/15 split before training starts. If materialization is
 interrupted, inspect or remove the `.incomplete` directory before retrying.
 
+### Training from an interrupted materialization
+
+Completed Parquet shards survive `Ctrl+C`: each was written to a temporary
+file and atomically renamed. Only the final in-memory buffers are lost (at most
+`rows_per_shard - 1`, or 255 by default, in each partition). To deliberately
+use those completed shards, keep the `.incomplete` directory and opt in:
+
+```bash
+python train/stage4/train_stage4.py \
+  --materialized_data_dir /path/to/molmoact_stage_10pct.incomplete \
+  --allow_incomplete_materialized \
+  --alpha 100 \
+  --beta 100 \
+  --gamma 25 \
+  --output_dir checkpoints/stage4_partial
+```
+
+Before model loading, the opt-in path reads every Parquet footer, checks the
+required schema, reports the exact number of usable rows in the selected
+partition, and ignores any unfinished `*.tmp` file. It does not pretend that
+the scan covered the whole source dataset: the resulting training set is the
+selected subset encountered before interruption.
+
 The students receive only the resized `primary` image. VGGT receives exactly
 `[primary, wrist]` jointly and must return `[B,2,N,D]`; only `features[:,0]` is
 used as the Spatial Forcing target. The view-0 representation has nevertheless

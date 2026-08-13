@@ -29,7 +29,11 @@ from train.stage4.stage4_dataloader import (
     parse_molmoact_annotation,
     partition_for_fingerprint,
 )
-from train.stage4.train_stage4 import Stage4Config, _build_optimizer_groups
+from train.stage4.train_stage4 import (
+    Stage4Config,
+    _build_optimizer_groups,
+    _validate_config,
+)
 
 
 def test_latent_preservation_is_zero_for_identical_states():
@@ -329,3 +333,13 @@ def test_optimizer_uses_requested_layer_dependent_groups():
     assert by_name["qwen_layers_8_31"]["lr"] == 1e-6
     assert by_name["waypoint_head"]["lr"] == 1e-5
     assert by_name["sf_projector"]["lr"] == 1e-4
+
+
+def test_incomplete_materialized_opt_in_requires_a_local_directory():
+    config = Stage4Config(allow_incomplete_materialized=True)
+    try:
+        _validate_config(config)
+    except ValueError as error:
+        assert "materialized_data_dir" in str(error)
+    else:
+        raise AssertionError("Incomplete-data opt-in was accepted without a path")

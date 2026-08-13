@@ -56,6 +56,7 @@ class Stage4Config:
     hf_repo: str = DEFAULT_HF_REPO
     hf_config: str = DEFAULT_HF_CONFIG
     materialized_data_dir: Optional[str] = None
+    allow_incomplete_materialized: bool = False
     output_dir: str = "checkpoints/stage4"
     reference_checkpoint: Optional[str] = None
     resume_from: Optional[str] = None
@@ -254,6 +255,10 @@ def _validate_config(config: Stage4Config) -> None:
         raise ValueError("AdamW beta values must be in [0,1)")
     if config.gradient_accumulation_steps < 1:
         raise ValueError("gradient_accumulation_steps must be positive")
+    if config.allow_incomplete_materialized and not config.materialized_data_dir:
+        raise ValueError(
+            "allow_incomplete_materialized requires materialized_data_dir"
+        )
 
 
 def train(config: Stage4Config, dataloader=None) -> None:
@@ -368,6 +373,7 @@ def train(config: Stage4Config, dataloader=None) -> None:
             sample_ratio=config.sample_ratio,
             seed=config.seed,
             materialized_data_dir=config.materialized_data_dir,
+            allow_incomplete_materialized=config.allow_incomplete_materialized,
         )
 
     logger.info(
@@ -581,6 +587,14 @@ def parse_args() -> Stage4Config:
     parser.add_argument(
         "--materialized_data_dir",
         help="Completed local output from materialize_molmoact.py (no dataset GETs)",
+    )
+    parser.add_argument(
+        "--allow_incomplete_materialized",
+        action="store_true",
+        help=(
+            "Explicitly train from validated completed Parquet shards left by an "
+            "interrupted materialization"
+        ),
     )
     parser.add_argument("--split", default="train")
     parser.add_argument(
