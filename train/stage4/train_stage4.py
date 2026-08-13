@@ -55,6 +55,7 @@ class Stage4Config:
     student_checkpoint: str = "shreethar/LatentStudent-ckpt-400"
     hf_repo: str = DEFAULT_HF_REPO
     hf_config: str = DEFAULT_HF_CONFIG
+    materialized_data_dir: Optional[str] = None
     output_dir: str = "checkpoints/stage4"
     reference_checkpoint: Optional[str] = None
     resume_from: Optional[str] = None
@@ -366,6 +367,7 @@ def train(config: Stage4Config, dataloader=None) -> None:
             max_length=config.max_seq_len,
             sample_ratio=config.sample_ratio,
             seed=config.seed,
+            materialized_data_dir=config.materialized_data_dir,
         )
 
     logger.info(
@@ -385,11 +387,15 @@ def train(config: Stage4Config, dataloader=None) -> None:
         config.student_visual_layer,
         config.vggt_layer,
     )
+    data_source = (
+        f"local Parquet {config.materialized_data_dir}"
+        if config.materialized_data_dir
+        else f"remote stream {config.hf_repo}[{config.hf_config}]"
+    )
     logger.info(
-        "Dataset: %s[%s] streaming partition=%s ratios=%g/%g/%g, "
-        "valid-row sample ratio=%g; Qwen spatial merge=%d",
-        config.hf_repo,
-        config.hf_config,
+        "Dataset: %s partition=%s ratios=%g/%g/%g, valid-row sample "
+        "ratio=%g; Qwen spatial merge=%d",
+        data_source,
         config.data_partition,
         config.train_ratio,
         config.validation_ratio,
@@ -572,6 +578,10 @@ def parse_args() -> Stage4Config:
     parser.add_argument("--processor_name")
     parser.add_argument("--hf_repo", default=DEFAULT_HF_REPO)
     parser.add_argument("--hf_config", default=DEFAULT_HF_CONFIG)
+    parser.add_argument(
+        "--materialized_data_dir",
+        help="Completed local output from materialize_molmoact.py (no dataset GETs)",
+    )
     parser.add_argument("--split", default="train")
     parser.add_argument(
         "--data_partition",

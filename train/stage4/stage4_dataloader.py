@@ -5,10 +5,11 @@ Each selected sample has two deliberately different visual paths:
 * the reference and trainable latent students receive only ``primary``;
 * frozen VGGT jointly receives ``[primary, wrist]`` in that order.
 
-The dataset is streamed because the full MolmoAct mixture is very large. Rows
-are first validated, then content-hashed for reproducible 10% sampling and a
-leakage-resistant 70/15/15 train/validation/test partition. No full local copy
-or preliminary counting pass is required.
+The source can either be streamed from Hugging Face or read from locally
+materialized Parquet shards. Both modes remain iterable so host RAM stays
+bounded. The local format is already filtered, sampled, and partitioned by
+``materialize_molmoact.py`` and therefore needs no network access at training
+time.
 """
 
 from __future__ import annotations
@@ -16,8 +17,10 @@ from __future__ import annotations
 import ast
 import hashlib
 import io
+import json
 import logging
 import re
+from pathlib import Path
 from typing import Any, Iterable, Iterator, List, Optional
 
 import numpy as np
@@ -37,6 +40,7 @@ ANNOTATION_MIN = 1.0
 ANNOTATION_MAX = 256.0
 PARTITIONS = ("train", "validation", "test")
 DEFAULT_SPLIT_RATIOS = (0.70, 0.15, 0.15)
+MATERIALIZED_FORMAT_VERSION = 1
 
 TRAJECTORY_PROMPT = (
     "You are a robot manipulation assistant. Given an observation image and a "
@@ -273,7 +277,7 @@ def _sharded_rows(rows: Iterable[dict]) -> Iterable[dict]:
 
 
 class MolmoActStage4Dataset(IterableDataset):
-    """Streaming, filtered MolmoAct samples with primary/wrist view ownership."""
+    """Iterable MolmoAct samples with primary/wrist view ownership."""
 
     def __init__(
         self,
@@ -284,6 +288,7 @@ class MolmoActStage4Dataset(IterableDataset):
         seed: int = 42,
         data_partition: str = "train",
         split_ratios: tuple[float, float, float] = DEFAULT_SPLIT_RATIOS,
+        preselected: bool = False,
     ) -> None:
         super().__init__()
         if not 0.0 < sample_ratio <= 1.0:
@@ -299,6 +304,7 @@ class MolmoActStage4Dataset(IterableDataset):
         self.seed = seed
         self.data_partition = data_partition
         self.split_ratios = split_ratios
+        self.preselected = preselected
 
     def _convert_row(
         self,
@@ -371,23 +377,43 @@ class MolmoActStage4Dataset(IterableDataset):
             # Validate cheap fields before sampling and image preprocessing.
             if parse_molmoact_annotation(row.get("annotation")) is None:
                 continue
-            conversation = row.get("conversations", row.get("conversation"))
-            task_name = extract_task_name(conversation)
-            if task_name is None:
-                continue
             if row.get("primary") is None or row.get("wrist", row.get("wrirst")) is None:
                 continue
-            try:
-                fingerprint = molmoact_row_fingerprint(row, task_name)
-            except (OSError, TypeError, ValueError):
-                logger.warning("Skipping row %d that cannot be fingerprinted", row_index)
-                continue
-            if not is_sampled_fingerprint(fingerprint, self.sample_ratio, self.seed):
-                continue
-            if partition_for_fingerprint(
-                fingerprint, self.seed, self.split_ratios
-            ) != self.data_partition:
-                continue
+
+            if self.preselected:
+                # Materialized shards carry these fields explicitly. Do not
+                # hash/sample them a second time: image serialization could
+                # otherwise change an implicit content fingerprint.
+                if row.get("data_partition") != self.data_partition:
+                    raise ValueError(
+                        "Materialized shard contains a row from the wrong partition"
+                    )
+                task_name = row.get("task_name")
+                fingerprint = row.get("fingerprint")
+                if not isinstance(task_name, str) or not task_name.strip():
+                    raise ValueError("Materialized row has no valid task_name")
+                if not isinstance(fingerprint, str) or not fingerprint:
+                    raise ValueError("Materialized row has no valid fingerprint")
+            else:
+                conversation = row.get("conversations", row.get("conversation"))
+                task_name = extract_task_name(conversation)
+                if task_name is None:
+                    continue
+                try:
+                    fingerprint = molmoact_row_fingerprint(row, task_name)
+                except (OSError, TypeError, ValueError):
+                    logger.warning(
+                        "Skipping row %d that cannot be fingerprinted", row_index
+                    )
+                    continue
+                if not is_sampled_fingerprint(
+                    fingerprint, self.sample_ratio, self.seed
+                ):
+                    continue
+                if partition_for_fingerprint(
+                    fingerprint, self.seed, self.split_ratios
+                ) != self.data_partition:
+                    continue
             sample = self._convert_row(row, row_index, task_name, fingerprint)
             if sample is not None:
                 yield sample
@@ -431,22 +457,63 @@ def build_stage4_dataloader(
     max_length: int = 1024,
     sample_ratio: float = 0.1,
     seed: int = 42,
+    materialized_data_dir: Optional[str] = None,
     hf_split=None,
     drop_last: Optional[bool] = None,
 ) -> DataLoader:
+    if hf_split is not None and materialized_data_dir is not None:
+        raise ValueError("Pass either hf_split or materialized_data_dir, not both")
+
+    preselected = False
     if hf_split is None:
         from datasets import load_dataset
-        from datasets import Image as HFImage
 
-        hf_split = load_dataset(
-            hf_repo,
-            hf_config,
-            split=split,
-            streaming=True,
-        )
-        # Preserve compressed image bytes until the selected row is decoded.
-        hf_split = hf_split.cast_column("primary", HFImage(decode=False))
-        hf_split = hf_split.cast_column("wrist", HFImage(decode=False))
+        if materialized_data_dir is not None:
+            data_root = Path(materialized_data_dir).expanduser().resolve()
+            manifest_path = data_root / "manifest.json"
+            if not manifest_path.is_file():
+                raise FileNotFoundError(
+                    f"Completed materialized manifest not found: {manifest_path}"
+                )
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            _validate_materialized_manifest(
+                manifest,
+                sample_ratio=sample_ratio,
+                seed=seed,
+                split_ratios=split_ratios,
+            )
+            parquet_files = sorted((data_root / data_partition).glob("*.parquet"))
+            if not parquet_files:
+                raise FileNotFoundError(
+                    f"No Parquet shards found for {data_partition}: {data_root}"
+                )
+            # ``streaming=True`` here means streaming from local Parquet only;
+            # unlike the remote path, it performs no HTTP GET requests.
+            hf_split = load_dataset(
+                "parquet",
+                data_files=[str(path) for path in parquet_files],
+                split="train",
+                streaming=True,
+            )
+            preselected = True
+            logger.info(
+                "Reading %d local %s shards from %s",
+                len(parquet_files),
+                data_partition,
+                data_root,
+            )
+        else:
+            from datasets import Image as HFImage
+
+            hf_split = load_dataset(
+                hf_repo,
+                hf_config,
+                split=split,
+                streaming=True,
+            )
+            # Preserve compressed image bytes until the selected row is decoded.
+            hf_split = hf_split.cast_column("primary", HFImage(decode=False))
+            hf_split = hf_split.cast_column("wrist", HFImage(decode=False))
 
     dataset = MolmoActStage4Dataset(
         hf_split,
@@ -456,6 +523,7 @@ def build_stage4_dataloader(
         seed=seed,
         data_partition=data_partition,
         split_ratios=split_ratios,
+        preselected=preselected,
     )
     if drop_last is None:
         drop_last = data_partition == "train"
@@ -469,6 +537,45 @@ def build_stage4_dataloader(
         drop_last=drop_last,
         persistent_workers=num_workers > 0,
     )
+
+
+def _validate_materialized_manifest(
+    manifest: dict,
+    *,
+    sample_ratio: float,
+    seed: int,
+    split_ratios: tuple[float, float, float],
+) -> None:
+    """Prevent silently training with shards made under another data recipe."""
+    if manifest.get("format_version") != MATERIALIZED_FORMAT_VERSION:
+        raise ValueError(
+            "Unsupported materialized dataset format: "
+            f"{manifest.get('format_version')!r}"
+        )
+    if not manifest.get("complete"):
+        raise ValueError("Materialized dataset manifest is not marked complete")
+    if not np.isclose(
+        float(manifest.get("sample_ratio", -1.0)),
+        sample_ratio,
+        rtol=0.0,
+        atol=1e-12,
+    ):
+        raise ValueError(
+            "Materialized sample_ratio does not match training: "
+            f"{manifest.get('sample_ratio')} != {sample_ratio}"
+        )
+    if int(manifest.get("seed", -1)) != seed:
+        raise ValueError(
+            f"Materialized seed does not match training: {manifest.get('seed')} != {seed}"
+        )
+    saved_ratios = tuple(float(value) for value in manifest.get("split_ratios", ()))
+    if len(saved_ratios) != 3 or not np.allclose(
+        saved_ratios, split_ratios, rtol=0.0, atol=1e-12
+    ):
+        raise ValueError(
+            "Materialized split ratios do not match training: "
+            f"{saved_ratios} != {split_ratios}"
+        )
 
 
 def build_stage4_partition_dataloaders(**kwargs) -> dict[str, DataLoader]:

@@ -1,3 +1,5 @@
+import io
+
 import torch
 import torch.nn as nn
 from PIL import Image
@@ -19,6 +21,8 @@ from train.stage4.models.spatial_forcing import (
 )
 from train.stage4.stage4_dataloader import (
     MolmoActStage4Dataset,
+    MATERIALIZED_FORMAT_VERSION,
+    _validate_materialized_manifest,
     build_trajectory_prompt,
     extract_task_name,
     is_sampled_fingerprint,
@@ -215,6 +219,73 @@ def test_molmoact_students_get_primary_while_vggt_gets_both_views():
     assert sample["vggt_images"][0, 2].mean() < 0.01
     assert sample["vggt_images"][1, 2].mean() > 0.99
     assert sample["planner_view_index"] == 0
+
+
+def test_materialized_row_is_not_sampled_or_hashed_again():
+    class FakeProcessor:
+        def apply_chat_template(self, _messages, **_kwargs):
+            return "rendered prompt"
+
+        def __call__(self, **_kwargs):
+            return {
+                "input_ids": torch.tensor([[1, 2, 3]]),
+                "attention_mask": torch.ones(1, 3, dtype=torch.long),
+                "pixel_values": torch.zeros(1, 4),
+                "image_grid_thw": torch.tensor([[1, 4, 4]]),
+            }
+
+    def image_bytes(color):
+        buffer = io.BytesIO()
+        Image.new("RGB", (16, 16), color=color).save(buffer, format="PNG")
+        return buffer.getvalue()
+
+    row = {
+        "primary": image_bytes((255, 0, 0)),
+        "wrist": image_bytes((0, 0, 255)),
+        "task_name": "close the box",
+        "fingerprint": "already-selected",
+        "data_partition": "train",
+        "annotation": "[[10,20],[20,30],[30,40],[40,50],[50,60]]",
+    }
+    dataset = MolmoActStage4Dataset(
+        [row],
+        processor=FakeProcessor(),
+        sample_ratio=0.1,
+        data_partition="train",
+        preselected=True,
+    )
+    sample = next(iter(dataset))
+    assert sample["sample_id"] == "molmoact_already-selected"
+    assert sample["task_name"] == "close the box"
+
+
+def test_materialized_manifest_must_match_training_recipe():
+    manifest = {
+        "format_version": MATERIALIZED_FORMAT_VERSION,
+        "complete": True,
+        "sample_ratio": 0.1,
+        "seed": 42,
+        "split_ratios": [0.70, 0.15, 0.15],
+    }
+    _validate_materialized_manifest(
+        manifest,
+        sample_ratio=0.1,
+        seed=42,
+        split_ratios=(0.70, 0.15, 0.15),
+    )
+
+    mismatched = dict(manifest, seed=7)
+    try:
+        _validate_materialized_manifest(
+            mismatched,
+            sample_ratio=0.1,
+            seed=42,
+            split_ratios=(0.70, 0.15, 0.15),
+        )
+    except ValueError as error:
+        assert "seed" in str(error)
+    else:
+        raise AssertionError("Mismatched materialization seed was accepted")
 
 
 def test_streaming_partitions_are_deterministic_disjoint_and_approximately_70_15_15():

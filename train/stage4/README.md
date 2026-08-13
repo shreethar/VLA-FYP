@@ -39,9 +39,11 @@ pip install -r train/stage4/requirements.txt
 
 ## Dataset contract
 
-The default source is
-`allenai/MolmoAct-Midtraining-Mixture[molmoact_tabletop_primary]`, loaded in
-streaming mode. Rows are processed in this order:
+The source is
+`allenai/MolmoAct-Midtraining-Mixture[molmoact_tabletop_primary]`. The
+recommended training path is to materialize the selected subset once and then
+stream local Parquet shards. Direct Hugging Face streaming remains available
+as a fallback. Rows are processed in this order:
 
 1. reject null/malformed annotations and annotations with fewer than five pairs;
 2. reject rows without both `primary` and `wrist` images;
@@ -57,8 +59,48 @@ Sampling and partition membership are stable across worker counts and runs.
 Exact duplicate planner samples receive the same fingerprint, so they cannot
 leak between partitions. Both the 10% sample and 70/15/15 proportions are
 approximate: exact counts would require a full preliminary scan/materialization.
-The default training stream therefore contains approximately 7% of all usable
-rows; validation and test each contain approximately 1.5%.
+The resulting training partition therefore contains approximately 7% of all
+usable rows; validation and test each contain approximately 1.5%.
+
+### One-time local materialization
+
+Choose a fast local disk with enough free space, then run:
+
+```bash
+python train/stage4/materialize_molmoact.py \
+  --output_dir /path/to/fast-local-disk/molmoact_stage4_10pct
+```
+
+This makes one remote streaming pass, preserves the two compressed source
+images, and writes:
+
+```text
+molmoact_stage4_10pct/
+  manifest.json
+  train/part-*.parquet
+  validation/part-*.parquet
+  test/part-*.parquet
+```
+
+The final disk footprint is data-dependent. The script logs the actual GiB and
+records byte/row/shard counts in `manifest.json`. It writes to a sibling
+`.incomplete` directory and only renames it to the requested output after a
+complete source scan, so training cannot mistake a partial run for a complete
+dataset.
+
+Train from it with:
+
+```bash
+python train/stage4/train_stage4.py \
+  --materialized_data_dir /path/to/fast-local-disk/molmoact_stage4_10pct \
+  --output_dir checkpoints/stage4
+```
+
+The loader still uses iterable/streaming reads to keep RAM bounded, but every
+read is from local Parquet: there are no Hugging Face dataset GET requests
+during training. The manifest is checked against the requested sample ratio,
+seed, and 70/15/15 split before training starts. If materialization is
+interrupted, inspect or remove the `.incomplete` directory before retrying.
 
 The students receive only the resized `primary` image. VGGT receives exactly
 `[primary, wrist]` jointly and must return `[B,2,N,D]`; only `features[:,0]` is
@@ -111,6 +153,7 @@ random spatial slots.
 
 ```bash
 python train/stage4/train_stage4.py \
+  --materialized_data_dir /path/to/fast-local-disk/molmoact_stage4_10pct \
   --output_dir checkpoints/stage4
 ```
 
@@ -118,10 +161,10 @@ This uses the requested defaults:
 
 ```text
 checkpoint    shreethar/LatentStudent-ckpt-400
-dataset       allenai/MolmoAct-Midtraining-Mixture
-config        molmoact_tabletop_primary
+dataset       local materialized MolmoAct Parquet shards
+source        allenai/MolmoAct-Midtraining-Mixture[molmoact_tabletop_primary]
 sample ratio  0.1 after validation
-partitions     70/15/15 streaming hash split (training selects train)
+partitions     70/15/15 materialized hash split (training selects train)
 layers        Qwen 8 / VGGT 8 (zero-based)
 loss weights  alpha=1.0, beta=1.0, gamma=0.5
 steps/batch    10000 / 16
@@ -133,6 +176,7 @@ To resume, retain the original Stage 2 checkpoint as
 ```bash
 python train/stage4/train_stage4.py \
   --resume_from checkpoints/stage4/step_001000 \
+  --materialized_data_dir /path/to/fast-local-disk/molmoact_stage4_10pct \
   --output_dir checkpoints/stage4
 ```
 
