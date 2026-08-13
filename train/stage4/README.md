@@ -119,11 +119,11 @@ python train/stage4/train_stage4.py \
   --output_dir checkpoints/stage4_partial
 ```
 
-Before model loading, the opt-in path reads every Parquet footer, checks the
-required schema, reports the exact number of usable rows in the selected
-partition, and ignores any unfinished `*.tmp` file. It does not pretend that
-the scan covered the whole source dataset: the resulting training set is the
-selected subset encountered before interruption.
+When constructing the data loader, the opt-in path reads every Parquet footer,
+checks the required schema, reports the exact number of usable rows in the
+selected partition, and ignores any unfinished `*.tmp` file. It does not
+pretend that the scan covered the whole source dataset: the resulting training
+set is the selected subset encountered before interruption.
 
 The students receive only the resized `primary` image. VGGT receives exactly
 `[primary, wrist]` jointly and must return `[B,2,N,D]`; only `features[:,0]` is
