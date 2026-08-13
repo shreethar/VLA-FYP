@@ -91,3 +91,29 @@ python train/stage4/train_stage4.py \
 The frozen reference continues to load from the original Stage 2 checkpoint,
 while the trainable student, projector, optimizer, and scheduler resume from
 Stage 4.
+
+## Validate token correspondence first
+
+Before training, run the correspondence inspector on several image and video
+samples. It compares Qwen's real `grid_thw`, placeholder count, vision-encoder
+output, and layer-8 token count against VGGT's view/patch grid. It also compares
+the current count-inferred resize with an explicit `(time, height, width)`
+resize using a synthetic coordinate field.
+
+```bash
+python train/stage4/inspect_spatial_correspondence.py \
+  --student_checkpoint checkpoints/stage2/step_004500 \
+  --base_model_name shreethar/stage1_unsloth \
+  --hf_repo YOUR_ORG/YOUR_TRAJECTORY_DATASET \
+  --split train \
+  --sample_indices 0,1,2,10 \
+  --student_layer 8 \
+  --vggt_layer 8 \
+  --output spatial_correspondence_report.json
+```
+
+Do not start Stage 4 when any sample reports
+`DO_NOT_TRAIN_WITH_CURRENT_ALIGNMENT`. Send
+`spatial_correspondence_report.json` back for review; in particular, inspect
+temporal view mismatches and normalized coordinate displacement rather than
+accepting equal token counts alone.
