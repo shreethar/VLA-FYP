@@ -422,6 +422,88 @@ class LatentStudent(nn.Module):
     # Core: latent generation + h_S extraction + spatial decoding
     # -----------------------------------------------------------------------
 
+    def _generate_reasoning_context(
+        self,
+        input_ids: torch.Tensor,
+        pixel_values: Optional[torch.Tensor],
+        image_grid_thw: Optional[torch.Tensor],
+        attention_mask: torch.Tensor,
+        pixel_values_videos: Optional[torch.Tensor] = None,
+        video_grid_thw: Optional[torch.Tensor] = None,
+    ) -> Tuple[List[torch.Tensor], torch.Tensor, torch.Tensor]:
+        """Run the continuous autoregressive loop shared by Stage 2 and Stage 4.
+
+        Returns the M latent states plus the growing embeddings/mask needed by
+        :meth:`generate_latents` for spatial decoding.  Stage 4's frozen
+        reference model uses :meth:`generate_reasoning_latents` to stop here,
+        avoiding an unnecessary spatial-decoder forward pass.
+        """
+        batch_size = input_ids.shape[0]
+        device = input_ids.device
+
+        prefix_embeds, seed_hidden = self.encode_prefix(
+            input_ids,
+            pixel_values,
+            image_grid_thw,
+            attention_mask,
+            pixel_values_videos,
+            video_grid_thw,
+        )
+
+        current_embeds = prefix_embeds
+        current_mask = attention_mask
+        current_token = seed_hidden
+        latents: List[torch.Tensor] = []
+
+        for _ in range(self.M):
+            current_embeds = torch.cat(
+                [current_embeds, current_token.unsqueeze(1)], dim=1
+            )
+            current_mask = torch.cat(
+                [
+                    current_mask,
+                    torch.ones(
+                        batch_size,
+                        1,
+                        device=device,
+                        dtype=current_mask.dtype,
+                    ),
+                ],
+                dim=1,
+            )
+
+            out = self._language_model(
+                inputs_embeds=current_embeds,
+                attention_mask=current_mask,
+                use_cache=False,
+                output_hidden_states=False,
+                return_dict=True,
+            )
+            current_token = out.last_hidden_state[:, -1, :]
+            latents.append(current_token)
+
+        return latents, current_embeds, current_mask
+
+    def generate_reasoning_latents(
+        self,
+        input_ids: torch.Tensor,
+        pixel_values: Optional[torch.Tensor],
+        image_grid_thw: Optional[torch.Tensor],
+        attention_mask: torch.Tensor,
+        pixel_values_videos: Optional[torch.Tensor] = None,
+        video_grid_thw: Optional[torch.Tensor] = None,
+    ) -> List[torch.Tensor]:
+        """Generate only z_1..z_M, without the spatial decoding pass."""
+        latents, _, _ = self._generate_reasoning_context(
+            input_ids,
+            pixel_values,
+            image_grid_thw,
+            attention_mask,
+            pixel_values_videos,
+            video_grid_thw,
+        )
+        return latents
+
     def generate_latents(
         self,
         input_ids: torch.Tensor,
@@ -493,52 +575,16 @@ class LatentStudent(nn.Module):
         )
 
         batch_size = input_ids.shape[0]
-        device     = input_ids.device
+        device = input_ids.device
 
-        # ------------------------------------------------------------------
-        # Step 0: Encode prefix
-        # input_ids ends with <think> → seed_hidden = h at <think>
-        # ------------------------------------------------------------------
-        prefix_embeds, seed_hidden = self.encode_prefix(
-            input_ids, pixel_values, image_grid_thw, attention_mask, pixel_values_videos, video_grid_thw
+        latents, current_embeds, current_mask = self._generate_reasoning_context(
+            input_ids,
+            pixel_values,
+            image_grid_thw,
+            attention_mask,
+            pixel_values_videos,
+            video_grid_thw,
         )
-
-        current_embeds = prefix_embeds   # [B, prompt_len, d]
-        current_mask   = attention_mask  # [B, prompt_len]
-        current_token  = seed_hidden     # [B, d]  — input for step m=1
-
-        latents: List[torch.Tensor] = []
-
-        # ------------------------------------------------------------------
-        # Steps 1..M: concat-based latent loop
-        # ------------------------------------------------------------------
-        for _ in range(self.M):
-            # Append current_token as the newest sequence position
-            current_embeds = torch.cat(
-                [current_embeds, current_token.unsqueeze(1)], dim=1
-            )   # [B, prompt_len + m, d]
-
-            current_mask = torch.cat(
-                [current_mask,
-                 torch.ones(batch_size, 1, device=device, dtype=current_mask.dtype)],
-                dim=1,
-            )   # [B, prompt_len + m]
-
-            out = self._language_model(
-                inputs_embeds=current_embeds,
-                attention_mask=current_mask,
-                use_cache=False,          # forces LinearAttentionChunk in DeltaNet
-                output_hidden_states=False,
-                return_dict=True,
-            )
-
-            z_m = out.last_hidden_state[:, -1, :]   # [B, d]
-            latents.append(z_m)
-            current_token = z_m   # feed z_m as next token in embedding space
-
-        # After M steps:
-        #   current_embeds = [prefix | z_1 | ... | z_M]
-        #   current_mask   extended by M positions
 
         # ------------------------------------------------------------------
         # Final forward: append </think> | s_1 ... s_K  (one combined pass)
@@ -602,24 +648,34 @@ class LatentStudent(nn.Module):
         attention_mask: torch.Tensor,
         pixel_values_videos: Optional[torch.Tensor] = None,
         video_grid_thw: Optional[torch.Tensor] = None,
-    ) -> torch.Tensor:
+        layer_idx: Optional[int] = None,
+        return_mask: bool = False,
+    ):
         """
         Full forward pass with output_hidden_states=True.
-        Returns hidden states at layer L/2 = 16 at visual token positions.
+        Returns hidden states at a selected transformer layer at visual-token
+        positions.  ``layer_idx`` is zero-based; ``None`` selects L/2 = 16.
 
         These are x_V — used in Stage 4:
             L_spatial = -CosSim( ProjectionMLP(x_V), VGGT(I) )
 
         Layer indexing:
-            hidden_states tuple index 0  = embedding layer output
-            hidden_states tuple index i  = output of transformer layer i-1
-            → layer L/2 output lives at index (mid_layer_idx + 1) = 17
+            hidden_states tuple index 0 = embedding layer output
+            hidden_states tuple index i+1 = output of transformer layer i
 
         Returns
         -------
-        x_V : [batch, num_visual_tokens, hidden_dim]
-              or [batch, 1, hidden_dim] if no visual tokens (text-only batch)
+        x_V : [batch, max_visual_tokens, hidden_dim]
+              Zero-padded when samples contain different visual-token counts.
+        visual_mask : [batch, max_visual_tokens], optional
+              Returned when ``return_mask=True``; True marks real tokens.
         """
+        selected_layer = self.mid_layer_idx if layer_idx is None else layer_idx
+        if not 0 <= selected_layer < self.num_layers:
+            raise ValueError(
+                f"layer_idx must be in [0, {self.num_layers - 1}], got {selected_layer}"
+            )
+
         embeds = self._build_input_embeds(input_ids, pixel_values, image_grid_thw, pixel_values_videos, video_grid_thw)
 
         out = self._language_model(
@@ -630,11 +686,12 @@ class LatentStudent(nn.Module):
             return_dict=True,
         )
 
-        # hidden_states[0] = embed output; hidden_states[k] = layer k-1 output
-        mid_hidden = out.hidden_states[self.mid_layer_idx + 1]   # [B, seq, d]
+        # hidden_states[0] = embeddings; hidden_states[i+1] = layer i output
+        mid_hidden = out.hidden_states[selected_layer + 1]   # [B, seq, d]
 
         if self._image_token_id is None and not hasattr(self, "_video_token_id"):
-            return mid_hidden
+            visual_mask = attention_mask.to(torch.bool)
+            return (mid_hidden, visual_mask) if return_mask else mid_hidden
 
         mask = torch.zeros_like(input_ids, dtype=torch.bool)
         if self._image_token_id is not None:
@@ -642,19 +699,25 @@ class LatentStudent(nn.Module):
         if hasattr(self, "_video_token_id"):
             mask = mask | (input_ids == self._video_token_id)
 
-        n_visual = mask[0].sum().item()
-
-        if n_visual == 0:
-            return torch.zeros(
-                input_ids.shape[0], 1, self.hidden_dim,
-                device=mid_hidden.device,
-                dtype=mid_hidden.dtype,
-            )
-
-        x_V = mid_hidden[mask].view(
-            input_ids.shape[0], n_visual, self.hidden_dim
+        counts = mask.sum(dim=1)
+        max_visual = max(1, int(counts.max().item()))
+        x_V = mid_hidden.new_zeros(
+            input_ids.shape[0], max_visual, self.hidden_dim
         )
-        return x_V
+        visual_mask = torch.zeros(
+            input_ids.shape[0],
+            max_visual,
+            device=mid_hidden.device,
+            dtype=torch.bool,
+        )
+
+        for batch_idx, count in enumerate(counts.tolist()):
+            if count == 0:
+                continue
+            x_V[batch_idx, :count] = mid_hidden[batch_idx, mask[batch_idx]]
+            visual_mask[batch_idx, :count] = True
+
+        return (x_V, visual_mask) if return_mask else x_V
 
     # -----------------------------------------------------------------------
     # Standard forward (for SFT eval / non-latent use cases)
