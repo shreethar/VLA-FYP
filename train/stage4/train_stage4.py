@@ -14,12 +14,14 @@ Objective
 from __future__ import annotations
 
 import argparse
+import json
 import logging
 import math
 import re
 import sys
+import time
 from contextlib import nullcontext
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Optional
 
@@ -95,6 +97,13 @@ class Stage4Config:
     seed: int = 42
     projector_normalization: str = "batchnorm"
     use_vggt_position_embedding: bool = False
+    use_wandb: bool = True
+    wandb_project: str = "reasonflow-vla"
+    wandb_entity: Optional[str] = None
+    wandb_run_name: str = "stage4-spatial-forcing"
+    wandb_run_id: Optional[str] = None
+    wandb_mode: str = "online"
+    wandb_tags: tuple[str, ...] = ("stage4", "spatial-forcing", "molmoact")
 
 
 def _autocast_context(device: torch.device):
@@ -105,6 +114,71 @@ def _autocast_context(device: torch.device):
 
 def _move_optional(value, device: torch.device):
     return value.to(device, non_blocking=True) if value is not None else None
+
+
+def _resume_wandb_run_id(config: Stage4Config) -> Optional[str]:
+    """Recover the W&B ID stored in a Stage 4 checkpoint when resuming."""
+    if config.wandb_run_id:
+        return config.wandb_run_id
+    if not config.resume_from:
+        return None
+    config_path = Path(config.resume_from) / "stage4_config.json"
+    if not config_path.is_file():
+        return None
+    try:
+        saved_config = json.loads(config_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as error:
+        logger.warning("Could not read W&B run ID from %s: %s", config_path, error)
+        return None
+    run_id = saved_config.get("wandb_run_id")
+    return str(run_id) if run_id else None
+
+
+def _init_wandb(config: Stage4Config):
+    if not config.use_wandb:
+        logger.info("W&B logging disabled")
+        return None
+    try:
+        import wandb
+    except ImportError as error:
+        raise RuntimeError(
+            "W&B logging is enabled but wandb is not installed. Install "
+            "train/stage4/requirements.txt or pass --no_wandb."
+        ) from error
+
+    run_id = _resume_wandb_run_id(config)
+    init_kwargs = {
+        "project": config.wandb_project,
+        "entity": config.wandb_entity,
+        "name": config.wandb_run_name,
+        "tags": list(config.wandb_tags),
+        "config": asdict(config),
+        "mode": config.wandb_mode,
+        "job_type": "stage4-spatial-forcing",
+    }
+    if run_id:
+        init_kwargs.update({"id": run_id, "resume": "allow"})
+    run = wandb.init(**init_kwargs)
+    if run is None:
+        raise RuntimeError("wandb.init() did not return a run")
+    config.wandb_run_id = run.id
+    run.config.update({"wandb_run_id": run.id}, allow_val_change=True)
+    run.define_metric("progress/optimizer_step")
+    run.define_metric("*", step_metric="progress/optimizer_step")
+    logger.info("W&B run: %s", run.url or f"offline:{run.id}")
+    return run
+
+
+def _parameter_grad_norm(parameters: list[torch.nn.Parameter]) -> float:
+    """L2 norm for one optimizer group before global clipping."""
+    norms = [
+        parameter.grad.detach().float().norm(2)
+        for parameter in parameters
+        if parameter.grad is not None
+    ]
+    if not norms:
+        return 0.0
+    return float(torch.stack(norms).norm(2).item())
 
 
 def _build_scheduler(optimizer, warmup_steps: int, total_steps: int):
@@ -259,10 +333,17 @@ def _validate_config(config: Stage4Config) -> None:
         raise ValueError(
             "allow_incomplete_materialized requires materialized_data_dir"
         )
+    if config.log_steps < 1:
+        raise ValueError("log_steps must be positive")
+    if config.use_wandb and not config.wandb_project.strip():
+        raise ValueError("wandb_project cannot be empty when W&B is enabled")
+    if config.wandb_mode not in {"online", "offline"}:
+        raise ValueError("wandb_mode must be online or offline")
 
 
 def train(config: Stage4Config, dataloader=None) -> None:
     _validate_config(config)
+    wandb_run = _init_wandb(config)
     if not torch.cuda.is_available():
         logger.warning("CUDA is unavailable; the three-model run will be extremely slow")
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -430,8 +511,18 @@ def train(config: Stage4Config, dataloader=None) -> None:
     data_iterator = iter(dataloader)
     optimizer.zero_grad(set_to_none=True)
     last_saved_step = start_step
+    samples_seen = start_step * config.batch_size * config.gradient_accumulation_steps
+    best_total_loss = math.inf
+    best_waypoint_loss = math.inf
+    best_latent_loss = math.inf
+    best_spatial_cosine = -math.inf
+    if device.type == "cuda":
+        torch.cuda.reset_peak_memory_stats(device)
 
     for step in range(start_step + 1, config.max_steps + 1):
+        step_started = time.perf_counter()
+        step_sample_count = 0
+        should_log = step % config.log_steps == 0 or step == start_step + 1
         metric_sums: dict[str, float] = {}
         for _ in range(config.gradient_accumulation_steps):
             try:
@@ -441,6 +532,7 @@ def train(config: Stage4Config, dataloader=None) -> None:
                 batch = next(data_iterator)
 
             input_ids = batch["input_ids"].to(device, non_blocking=True)
+            step_sample_count += int(input_ids.shape[0])
             attention_mask = batch["attention_mask"].to(device, non_blocking=True)
             pixel_values = _move_optional(batch.get("pixel_values"), device)
             image_grid_thw = _move_optional(batch.get("image_grid_thw"), device)
@@ -516,17 +608,58 @@ def train(config: Stage4Config, dataloader=None) -> None:
 
             for key, value in losses.detached_metrics().items():
                 metric_sums[key] = metric_sums.get(key, 0.0) + value
+            trajectory_error = (
+                predicted_waypoints.detach().float() - ground_truth.detach().float()
+            )
+            auxiliary_metrics = {
+                "loss_weighted/latent": config.alpha * float(latent.detach().item()),
+                "loss_weighted/waypoint": config.beta
+                * float(waypoint.detach().item()),
+                "loss_weighted/spatial_forcing": config.gamma
+                * float(spatial_forcing.detach().item()),
+                "latent/cosine": 1.0 - float(latent.detach().item()),
+                "trajectory/mae_normalized": float(
+                    trajectory_error.abs().mean().item()
+                ),
+                "trajectory/rmse_normalized": float(
+                    trajectory_error.square().mean().sqrt().item()
+                ),
+                "trajectory/mae_pixels": float(
+                    trajectory_error.abs().mean().mul(255.0).item()
+                ),
+                "trajectory/prediction_mean": float(
+                    predicted_waypoints.detach().float().mean().item()
+                ),
+                "trajectory/prediction_std": float(
+                    predicted_waypoints.detach().float().std(unbiased=False).item()
+                ),
+                "trajectory/target_mean": float(ground_truth.float().mean().item()),
+                "trajectory/target_std": float(
+                    ground_truth.float().std(unbiased=False).item()
+                ),
+            }
+            for key, value in auxiliary_metrics.items():
+                metric_sums[key] = metric_sums.get(key, 0.0) + value
 
         assert_spatial_tokens_frozen(student)
-        torch.nn.utils.clip_grad_norm_(
+        group_grad_norms = {}
+        if should_log:
+            group_grad_norms = {
+                name: _parameter_grad_norm(parameters)
+                for name, parameters in grouped_parameters.items()
+            }
+        global_grad_norm = torch.nn.utils.clip_grad_norm_(
             student_parameters + list(spatial_alignment.parameters()),
             config.grad_clip,
         )
+        global_grad_norm_value = float(global_grad_norm.detach().float().item())
         optimizer.step()
         scheduler.step()
         optimizer.zero_grad(set_to_none=True)
+        step_time_seconds = time.perf_counter() - step_started
+        samples_seen += step_sample_count
 
-        if step % config.log_steps == 0 or step == start_step + 1:
+        if should_log:
             denom = config.gradient_accumulation_steps
             metrics = {key: value / denom for key, value in metric_sums.items()}
             current_lrs = {
@@ -546,6 +679,66 @@ def train(config: Stage4Config, dataloader=None) -> None:
                 current_lrs["waypoint_head"],
                 current_lrs["sf_projector"],
             )
+            if wandb_run is not None:
+                wandb_metrics = {
+                    **metrics,
+                    "progress/optimizer_step": step,
+                    "progress/fraction": step / config.max_steps,
+                    "data/samples_seen": samples_seen,
+                    "data/effective_batch_size": step_sample_count,
+                    "performance/step_time_seconds": step_time_seconds,
+                    "performance/samples_per_second": step_sample_count
+                    / max(step_time_seconds, 1e-12),
+                    "grad_norm/global_pre_clip": global_grad_norm_value,
+                    "grad_norm/clip_threshold": config.grad_clip,
+                    "grad_norm/was_clipped": float(
+                        global_grad_norm_value > config.grad_clip
+                    ),
+                    **{
+                        f"grad_norm/{name}": value
+                        for name, value in group_grad_norms.items()
+                    },
+                    **{
+                        f"learning_rate/{name}": value
+                        for name, value in current_lrs.items()
+                    },
+                }
+                if device.type == "cuda":
+                    wandb_metrics.update(
+                        {
+                            "memory/allocated_gib": torch.cuda.memory_allocated(device)
+                            / 1024**3,
+                            "memory/reserved_gib": torch.cuda.memory_reserved(device)
+                            / 1024**3,
+                            "memory/peak_allocated_gib": torch.cuda.max_memory_allocated(
+                                device
+                            )
+                            / 1024**3,
+                            "memory/peak_reserved_gib": torch.cuda.max_memory_reserved(
+                                device
+                            )
+                            / 1024**3,
+                        }
+                    )
+                    torch.cuda.reset_peak_memory_stats(device)
+                wandb_run.log(wandb_metrics, step=step)
+
+                best_total_loss = min(best_total_loss, metrics["loss/total"])
+                best_waypoint_loss = min(
+                    best_waypoint_loss, metrics["loss/waypoint"]
+                )
+                best_latent_loss = min(best_latent_loss, metrics["loss/latent"])
+                best_spatial_cosine = max(
+                    best_spatial_cosine, metrics["spatial/cosine"]
+                )
+                wandb_run.summary.update(
+                    {
+                        "best/loss_total": best_total_loss,
+                        "best/loss_waypoint": best_waypoint_loss,
+                        "best/loss_latent": best_latent_loss,
+                        "best/spatial_cosine": best_spatial_cosine,
+                    }
+                )
 
         if step % config.save_steps == 0:
             saved = save_stage4_checkpoint(
@@ -559,6 +752,9 @@ def train(config: Stage4Config, dataloader=None) -> None:
             )
             last_saved_step = step
             logger.info("Saved %s", saved)
+            if wandb_run is not None:
+                wandb_run.summary["checkpoint/latest_step"] = step
+                wandb_run.summary["checkpoint/latest_path"] = str(saved)
 
     if last_saved_step != config.max_steps:
         saved = save_stage4_checkpoint(
@@ -571,6 +767,16 @@ def train(config: Stage4Config, dataloader=None) -> None:
             config,
         )
         logger.info("Saved final checkpoint %s", saved)
+        last_saved_step = config.max_steps
+        if wandb_run is not None:
+            wandb_run.summary["checkpoint/latest_step"] = config.max_steps
+            wandb_run.summary["checkpoint/latest_path"] = str(saved)
+
+    if wandb_run is not None:
+        wandb_run.summary["training/final_step"] = config.max_steps
+        wandb_run.summary["training/samples_seen"] = samples_seen
+        wandb_run.summary["training/completed"] = True
+        wandb_run.finish()
 
 
 def parse_args() -> Stage4Config:
@@ -634,6 +840,25 @@ def parse_args() -> Stage4Config:
     parser.add_argument("--save_steps", type=int, default=500)
     parser.add_argument("--log_steps", type=int, default=10)
     parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--wandb_project", default="reasonflow-vla")
+    parser.add_argument("--wandb_entity")
+    parser.add_argument(
+        "--wandb_run_name",
+        "--wandb_run",
+        default="stage4-spatial-forcing",
+    )
+    parser.add_argument("--wandb_run_id")
+    parser.add_argument(
+        "--wandb_mode",
+        choices=("online", "offline"),
+        default="online",
+    )
+    parser.add_argument(
+        "--wandb_tags",
+        default="stage4,spatial-forcing,molmoact",
+        help="Comma-separated W&B run tags",
+    )
+    parser.add_argument("--no_wandb", action="store_true")
     parser.add_argument(
         "--projector_normalization",
         choices=("batchnorm",),
@@ -641,7 +866,12 @@ def parse_args() -> Stage4Config:
     )
     parser.add_argument("--use_vggt_position_embedding", action="store_true")
     args = parser.parse_args()
-    return Stage4Config(**vars(args))
+    values = vars(args)
+    values["use_wandb"] = not values.pop("no_wandb")
+    values["wandb_tags"] = tuple(
+        tag.strip() for tag in values["wandb_tags"].split(",") if tag.strip()
+    )
+    return Stage4Config(**values)
 
 
 if __name__ == "__main__":

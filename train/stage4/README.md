@@ -116,6 +116,7 @@ python train/stage4/train_stage4.py \
   --alpha 100 \
   --beta 100 \
   --gamma 25 \
+  --wandb_run_name stage4-sf-partial-a100-b100-g25 \
   --output_dir checkpoints/stage4_partial
 ```
 
@@ -138,6 +139,43 @@ grid. Token-count factorization is not used by training.
 The SF projector applies `BatchNorm1d` to the concatenated valid visual tokens
 from the complete optimizer batch, followed by `Linear -> GELU -> Linear` and
 tokenwise cosine alignment.
+
+## Weights & Biases metrics
+
+W&B logging is enabled by default and uses project `reasonflow-vla` with run
+name `stage4-spatial-forcing`. Authenticate once on the training machine:
+
+```bash
+wandb login
+```
+
+Stage 4 logs the following every `--log_steps` optimizer steps:
+
+- total and raw latent/waypoint/Spatial Forcing losses;
+- alpha/beta/gamma-weighted contribution from each loss;
+- latent cosine preservation and VGGT spatial cosine alignment;
+- normalized and pixel-space waypoint MAE, normalized RMSE, and prediction/
+  target distribution statistics;
+- pre-clipping global and per-optimizer-group gradient norms;
+- all four parameter-group learning rates and whether clipping occurred;
+- optimizer progress, samples processed, step time, throughput, and CUDA
+  allocated/reserved/peak memory.
+
+Run summaries retain the best logged total/waypoint/latent losses, best spatial
+cosine, latest checkpoint path, final step, and sample count. Model checkpoint
+directories are not uploaded as W&B artifacts, avoiding large background
+uploads. The W&B run ID is stored in `stage4_config.json` and automatically
+reused with `--resume_from`.
+
+Useful controls:
+
+```bash
+--wandb_project reasonflow-vla
+--wandb_run_name stage4-sf-partial
+--wandb_tags stage4,spatial-forcing,molmoact,partial
+--wandb_mode offline      # retain local W&B logs without network sync
+--no_wandb                # explicitly disable tracking
+```
 
 ## Optimization recipe
 

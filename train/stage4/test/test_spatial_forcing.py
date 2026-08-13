@@ -32,6 +32,7 @@ from train.stage4.stage4_dataloader import (
 from train.stage4.train_stage4 import (
     Stage4Config,
     _build_optimizer_groups,
+    _parameter_grad_norm,
     _validate_config,
 )
 
@@ -343,3 +344,21 @@ def test_incomplete_materialized_opt_in_requires_a_local_directory():
         assert "materialized_data_dir" in str(error)
     else:
         raise AssertionError("Incomplete-data opt-in was accepted without a path")
+
+
+def test_parameter_group_gradient_norm_is_pre_clip_l2_norm():
+    first = nn.Parameter(torch.tensor([0.0]))
+    second = nn.Parameter(torch.tensor([0.0]))
+    first.grad = torch.tensor([3.0])
+    second.grad = torch.tensor([4.0])
+    assert _parameter_grad_norm([first, second]) == 5.0
+
+
+def test_wandb_configuration_validation():
+    _validate_config(Stage4Config(wandb_mode="offline"))
+    try:
+        _validate_config(Stage4Config(wandb_mode="invalid"))
+    except ValueError as error:
+        assert "wandb_mode" in str(error)
+    else:
+        raise AssertionError("Invalid W&B mode was accepted")
