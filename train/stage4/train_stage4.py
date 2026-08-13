@@ -44,14 +44,16 @@ from train.stage4.models.spatial_forcing import (
     VGGTExtractor,
 )
 from train.stage4.stage4_dataloader import build_stage4_dataloader
+from train.stage4.stage4_dataloader import DEFAULT_HF_CONFIG, DEFAULT_HF_REPO
 
 logger = logging.getLogger("stage4")
 
 
 @dataclass
 class Stage4Config:
-    student_checkpoint: str
-    hf_repo: Optional[str] = None
+    student_checkpoint: str = "shreethar/LatentStudent-ckpt-400"
+    hf_repo: str = DEFAULT_HF_REPO
+    hf_config: str = DEFAULT_HF_CONFIG
     output_dir: str = "checkpoints/stage4"
     reference_checkpoint: Optional[str] = None
     resume_from: Optional[str] = None
@@ -59,7 +61,7 @@ class Stage4Config:
     processor_name: Optional[str] = None
     vggt_checkpoint: str = "facebook/VGGT-1B"
     split: str = "train"
-    subset_ratio: float = 1.0
+    sample_ratio: float = 0.1
     max_seq_len: int = 1024
     batch_size: int = 1
     num_workers: int = 2
@@ -133,7 +135,42 @@ def _token_id(tokenizer, token: str) -> int:
     return int(token_id)
 
 
+def _resolve_qwen_spatial_merge_size(student) -> int:
+    """Read the vision-to-LLM merge factor from the loaded checkpoint."""
+    visual = student._visual_encoder
+    candidates = [
+        visual,
+        getattr(visual, "config", None),
+        getattr(getattr(student.vlm, "config", None), "vision_config", None),
+    ]
+    for candidate in candidates:
+        if candidate is None:
+            continue
+        for name in ("spatial_merge_size", "merge_size"):
+            value = getattr(candidate, name, None)
+            if value is not None:
+                value = int(value)
+                if value <= 0:
+                    raise ValueError(f"Invalid Qwen {name}={value}")
+                return value
+    raise RuntimeError(
+        "Could not determine Qwen's spatial_merge_size from the loaded model"
+    )
+
+
+def _validate_config(config: Stage4Config) -> None:
+    if config.M != 6:
+        raise ValueError("This Stage 4 recipe requires the checkpoint's six latent slots")
+    if config.K != 5:
+        raise ValueError("MolmoAct Stage 4 requires exactly five spatial slots")
+    if not 0.0 < config.sample_ratio <= 1.0:
+        raise ValueError("sample_ratio must be in (0,1]")
+    if config.gradient_accumulation_steps < 1:
+        raise ValueError("gradient_accumulation_steps must be positive")
+
+
 def train(config: Stage4Config, dataloader=None) -> None:
+    _validate_config(config)
     if not torch.cuda.is_available():
         logger.warning("CUDA is unavailable; the three-model run will be extremely slow")
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -192,6 +229,7 @@ def train(config: Stage4Config, dataloader=None) -> None:
         use_input_norm=config.use_input_norm,
         use_vggt_position_embedding=config.use_vggt_position_embedding,
     ).to(device)
+    qwen_spatial_merge_size = _resolve_qwen_spatial_merge_size(student)
 
     student_parameters = [
         parameter for parameter in student.parameters() if parameter.requires_grad
@@ -223,10 +261,6 @@ def train(config: Stage4Config, dataloader=None) -> None:
         logger.info("Resumed Stage 4 optimizer/projector at step %d", start_step)
 
     if dataloader is None:
-        if not config.hf_repo:
-            raise ValueError(
-                "hf_repo is required unless train(config, dataloader=...) is used"
-            )
         from transformers import AutoProcessor
 
         processor = AutoProcessor.from_pretrained(
@@ -235,11 +269,13 @@ def train(config: Stage4Config, dataloader=None) -> None:
         dataloader = build_stage4_dataloader(
             processor=processor,
             hf_repo=config.hf_repo,
+            hf_config=config.hf_config,
             split=config.split,
             batch_size=config.batch_size,
             num_workers=config.num_workers,
             max_length=config.max_seq_len,
-            subset_ratio=config.subset_ratio,
+            sample_ratio=config.sample_ratio,
+            seed=config.seed,
         )
 
     logger.info(
@@ -255,6 +291,13 @@ def train(config: Stage4Config, dataloader=None) -> None:
         config.gamma,
         config.student_visual_layer,
         config.vggt_layer,
+    )
+    logger.info(
+        "Dataset: %s[%s], valid-row sample ratio=%g; Qwen spatial merge=%d",
+        config.hf_repo,
+        config.hf_config,
+        config.sample_ratio,
+        qwen_spatial_merge_size,
     )
 
     reference.eval()
@@ -285,6 +328,9 @@ def train(config: Stage4Config, dataloader=None) -> None:
             ground_truth = batch["gt_waypoints"].to(device, non_blocking=True)
             vggt_images = batch["vggt_images"].to(device, non_blocking=True)
             vggt_view_mask = batch["vggt_view_mask"].to(
+                device, non_blocking=True
+            )
+            planner_view_indices = batch["planner_view_indices"].to(
                 device, non_blocking=True
             )
 
@@ -329,6 +375,10 @@ def train(config: Stage4Config, dataloader=None) -> None:
                 student_visual,
                 student_visual_mask,
                 geometry_features,
+                image_grid_thw=image_grid_thw,
+                spatial_merge_size=qwen_spatial_merge_size,
+                planner_view_indices=planner_view_indices,
+                vggt_patch_size=vggt.patch_size,
             )
             losses = combine_stage4_losses(
                 latent=latent,
@@ -396,16 +446,21 @@ def train(config: Stage4Config, dataloader=None) -> None:
 
 def parse_args() -> Stage4Config:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--student_checkpoint", required=True)
+    parser.add_argument(
+        "--student_checkpoint", default="shreethar/LatentStudent-ckpt-400"
+    )
     parser.add_argument("--reference_checkpoint")
     parser.add_argument("--resume_from")
     parser.add_argument("--base_model_name")
     parser.add_argument("--processor_name")
-    parser.add_argument("--hf_repo", required=True)
+    parser.add_argument("--hf_repo", default=DEFAULT_HF_REPO)
+    parser.add_argument("--hf_config", default=DEFAULT_HF_CONFIG)
     parser.add_argument("--split", default="train")
     parser.add_argument("--output_dir", default="checkpoints/stage4")
     parser.add_argument("--vggt_checkpoint", default="facebook/VGGT-1B")
-    parser.add_argument("--subset_ratio", type=float, default=1.0)
+    parser.add_argument(
+        "--sample_ratio", "--subset_ratio", dest="sample_ratio", type=float, default=0.1
+    )
     parser.add_argument("--max_seq_len", type=int, default=1024)
     parser.add_argument("--batch_size", type=int, default=1)
     parser.add_argument("--num_workers", type=int, default=2)

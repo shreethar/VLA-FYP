@@ -39,15 +39,30 @@ pip install -r train/stage4/requirements.txt
 
 ## Dataset contract
 
-`stage4_dataloader.py` currently accepts the same Hugging Face record schema as
-Stage 2 and keeps trajectory examples only. It produces two visual paths:
+The default source is
+`allenai/MolmoAct-Midtraining-Mixture[molmoact_tabletop_primary]`, loaded in
+streaming mode. Rows are processed in this order:
 
-- Qwen processor tensors (`pixel_values`, `image_grid_thw`, and video variants);
-- raw `[0,1]` RGB images at 518x518 for VGGT.
+1. reject null/malformed annotations and annotations with fewer than five pairs;
+2. reject rows without both `primary` and `wrist` images;
+3. extract only the task name from the first human `The task is ...` sentence;
+4. retain each valid row with probability `--sample_ratio` (default `0.1`);
+5. normalize the first five coordinates from `[1,256]` to `[0,1]` using
+   `(coordinate - 1) / 255`.
 
-For a new dataset, either adapt `Stage4Dataset` or call
-`train(config, dataloader=your_loader)` with a loader yielding the same batch
-keys. Ground-truth waypoints must be `[B, 5, 2]` normalized to `[0,1]`.
+Sampling is seeded and reproducible for a fixed worker/distributed setup. It is
+a Bernoulli sample of approximately 10% of usable rows; computing an exact 10%
+would require a full counting pass over this very large dataset.
+
+The students receive only the resized `primary` image. VGGT receives exactly
+`[primary, wrist]` jointly and must return `[B,2,N,D]`; only `features[:,0]` is
+used as the Spatial Forcing target. The view-0 representation has nevertheless
+been enriched by VGGT's joint/global cross-view processing.
+
+Qwen/VGGT correspondence is metadata-driven. Qwen's target height and width are
+read from `image_grid_thw` and divided by its actual `spatial_merge_size`. The
+single VGGT primary-view patch map is then bilinearly resized to that explicit
+grid. Token-count factorization is not used by training.
 
 ## Checkpoint formats
 
@@ -66,15 +81,20 @@ random spatial slots.
 
 ```bash
 python train/stage4/train_stage4.py \
-  --student_checkpoint checkpoints/stage2/step_004500 \
-  --base_model_name shreethar/stage1_unsloth \
-  --hf_repo YOUR_ORG/YOUR_TRAJECTORY_DATASET \
   --output_dir checkpoints/stage4 \
-  --student_visual_layer 8 \
-  --vggt_layer 8 \
-  --alpha 1.0 \
-  --beta 1.0 \
-  --gamma 0.5
+  --batch_size 1 \
+  --max_steps 5000
+```
+
+This uses the requested defaults:
+
+```text
+checkpoint    shreethar/LatentStudent-ckpt-400
+dataset       allenai/MolmoAct-Midtraining-Mixture
+config        molmoact_tabletop_primary
+sample ratio  0.1 after validation
+layers        Qwen 8 / VGGT 8 (zero-based)
+loss weights  alpha=1.0, beta=1.0, gamma=0.5
 ```
 
 To resume, retain the original Stage 2 checkpoint as
@@ -82,10 +102,8 @@ To resume, retain the original Stage 2 checkpoint as
 
 ```bash
 python train/stage4/train_stage4.py \
-  --student_checkpoint checkpoints/stage2/step_004500 \
   --resume_from checkpoints/stage4/step_001000 \
-  --base_model_name shreethar/stage1_unsloth \
-  --hf_repo YOUR_ORG/YOUR_TRAJECTORY_DATASET
+  --output_dir checkpoints/stage4
 ```
 
 The frozen reference continues to load from the original Stage 2 checkpoint,
@@ -94,18 +112,13 @@ Stage 4.
 
 ## Validate token correspondence first
 
-Before training, run the correspondence inspector on several image and video
-samples. It compares Qwen's real `grid_thw`, placeholder count, vision-encoder
-output, and layer-8 token count against VGGT's view/patch grid. It also compares
-the current count-inferred resize with an explicit `(time, height, width)`
-resize using a synthetic coordinate field.
+Before training, run the correspondence inspector on several samples. It
+compares Qwen's real `grid_thw`, placeholder count, vision-encoder output, and
+layer-8 token count against VGGT's two-view patch grid. It verifies that only
+the primary feature slice is resized to the explicit Qwen merged grid.
 
 ```bash
 python train/stage4/inspect_spatial_correspondence.py \
-  --student_checkpoint checkpoints/stage2/step_004500 \
-  --base_model_name shreethar/stage1_unsloth \
-  --hf_repo YOUR_ORG/YOUR_TRAJECTORY_DATASET \
-  --split train \
   --sample_indices 0,1,2,10 \
   --student_layer 8 \
   --vggt_layer 8 \
@@ -115,5 +128,4 @@ python train/stage4/inspect_spatial_correspondence.py \
 Do not start Stage 4 when any sample reports
 `DO_NOT_TRAIN_WITH_CURRENT_ALIGNMENT`. Send
 `spatial_correspondence_report.json` back for review; in particular, inspect
-temporal view mismatches and normalized coordinate displacement rather than
-accepting equal token counts alone.
+the grid/count chain and the primary/wrist view ownership.

@@ -8,9 +8,9 @@ which shape checks alone cannot:
 * Does that grid predict the actual placeholder, visual-encoder, and layer-8
   token counts?
 * What spatial and temporal grid does VGGT produce?
-* Does Stage 4's current count-inferred resampling equal a metadata-driven
-  ``(time, height, width)`` interpolation?
-* If not, how large is the implied coordinate displacement?
+* Does selecting VGGT view 0 produce one primary-view spatial map?
+* Does the metadata-driven planner-view resize exactly match Qwen's merged
+  ``(time, height, width)`` token grid?
 
 Run this on the training machine and send the generated JSON file back for
 review before starting a full Stage 4 run.
@@ -36,7 +36,11 @@ if str(REPO_ROOT) not in sys.path:
 
 from train.stage4.checkpointing import load_latent_student_checkpoint
 from train.stage4.models.spatial_forcing import VGGTExtractor, _closest_grid
-from train.stage4.stage4_dataloader import Stage4Dataset
+from train.stage4.stage4_dataloader import (
+    DEFAULT_HF_CONFIG,
+    DEFAULT_HF_REPO,
+    MolmoActStage4Dataset,
+)
 
 logger = logging.getLogger("spatial-correspondence")
 
@@ -226,15 +230,10 @@ def resolve_processor_geometry(processor, student) -> dict[str, Any]:
     }
 
 
-def load_hf_split(repo: str, split: str):
+def load_hf_split(repo: str, config: str, split: str):
     from datasets import load_dataset
 
-    try:
-        files = {split: f"hf://datasets/{repo}/data/{split}-*.parquet"}
-        return load_dataset("parquet", data_files=files, split=split)
-    except Exception:
-        logger.warning("Explicit Parquet load failed; using load_dataset(%s)", repo)
-        return load_dataset(repo, split=split)
+    return load_dataset(repo, config, split=split, streaming=True)
 
 
 def modality_details(
@@ -263,17 +262,14 @@ def modality_details(
 
 def inspect_sample(
     sample_index: int,
-    dataset: Stage4Dataset,
+    sample: dict[str, Any],
     processor,
     student,
     vggt: VGGTExtractor,
     student_layer: int,
     device: torch.device,
 ) -> dict[str, Any]:
-    sample = dataset[sample_index]
-    original_frame_sizes = [
-        list(frame.size) for frame in dataset.samples[sample_index]["frames"]
-    ]
+    original_frame_sizes = sample.get("original_frame_sizes")
     input_ids = sample["input_ids"].unsqueeze(0).to(device)
     attention_mask = sample["attention_mask"].unsqueeze(0).to(device)
     pixel_values = sample.get("pixel_values")
@@ -307,9 +303,10 @@ def inspect_sample(
                 pixel_values_videos, grid_thw=video_grid
             )
         if not isinstance(encoder_output, torch.Tensor):
-            encoder_output = getattr(
-                encoder_output, "pooler_output", encoder_output[0]
-            )
+            raw_encoder_output = encoder_output
+            encoder_output = getattr(raw_encoder_output, "pooler_output", None)
+            if encoder_output is None:
+                encoder_output = raw_encoder_output[0]
 
         layer_features, layer_mask = student.get_mid_layer_visual_features(
             input_ids,
@@ -337,54 +334,34 @@ def inspect_sample(
         vggt_images.shape[-2] // vggt.patch_size,
         vggt_images.shape[-1] // vggt.patch_size,
     )
+    planner_view_index = int(sample.get("planner_view_index", 0))
+    if not 0 <= planner_view_index < vggt_views:
+        raise ValueError(
+            f"planner_view_index={planner_view_index} outside {vggt_views} VGGT views"
+        )
+    planner_features = vggt_features[
+        planner_view_index : planner_view_index + 1
+    ]
     if len(grid_specs) == 1 and expected_tokens == actual_layer_tokens:
         target_grid = grid_specs[0].merged_thw
         metadata_target = metadata_resample_vggt(
-            vggt_features, vggt_grid, target_grid
+            planner_features, vggt_grid, target_grid
         )
-        current_target, inferred_hw = current_count_resample_vggt(
-            vggt_features,
-            vggt_grid,
-            actual_layer_tokens,
-        )
-        feature_cosine = F.cosine_similarity(
-            current_target.float(), metadata_target.float(), dim=-1
-        )
-
-        coordinates = make_coordinate_features(
-            vggt_views,
-            vggt_grid,
-            device,
-        )
-        metadata_coordinates = metadata_resample_vggt(
-            coordinates,
-            vggt_grid,
-            target_grid,
-        )
-        current_coordinates, _ = current_count_resample_vggt(
-            coordinates,
-            vggt_grid,
-            actual_layer_tokens,
-        )
-        displacement = (current_coordinates - metadata_coordinates).norm(dim=-1)
         comparison = {
             "available": True,
             "qwen_metadata_target_thw": list(target_grid),
-            "current_inferred_per_view_hw": list(inferred_hw),
+            "selected_vggt_view": planner_view_index,
+            "selected_view_role": "primary",
             "metadata_resampled_shape": list(metadata_target.shape),
-            "current_resampled_shape": list(current_target.shape),
-            "mean_feature_cosine_current_vs_metadata": float(feature_cosine.mean().item()),
-            "min_feature_cosine_current_vs_metadata": float(feature_cosine.min().item()),
-            "mean_normalized_coordinate_displacement": float(displacement.mean().item()),
-            "max_normalized_coordinate_displacement": float(displacement.max().item()),
-            "direct_temporal_correspondence": vggt_views == target_grid[0],
+            "matches_actual_layer_token_count": metadata_target.shape[0]
+            == actual_layer_tokens,
+            "direct_temporal_correspondence": target_grid[0] == 1,
             "vggt_views": vggt_views,
             "qwen_temporal_positions": target_grid[0],
         }
     elif len(grid_specs) != 1:
         comparison["reason"] = (
-            "Multiple Qwen grid rows require per-item/view ownership metadata; "
-            "the current Stage 4 dataset normally emits one image or one video."
+            "MolmoAct Stage 4 requires exactly one Qwen grid row for primary."
         )
     else:
         comparison["reason"] = (
@@ -399,12 +376,11 @@ def inspect_sample(
         == actual_encoder_tokens
         == actual_layer_tokens
     )
-    exact_grid_match = False
-    if comparison["available"]:
-        exact_grid_match = (
-            comparison["mean_normalized_coordinate_displacement"] < 1e-6
-            and comparison["max_normalized_coordinate_displacement"] < 1e-5
-        )
+    exact_grid_match = bool(
+        comparison.get("available")
+        and comparison.get("matches_actual_layer_token_count")
+        and comparison.get("direct_temporal_correspondence")
+    )
     spatial_aspect_matches = False
     if len(grid_specs) == 1:
         _, qwen_h, qwen_w = grid_specs[0].merged_thw
@@ -425,7 +401,9 @@ def inspect_sample(
         == (vggt_images.shape[-2] // vggt.patch_size)
         * (vggt_images.shape[-1] // vggt.patch_size),
         "qwen_vggt_spatial_aspect_ratio_matches": spatial_aspect_matches,
-        "current_resampling_matches_metadata_grid": exact_grid_match,
+        "metadata_resampling_matches_qwen_grid": exact_grid_match,
+        "vggt_has_exactly_primary_and_wrist_views": vggt_views == 2,
+        "planner_view_is_primary_index_zero": planner_view_index == 0,
     }
     checks["safe_to_use_current_alignment"] = all(checks.values())
 
@@ -467,6 +445,7 @@ def inspect_sample(
                 vggt_images.shape[-1] // vggt.patch_size,
             ],
             "features": tensor_summary(vggt_features),
+            "planner_primary_features": tensor_summary(planner_features),
         },
         "resampling_comparison": comparison,
         "checks": checks,
@@ -487,12 +466,22 @@ def parse_indices(value: str) -> list[int]:
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--student_checkpoint", required=True)
+    parser.add_argument(
+        "--student_checkpoint", default="shreethar/LatentStudent-ckpt-400"
+    )
     parser.add_argument("--base_model_name")
     parser.add_argument("--processor_name")
-    parser.add_argument("--hf_repo", required=True)
+    parser.add_argument("--hf_repo", default=DEFAULT_HF_REPO)
+    parser.add_argument("--hf_config", default=DEFAULT_HF_CONFIG)
     parser.add_argument("--split", default="train")
     parser.add_argument("--sample_indices", type=parse_indices, default=[0])
+    parser.add_argument(
+        "--sample_ratio",
+        type=float,
+        default=1.0,
+        help="Apply the training sampler before selecting diagnostic indices",
+    )
+    parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--max_seq_len", type=int, default=1024)
     parser.add_argument("--student_layer", type=int, default=8)
     parser.add_argument("--vggt_layer", type=int, default=8)
@@ -544,14 +533,31 @@ def main() -> None:
     )
     vggt.eval()
 
-    logger.info("Loading dataset %s[%s]", args.hf_repo, args.split)
-    hf_split = load_hf_split(args.hf_repo, args.split)
-    dataset = Stage4Dataset(
-        hf_split, processor=processor, max_length=args.max_seq_len
+    logger.info(
+        "Loading dataset %s[%s:%s] (streaming)",
+        args.hf_repo,
+        args.hf_config,
+        args.split,
     )
-    for index in args.sample_indices:
-        if not 0 <= index < len(dataset):
-            parser.error(f"sample index {index} outside dataset of size {len(dataset)}")
+    hf_split = load_hf_split(args.hf_repo, args.hf_config, args.split)
+    dataset = MolmoActStage4Dataset(
+        hf_split,
+        processor=processor,
+        max_length=args.max_seq_len,
+        sample_ratio=args.sample_ratio,
+        seed=args.seed,
+    )
+
+    wanted = set(args.sample_indices)
+    selected_samples: dict[int, dict[str, Any]] = {}
+    for index, sample in enumerate(dataset):
+        if index in wanted:
+            selected_samples[index] = sample
+        if len(selected_samples) == len(wanted):
+            break
+    missing = sorted(wanted - selected_samples.keys())
+    if missing:
+        parser.error(f"Dataset ended before selected sample indices: {missing}")
 
     reports = []
     for index in args.sample_indices:
@@ -559,7 +565,7 @@ def main() -> None:
         reports.append(
             inspect_sample(
                 sample_index=index,
-                dataset=dataset,
+                sample=selected_samples[index],
                 processor=processor,
                 student=student,
                 vggt=vggt,
@@ -573,6 +579,10 @@ def main() -> None:
         "base_model_name": args.base_model_name,
         "processor_name": processor_name,
         "vggt_checkpoint": args.vggt_checkpoint,
+        "hf_repo": args.hf_repo,
+        "hf_config": args.hf_config,
+        "sample_ratio": args.sample_ratio,
+        "seed": args.seed,
         "device": str(device),
         "samples": reports,
         "all_samples_safe_to_use_current_alignment": all(

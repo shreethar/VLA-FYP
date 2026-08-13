@@ -1,4 +1,5 @@
 import torch
+from PIL import Image
 
 from train.stage4.losses import (
     latent_reasoning_preservation_loss,
@@ -14,6 +15,12 @@ from train.stage4.models.spatial_forcing import (
     SpatialForcingAlignment,
     VGGTFeatureBatch,
     _closest_grid,
+)
+from train.stage4.stage4_dataloader import (
+    MolmoActStage4Dataset,
+    build_trajectory_prompt,
+    extract_task_name,
+    parse_molmoact_annotation,
 )
 
 
@@ -39,17 +46,48 @@ def test_waypoint_loss_is_squared_euclidean_not_coordinate_mse():
 def test_spatial_alignment_is_tokenwise_and_differentiable():
     alignment = SpatialForcingAlignment(student_dim=4, vggt_dim=3)
     student = torch.randn(2, 4, 4, requires_grad=True)
-    mask = torch.tensor([[True, True, True, True], [True, True, False, False]])
+    mask = torch.ones(2, 4, dtype=torch.bool)
     targets = VGGTFeatureBatch(
-        features=[torch.randn(1, 4, 3), torch.randn(1, 4, 3)],
+        features=[torch.randn(2, 4, 3), torch.randn(2, 4, 3)],
         patch_grid=(2, 2),
     )
-    loss, cosine = alignment(student, mask, targets)
+    loss, cosine = alignment(
+        student,
+        mask,
+        targets,
+        image_grid_thw=torch.tensor([[1, 4, 4], [1, 4, 4]]),
+        spatial_merge_size=2,
+        planner_view_indices=torch.tensor([0, 0]),
+    )
     assert loss.ndim == 0
     assert cosine.ndim == 0
     loss.backward()
     assert student.grad is not None
     assert torch.isfinite(student.grad).all()
+
+
+def test_spatial_alignment_uses_only_the_selected_planner_view():
+    torch.manual_seed(3)
+    alignment = SpatialForcingAlignment(student_dim=4, vggt_dim=3)
+    student = torch.randn(1, 4, 4)
+    mask = torch.ones(1, 4, dtype=torch.bool)
+    primary = torch.randn(1, 4, 3)
+    target_a = VGGTFeatureBatch(
+        features=[torch.cat([primary, torch.zeros_like(primary)], dim=0)],
+        patch_grid=(2, 2),
+    )
+    target_b = VGGTFeatureBatch(
+        features=[torch.cat([primary, torch.full_like(primary, 1_000.0)], dim=0)],
+        patch_grid=(2, 2),
+    )
+    kwargs = {
+        "image_grid_thw": torch.tensor([[1, 4, 4]]),
+        "spatial_merge_size": 2,
+        "planner_view_indices": torch.tensor([0]),
+    }
+    loss_a, _ = alignment(student, mask, target_a, **kwargs)
+    loss_b, _ = alignment(student, mask, target_b, **kwargs)
+    assert torch.allclose(loss_a, loss_b, atol=1e-7)
 
 
 def test_closest_grid_preserves_token_count_and_aspect_ratio():
@@ -95,3 +133,76 @@ def test_count_resampler_reports_inferred_grid():
     )
     assert inferred == (2, 2)
     assert resized.shape == (4, 3)
+
+
+def test_molmoact_annotation_filter_and_one_to_256_normalization():
+    assert parse_molmoact_annotation(None) is None
+    assert parse_molmoact_annotation([[10, 20]] * 4) is None
+    waypoints = parse_molmoact_annotation(
+        [[1, 1], [256, 256], [128.5, 64], [10, 20], [30, 40]]
+    )
+    assert waypoints is not None
+    assert waypoints.shape == (5, 2)
+    assert torch.equal(waypoints[0], torch.tensor([0.0, 0.0]))
+    assert torch.equal(waypoints[1], torch.tensor([1.0, 1.0]))
+    assert torch.all((0.0 <= waypoints) & (waypoints <= 1.0))
+
+
+def test_molmoact_task_extraction_discards_the_remainder():
+    conversation = {
+        "from": ["human", "gpt"],
+        "value": [
+            "The task is close the box. Notice that the trajectory is annotated.",
+            "irrelevant answer",
+        ],
+    }
+    task = extract_task_name(conversation)
+    assert task == "close the box"
+    prompt = build_trajectory_prompt(task)
+    assert "Task: close the box." in prompt
+    assert "Notice that" not in prompt
+
+
+def test_molmoact_students_get_primary_while_vggt_gets_both_views():
+    class FakeProcessor:
+        def __init__(self):
+            self.images = None
+            self.messages = None
+
+        def apply_chat_template(self, messages, **_kwargs):
+            self.messages = messages
+            return "rendered prompt"
+
+        def __call__(self, *, images, **_kwargs):
+            self.images = images
+            return {
+                "input_ids": torch.tensor([[1, 2, 3]]),
+                "attention_mask": torch.ones(1, 3, dtype=torch.long),
+                "pixel_values": torch.zeros(1, 4),
+                "image_grid_thw": torch.tensor([[1, 4, 4]]),
+            }
+
+    processor = FakeProcessor()
+    primary = Image.new("RGB", (32, 32), color=(255, 0, 0))
+    wrist = Image.new("RGB", (32, 32), color=(0, 0, 255))
+    row = {
+        "primary": primary,
+        "wrist": wrist,
+        "conversations": {
+            "from": ["human", "gpt"],
+            "value": ["The task is close the box. Notice the trace.", "answer"],
+        },
+        "annotation": [[10, 20], [20, 30], [30, 40], [40, 50], [50, 60]],
+    }
+    dataset = MolmoActStage4Dataset(
+        [row], processor=processor, sample_ratio=1.0
+    )
+    sample = next(iter(dataset))
+
+    assert len(processor.images) == 1
+    assert processor.images[0].getpixel((0, 0)) == (255, 0, 0)
+    assert sample["vggt_images"].shape == (2, 3, 518, 518)
+    assert sample["vggt_images"][0, 0].mean() > 0.99
+    assert sample["vggt_images"][0, 2].mean() < 0.01
+    assert sample["vggt_images"][1, 2].mean() > 0.99
+    assert sample["planner_view_index"] == 0

@@ -135,7 +135,27 @@ class VGGTExtractor(nn.Module):
                 f"VGGT layer {self.layer_index} was not cached. "
                 "Check the installed VGGT aggregator implementation."
             )
-        return features[:, :, patch_start_idx:, :]
+        if features.ndim != 4:
+            raise RuntimeError(
+                "VGGT cached aggregator features must preserve [B,V,P,D], "
+                f"got {tuple(features.shape)}"
+            )
+        if features.shape[:2] != images.shape[:2]:
+            raise RuntimeError(
+                "VGGT did not preserve the input view axis: "
+                f"input B,V={tuple(images.shape[:2])}, "
+                f"feature B,V={tuple(features.shape[:2])}"
+            )
+        patches = features[:, :, patch_start_idx:, :]
+        expected_patches = (images.shape[-2] // self.patch_size) * (
+            images.shape[-1] // self.patch_size
+        )
+        if patches.shape[2] != expected_patches:
+            raise RuntimeError(
+                f"VGGT patch slice has {patches.shape[2]} tokens per view; "
+                f"expected {expected_patches} from the input grid"
+            )
+        return patches
 
     @torch.no_grad()
     def forward(
@@ -225,7 +245,13 @@ def _add_vggt_position_embedding(
 
 
 class SpatialForcingAlignment(nn.Module):
-    """Trainable projector and raw ``-cosine`` Spatial Forcing loss."""
+    """Planner-view projector and raw ``-cosine`` Spatial Forcing loss.
+
+    Qwen and VGGT token counts are never treated as correspondence metadata.
+    Qwen's processor-provided ``image_grid_thw`` is converted to the
+    post-merge target grid, and only the selected VGGT planner view is
+    interpolated onto that grid.
+    """
 
     def __init__(
         self,
@@ -246,27 +272,34 @@ class SpatialForcingAlignment(nn.Module):
         self,
         target: torch.Tensor,
         patch_grid: Tuple[int, int],
-        target_token_count: int,
+        target_grid: Tuple[int, int, int],
+        vggt_patch_size: int,
     ) -> torch.Tensor:
-        """Bilinearly resample [V,P,D] VGGT patches to VLA token count."""
-        views, patch_count, feature_dim = target.shape
+        """Bilinearly resample one ``[P,D]`` VGGT view to explicit Qwen THW."""
+        if target.ndim != 2:
+            raise ValueError("Selected VGGT planner-view features must be [P,D]")
+        patch_count, feature_dim = target.shape
         patch_h, patch_w = patch_grid
         if patch_count != patch_h * patch_w:
             raise ValueError(
                 f"VGGT patch count {patch_count} does not match grid {patch_grid}"
             )
+        target_t, target_h, target_w = target_grid
+        if target_t != 1:
+            raise ValueError(
+                "Planner-view Spatial Forcing expects one Qwen image (T=1), "
+                f"but image_grid_thw implies T={target_t}"
+            )
+        if target_h <= 0 or target_w <= 0:
+            raise ValueError(f"Invalid Qwen target grid {target_grid}")
 
-        per_view_count = max(1, round(target_token_count / views))
-        target_h, target_w = _closest_grid(
-            per_view_count, aspect_ratio=patch_w / patch_h
-        )
-        feature_map = target.permute(0, 2, 1).reshape(
-            views, feature_dim, patch_h, patch_w
+        feature_map = target.transpose(0, 1).reshape(
+            1, feature_dim, patch_h, patch_w
         )
         if self.use_vggt_position_embedding:
             feature_map = _add_vggt_position_embedding(
                 feature_map,
-                image_hw=(patch_h * 14, patch_w * 14),
+                image_hw=(patch_h * vggt_patch_size, patch_w * vggt_patch_size),
             )
         feature_map = F.interpolate(
             feature_map.float(),
@@ -274,24 +307,17 @@ class SpatialForcingAlignment(nn.Module):
             mode="bilinear",
             align_corners=True,
         )
-        flattened = feature_map.flatten(2).transpose(1, 2).reshape(-1, feature_dim)
-
-        if flattened.shape[0] != target_token_count:
-            # Handles temporal merging or non-factorable token layouts while
-            # preserving the 2-D interpolation whenever possible.
-            flattened = F.interpolate(
-                flattened.transpose(0, 1).unsqueeze(0),
-                size=target_token_count,
-                mode="linear",
-                align_corners=False,
-            ).squeeze(0).transpose(0, 1)
-        return flattened
+        return feature_map.flatten(2).transpose(1, 2).squeeze(0)
 
     def forward(
         self,
         student_visual: torch.Tensor,
         student_visual_mask: torch.Tensor,
         vggt_features: VGGTFeatureBatch,
+        image_grid_thw: torch.Tensor,
+        spatial_merge_size: int,
+        planner_view_indices: Optional[torch.Tensor] = None,
+        vggt_patch_size: int = 14,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """Return ``(loss, mean_cosine_similarity)`` over valid visual tokens."""
         if student_visual.ndim != 3 or student_visual_mask.ndim != 2:
@@ -300,17 +326,59 @@ class SpatialForcingAlignment(nn.Module):
             raise ValueError("Student visual feature and mask shapes do not match")
         if len(vggt_features.features) != student_visual.shape[0]:
             raise ValueError("Student and VGGT batch sizes do not match")
+        if image_grid_thw is None or image_grid_thw.ndim != 2:
+            raise ValueError("image_grid_thw must be [B,3] for primary-only Qwen input")
+        if image_grid_thw.shape != (student_visual.shape[0], 3):
+            raise ValueError(
+                "Expected exactly one Qwen image_grid_thw row per sample; "
+                f"got {tuple(image_grid_thw.shape)} for batch {student_visual.shape[0]}"
+            )
+        if spatial_merge_size <= 0:
+            raise ValueError("spatial_merge_size must be positive")
+        if planner_view_indices is None:
+            planner_view_indices = torch.zeros(
+                student_visual.shape[0], dtype=torch.long, device=student_visual.device
+            )
+        if planner_view_indices.shape != (student_visual.shape[0],):
+            raise ValueError("planner_view_indices must have shape [B]")
 
         sample_similarities: List[torch.Tensor] = []
         for batch_idx, target in enumerate(vggt_features.features):
             valid_student = student_visual[batch_idx, student_visual_mask[batch_idx]]
             if valid_student.shape[0] == 0:
                 raise ValueError("Spatial Forcing received a sample with no visual tokens")
+            planner_view = int(planner_view_indices[batch_idx].item())
+            if not 0 <= planner_view < target.shape[0]:
+                raise ValueError(
+                    f"Planner view {planner_view} is outside VGGT's {target.shape[0]} views"
+                )
+
+            time, grid_h, grid_w = (
+                int(value) for value in image_grid_thw[batch_idx].tolist()
+            )
+            if grid_h % spatial_merge_size or grid_w % spatial_merge_size:
+                raise ValueError(
+                    f"Qwen grid {(time, grid_h, grid_w)} is not divisible by "
+                    f"spatial_merge_size={spatial_merge_size}"
+                )
+            merged_grid = (
+                time,
+                grid_h // spatial_merge_size,
+                grid_w // spatial_merge_size,
+            )
+            expected_tokens = math.prod(merged_grid)
+            if valid_student.shape[0] != expected_tokens:
+                raise ValueError(
+                    "Qwen layer visual-token count disagrees with image_grid_thw: "
+                    f"layer={valid_student.shape[0]}, grid={merged_grid} "
+                    f"({expected_tokens} tokens)"
+                )
             projected = self.projector(valid_student.float())
             target_resampled = self._resample_target(
-                target.detach(),
+                target[planner_view].detach(),
                 vggt_features.patch_grid,
-                valid_student.shape[0],
+                merged_grid,
+                vggt_patch_size,
             )
             cosine = F.cosine_similarity(
                 projected,
