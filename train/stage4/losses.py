@@ -59,6 +59,46 @@ def waypoint_loss(
     return (predicted_waypoints - ground_truth).square().sum(dim=-1).mean()
 
 
+def relative_kv_drift(
+    student_kv: torch.Tensor,
+    reference_kv: torch.Tensor,
+    visual_mask: torch.Tensor,
+    eps: float = 1e-12,
+) -> torch.Tensor:
+    """Mean per-sample ``||KV_B3-KV_B2||_2 / ||KV_B2||_2`` on visual tokens."""
+    if student_kv.shape != reference_kv.shape:
+        raise ValueError(
+            "Student/reference K/V shapes differ: "
+            f"{tuple(student_kv.shape)} vs {tuple(reference_kv.shape)}"
+        )
+    if student_kv.ndim != 3 or visual_mask.shape != student_kv.shape[:2]:
+        raise ValueError("K/V tensors and visual_mask must be [B,N,D] and [B,N]")
+
+    student = student_kv.detach()
+    reference = reference_kv.detach().to(
+        device=student.device, dtype=student.dtype
+    )
+    mask = visual_mask.to(device=student.device, dtype=torch.bool)
+    if not mask.any():
+        raise ValueError("Relative K/V drift received no valid visual tokens")
+
+    # Accumulate one sample at a time to avoid materializing a full-batch fp32
+    # difference tensor for Qwen3.5's wide projected K/V activations.
+    relative_drifts = []
+    for batch_index in range(student.shape[0]):
+        valid = mask[batch_index]
+        if not valid.any():
+            continue
+        difference = (
+            student[batch_index, valid] - reference[batch_index, valid]
+        ).float()
+        reference_valid = reference[batch_index, valid].float()
+        difference_norm = difference.square().sum().sqrt()
+        reference_norm = reference_valid.square().sum().sqrt().clamp_min(eps)
+        relative_drifts.append(difference_norm / reference_norm)
+    return torch.stack(relative_drifts).mean()
+
+
 @dataclass
 class Stage4LossOutput:
     total: torch.Tensor

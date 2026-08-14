@@ -650,6 +650,7 @@ class LatentStudent(nn.Module):
         video_grid_thw: Optional[torch.Tensor] = None,
         layer_idx: Optional[int] = None,
         return_mask: bool = False,
+        return_kv: bool = False,
     ):
         """
         Full forward pass with output_hidden_states=True.
@@ -657,7 +658,14 @@ class LatentStudent(nn.Module):
         positions.  ``layer_idx`` is zero-based; ``None`` selects L/2 = 16.
 
         These are x_V — used in Stage 4:
-            L_spatial = -CosSim( ProjectionMLP(x_V), VGGT(I) )
+            L_spatial = 1 - CosSim( ProjectionMLP(x_V), VGGT(I) )
+
+        With ``return_kv=True``, this also captures the selected layer's
+        projected key/value activations at visual-token positions. Qwen3.5's
+        linear-attention layers use a combined ``in_proj_qkv``; in that case
+        the query slice is discarded and the contiguous K/V slices are
+        returned. Full-attention layers concatenate ``k_proj`` and ``v_proj``.
+        This is an activation diagnostic only, not a KV cache.
 
         Layer indexing:
             hidden_states tuple index 0 = embedding layer output
@@ -669,6 +677,8 @@ class LatentStudent(nn.Module):
               Zero-padded when samples contain different visual-token counts.
         visual_mask : [batch, max_visual_tokens], optional
               Returned when ``return_mask=True``; True marks real tokens.
+        kv_V : [batch, max_visual_tokens, key_dim + value_dim], optional
+              Returned when ``return_kv=True``.
         """
         selected_layer = self.mid_layer_idx if layer_idx is None else layer_idx
         if not 0 <= selected_layer < self.num_layers:
@@ -676,21 +686,85 @@ class LatentStudent(nn.Module):
                 f"layer_idx must be in [0, {self.num_layers - 1}], got {selected_layer}"
             )
 
-        embeds = self._build_input_embeds(input_ids, pixel_values, image_grid_thw, pixel_values_videos, video_grid_thw)
-
-        out = self._language_model(
-            inputs_embeds=embeds,
-            attention_mask=attention_mask,
-            use_cache=False,
-            output_hidden_states=True,
-            return_dict=True,
+        embeds = self._build_input_embeds(
+            input_ids,
+            pixel_values,
+            image_grid_thw,
+            pixel_values_videos,
+            video_grid_thw,
         )
+
+        captured_kv = {}
+        hook_handles = []
+        if return_kv:
+            layer = self._language_model.layers[selected_layer]
+            if hasattr(layer, "linear_attn"):
+                token_mixer = layer.linear_attn
+                key_dim = int(getattr(token_mixer, "key_dim"))
+
+                def capture_linear_kv(_module, _inputs, output):
+                    if not isinstance(output, torch.Tensor):
+                        raise TypeError("in_proj_qkv hook expected a tensor output")
+                    # Q and K both have key_dim; V occupies the remainder.
+                    captured_kv["kv"] = output[..., key_dim:]
+
+                hook_handles.append(
+                    token_mixer.in_proj_qkv.register_forward_hook(capture_linear_kv)
+                )
+            elif hasattr(layer, "self_attn"):
+                token_mixer = layer.self_attn
+
+                def capture_key(_module, _inputs, output):
+                    captured_kv["key"] = output
+
+                def capture_value(_module, _inputs, output):
+                    captured_kv["value"] = output
+
+                hook_handles.extend(
+                    [
+                        token_mixer.k_proj.register_forward_hook(capture_key),
+                        token_mixer.v_proj.register_forward_hook(capture_value),
+                    ]
+                )
+            else:
+                raise TypeError(
+                    f"Layer {selected_layer} exposes neither linear_attn nor self_attn"
+                )
+
+        try:
+            out = self._language_model(
+                inputs_embeds=embeds,
+                attention_mask=attention_mask,
+                use_cache=False,
+                output_hidden_states=True,
+                return_dict=True,
+            )
+        finally:
+            for handle in hook_handles:
+                handle.remove()
+
+        kv_hidden = None
+        if return_kv:
+            if "kv" in captured_kv:
+                kv_hidden = captured_kv["kv"]
+            elif "key" in captured_kv and "value" in captured_kv:
+                kv_hidden = torch.cat(
+                    [captured_kv["key"], captured_kv["value"]], dim=-1
+                )
+            else:
+                raise RuntimeError(
+                    f"Layer {selected_layer} K/V projection hooks captured no output"
+                )
 
         # hidden_states[0] = embeddings; hidden_states[i+1] = layer i output
         mid_hidden = out.hidden_states[selected_layer + 1]   # [B, seq, d]
 
         if self._image_token_id is None and not hasattr(self, "_video_token_id"):
             visual_mask = attention_mask.to(torch.bool)
+            if return_kv and return_mask:
+                return mid_hidden, visual_mask, kv_hidden
+            if return_kv:
+                return mid_hidden, kv_hidden
             return (mid_hidden, visual_mask) if return_mask else mid_hidden
 
         mask = torch.zeros_like(input_ids, dtype=torch.bool)
@@ -704,6 +778,11 @@ class LatentStudent(nn.Module):
         x_V = mid_hidden.new_zeros(
             input_ids.shape[0], max_visual, self.hidden_dim
         )
+        kv_V = None
+        if return_kv:
+            kv_V = kv_hidden.new_zeros(
+                input_ids.shape[0], max_visual, kv_hidden.shape[-1]
+            )
         visual_mask = torch.zeros(
             input_ids.shape[0],
             max_visual,
@@ -715,8 +794,14 @@ class LatentStudent(nn.Module):
             if count == 0:
                 continue
             x_V[batch_idx, :count] = mid_hidden[batch_idx, mask[batch_idx]]
+            if kv_V is not None:
+                kv_V[batch_idx, :count] = kv_hidden[batch_idx, mask[batch_idx]]
             visual_mask[batch_idx, :count] = True
 
+        if return_kv and return_mask:
+            return x_V, visual_mask, kv_V
+        if return_kv:
+            return x_V, kv_V
         return (x_V, visual_mask) if return_mask else x_V
 
     # -----------------------------------------------------------------------

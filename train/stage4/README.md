@@ -17,7 +17,7 @@ L = alpha * L_latent + beta * L_waypoint + gamma * L_SF
 
 L_latent   = mean_b,m(1 - cos(z_SF[b,m], stopgrad(z_ref[b,m])))
 L_waypoint = mean_b,i(||predicted[b,i] - ground_truth[b,i]||_2^2)
-L_SF       = -mean_b,n(cos(P(H_visual,SF[b,n]), G_VGGT[b,n]))
+L_SF       = mean_b,n(1 - cos(P(H_visual,SF[b,n]), G_VGGT[b,n]))
 ```
 
 Both the trainable and reference students run the same six-step continuous
@@ -113,14 +113,14 @@ use those completed shards, keep the `.incomplete` directory and opt in:
 python train/stage4/train_stage4.py \
   --materialized_data_dir /path/to/molmoact_stage_10pct.incomplete \
   --allow_incomplete_materialized \
-  --alpha 100 \
-  --beta 100 \
-  --gamma 25 \
+  --alpha 1 \
+  --beta 3 \
+  --gamma 0.025 \
   --eval_steps 500 \
   --eval_batches 50 \
   --early_stopping_patience 5 \
   --early_stopping_min_delta 1e-4 \
-  --wandb_run_name stage4-sf-partial-a100-b100-g25 \
+  --wandb_run_name stage4-sf-partial-a1-b3-g0025 \
   --output_dir checkpoints/stage4_partial
 ```
 
@@ -158,6 +158,7 @@ Stage 4 logs the following every `--log_steps` optimizer steps:
 - total and raw latent/waypoint/Spatial Forcing losses;
 - alpha/beta/gamma-weighted contribution from each loss;
 - latent cosine preservation and VGGT spatial cosine alignment;
+- relative layer-8 visual K/V drift between B3 and frozen B2 during validation;
 - normalized and pixel-space waypoint MAE, normalized RMSE, and prediction/
   target distribution statistics;
 - pre-clipping global and per-optimizer-group gradient norms;
@@ -199,6 +200,20 @@ validation/loss/total = alpha * L_latent
                       + gamma * L_spatial_forcing
 ```
 
+Validation additionally reports the relative layer-8 visual key/value drift:
+
+```text
+validation/representation/relative_kv_drift
+    = mean_sample(
+        ||KV_B3^8 - KV_B2^8||_2 / max(||KV_B2^8||_2, epsilon)
+      )
+```
+
+Qwen3.5 layer 8 is a GatedDeltaNet linear-attention layer. Here `KV^8` means
+the actual K and V activation slices produced by its combined `in_proj_qkv`,
+restricted to primary-image visual-token positions; it does not mean a
+transformer KV cache. B2 is frozen and supplies the denominator/reference.
+
 An improvement must exceed `--early_stopping_min_delta` (default `1e-4`). A
 new best checkpoint is saved immediately and recorded in
 `<output_dir>/best_checkpoint.json`. Training stops after five consecutive
@@ -229,10 +244,10 @@ accidental learning rate.
 optimizer                         AdamW
 betas                             (0.9, 0.95)
 weight decay                      0.01
-Qwen decoder layers 0-7           1e-5
-Qwen decoder layers 8-31          1e-6
-waypoint head (SpatialMLP)         1e-5
-SF projector + BatchNorm           1e-4
+Qwen decoder layers 0-7           5e-7
+Qwen decoder layers 8-31          5e-8
+waypoint head (SpatialMLP)         5e-7
+SF projector + BatchNorm           1e-5
 five learned spatial embeddings    frozen
 scheduler                          cosine decay
 warmup                             500 / 10,000 steps (5%)
@@ -269,7 +284,7 @@ source        allenai/MolmoAct-Midtraining-Mixture[molmoact_tabletop_primary]
 sample ratio  0.1 after validation
 partitions     70/15/15 materialized hash split (training selects train)
 layers        Qwen 8 / VGGT 8 (zero-based)
-loss weights  alpha=1.0, beta=1.0, gamma=0.5
+loss weights  alpha=1.0, beta=3.0, gamma=0.025
 steps/batch    10000 / 16
 ```
 

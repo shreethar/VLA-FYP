@@ -255,7 +255,7 @@ def _add_vggt_position_embedding(
 
 
 class SpatialForcingAlignment(nn.Module):
-    """Planner-view projector and raw ``-cosine`` Spatial Forcing loss.
+    """Planner-view projector and ``1 - cosine`` Spatial Forcing loss.
 
     Qwen and VGGT token counts are never treated as correspondence metadata.
     Qwen's processor-provided ``image_grid_thw`` is converted to the
@@ -413,7 +413,7 @@ class SpatialForcingAlignment(nn.Module):
             sample_similarities.append(cosine.mean())
 
         mean_cosine = torch.stack(sample_similarities).mean()
-        return -mean_cosine, mean_cosine.detach()
+        return 1.0 - mean_cosine, mean_cosine.detach()
 
 
 # Backward-compatible aliases for older notebooks.

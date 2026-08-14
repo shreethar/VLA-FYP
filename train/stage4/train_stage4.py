@@ -40,6 +40,7 @@ from train.stage4.checkpointing import (
 from train.stage4.losses import (
     combine_stage4_losses,
     latent_reasoning_preservation_loss,
+    relative_kv_drift,
     waypoint_loss,
 )
 from train.stage4.models.spatial_forcing import (
@@ -79,12 +80,12 @@ class Stage4Config:
     student_visual_layer: int = 8
     vggt_layer: int = 8
     alpha: float = 1.0
-    beta: float = 1.0
-    gamma: float = 0.5
-    qwen_layers_0_7_lr: float = 1e-5
-    qwen_layers_8_31_lr: float = 1e-6
-    waypoint_head_lr: float = 1e-5
-    projector_lr: float = 1e-4
+    beta: float = 3.0
+    gamma: float = 0.025
+    qwen_layers_0_7_lr: float = 5e-7
+    qwen_layers_8_31_lr: float = 5e-8
+    waypoint_head_lr: float = 5e-7
+    projector_lr: float = 1e-5
     adam_beta1: float = 0.9
     adam_beta2: float = 0.95
     weight_decay: float = 0.01
@@ -327,6 +328,19 @@ def _evaluate_stage4(
                     pixel_values_videos=pixel_values_videos,
                     video_grid_thw=video_grid_thw,
                 )
+                _, reference_visual_mask, reference_kv = (
+                    reference.get_mid_layer_visual_features(
+                        input_ids,
+                        pixel_values,
+                        image_grid_thw,
+                        attention_mask,
+                        pixel_values_videos=pixel_values_videos,
+                        video_grid_thw=video_grid_thw,
+                        layer_idx=config.student_visual_layer,
+                        return_mask=True,
+                        return_kv=True,
+                    )
+                )
                 geometry_features = vggt(vggt_images, vggt_view_mask)
                 sf_latents, _, _, predicted_waypoints = student.generate_latents(
                     input_ids,
@@ -336,7 +350,7 @@ def _evaluate_stage4(
                     pixel_values_videos=pixel_values_videos,
                     video_grid_thw=video_grid_thw,
                 )
-                student_visual, student_visual_mask = (
+                student_visual, student_visual_mask, student_kv = (
                     student.get_mid_layer_visual_features(
                         input_ids,
                         pixel_values,
@@ -346,6 +360,7 @@ def _evaluate_stage4(
                         video_grid_thw=video_grid_thw,
                         layer_idx=config.student_visual_layer,
                         return_mask=True,
+                        return_kv=True,
                     )
                 )
 
@@ -362,6 +377,15 @@ def _evaluate_stage4(
                 planner_view_indices=planner_view_indices,
                 vggt_patch_size=vggt.patch_size,
             )
+            if not torch.equal(student_visual_mask, reference_visual_mask):
+                raise RuntimeError(
+                    "B3/B2 layer-8 visual-token masks differ during validation"
+                )
+            kv_drift = relative_kv_drift(
+                student_kv,
+                reference_kv,
+                student_visual_mask,
+            )
             losses = combine_stage4_losses(
                 latent=latent,
                 waypoint=waypoint,
@@ -372,9 +396,13 @@ def _evaluate_stage4(
                 gamma=config.gamma,
             )
             batch_size = int(input_ids.shape[0])
-            for key, value in _detached_stage4_metrics(
+            batch_metrics = _detached_stage4_metrics(
                 losses, predicted_waypoints, ground_truth, config
-            ).items():
+            )
+            batch_metrics["representation/relative_kv_drift"] = float(
+                kv_drift.item()
+            )
+            for key, value in batch_metrics.items():
                 metric_sums[key] = metric_sums.get(key, 0.0) + value * batch_size
             sample_count += batch_size
             batch_count += 1
@@ -1066,13 +1094,15 @@ def train(config: Stage4Config, dataloader=None, validation_dataloader=None) -> 
 
             logger.info(
                 "validation step=%d total=%.6f latent=%.6f waypoint=%.6f "
-                "sf=%.6f sf_cos=%.6f samples=%d improved=%s patience=%d/%d",
+                "sf=%.6f sf_cos=%.6f delta_kv=%.6f samples=%d improved=%s "
+                "patience=%d/%d",
                 step,
                 validation_metrics["loss/total"],
                 validation_metrics["loss/latent"],
                 validation_metrics["loss/waypoint"],
                 validation_metrics["loss/spatial_forcing"],
                 validation_metrics["spatial/cosine"],
+                validation_metrics["representation/relative_kv_drift"],
                 int(validation_metrics["evaluation/samples"]),
                 improved,
                 early_stopping_bad_evals,
@@ -1202,12 +1232,12 @@ def parse_args() -> Stage4Config:
     parser.add_argument("--student_visual_layer", type=int, default=8)
     parser.add_argument("--vggt_layer", type=int, default=8)
     parser.add_argument("--alpha", type=float, default=1.0)
-    parser.add_argument("--beta", type=float, default=1.0)
-    parser.add_argument("--gamma", type=float, default=0.5)
-    parser.add_argument("--qwen_layers_0_7_lr", type=float, default=1e-5)
-    parser.add_argument("--qwen_layers_8_31_lr", type=float, default=1e-6)
-    parser.add_argument("--waypoint_head_lr", type=float, default=1e-5)
-    parser.add_argument("--projector_lr", type=float, default=1e-4)
+    parser.add_argument("--beta", type=float, default=3.0)
+    parser.add_argument("--gamma", type=float, default=0.025)
+    parser.add_argument("--qwen_layers_0_7_lr", type=float, default=5e-7)
+    parser.add_argument("--qwen_layers_8_31_lr", type=float, default=5e-8)
+    parser.add_argument("--waypoint_head_lr", type=float, default=5e-7)
+    parser.add_argument("--projector_lr", type=float, default=1e-5)
     parser.add_argument("--adam_beta1", type=float, default=0.9)
     parser.add_argument("--adam_beta2", type=float, default=0.95)
     parser.add_argument("--weight_decay", type=float, default=0.01)

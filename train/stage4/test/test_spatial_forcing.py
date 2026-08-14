@@ -8,6 +8,7 @@ from PIL import Image
 from train.stage4.checkpointing import restore_stage4_training_state
 from train.stage4.losses import (
     latent_reasoning_preservation_loss,
+    relative_kv_drift,
     waypoint_loss,
 )
 from train.stage4.inspect_spatial_correspondence import (
@@ -78,6 +79,7 @@ def test_spatial_alignment_is_tokenwise_and_differentiable():
     )
     assert loss.ndim == 0
     assert cosine.ndim == 0
+    assert torch.allclose(loss, 1.0 - cosine, atol=1e-6)
     loss.backward()
     assert student.grad is not None
     assert torch.isfinite(student.grad).all()
@@ -334,10 +336,22 @@ def test_optimizer_uses_requested_layer_dependent_groups():
     by_name = {group["group_name"]: group for group in optimizer_groups}
     assert len(grouped["qwen_layers_0_7"]) == 8
     assert len(grouped["qwen_layers_8_31"]) == 24
-    assert by_name["qwen_layers_0_7"]["lr"] == 1e-5
-    assert by_name["qwen_layers_8_31"]["lr"] == 1e-6
-    assert by_name["waypoint_head"]["lr"] == 1e-5
-    assert by_name["sf_projector"]["lr"] == 1e-4
+    assert by_name["qwen_layers_0_7"]["lr"] == 5e-7
+    assert by_name["qwen_layers_8_31"]["lr"] == 5e-8
+    assert by_name["waypoint_head"]["lr"] == 5e-7
+    assert by_name["sf_projector"]["lr"] == 1e-5
+    assert config.alpha == 1.0
+    assert config.beta == 3.0
+    assert config.gamma == 0.025
+
+
+def test_relative_kv_drift_uses_frozen_reference_norm():
+    reference = torch.tensor([[[3.0, 4.0], [99.0, 99.0]]])
+    student = torch.tensor([[[6.0, 8.0], [-50.0, -50.0]]])
+    mask = torch.tensor([[True, False]])
+    # ||[3,4]|| / ||[3,4]|| = 1; masked padding must not contribute.
+    drift = relative_kv_drift(student, reference, mask)
+    assert torch.allclose(drift, torch.tensor(1.0))
 
 
 def test_incomplete_materialized_opt_in_requires_a_local_directory():
