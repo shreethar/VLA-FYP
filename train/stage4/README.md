@@ -116,6 +116,10 @@ python train/stage4/train_stage4.py \
   --alpha 100 \
   --beta 100 \
   --gamma 25 \
+  --eval_steps 500 \
+  --eval_batches 50 \
+  --early_stopping_patience 5 \
+  --early_stopping_min_delta 1e-4 \
   --wandb_run_name stage4-sf-partial-a100-b100-g25 \
   --output_dir checkpoints/stage4_partial
 ```
@@ -175,6 +179,44 @@ Useful controls:
 --wandb_tags stage4,spatial-forcing,molmoact,partial
 --wandb_mode offline      # retain local W&B logs without network sync
 --no_wandb                # explicitly disable tracking
+```
+
+## Validation and early stopping
+
+Evaluation is enabled by default. Every 500 optimizer steps, Stage 4 evaluates
+a fixed, deterministic prefix of 50 batches from the materialized
+`validation/` partition (800 samples with batch size 16). The student and SF
+projector switch to evaluation mode, so dropout is disabled and BatchNorm uses
+its training running statistics; all three models run without gradients.
+
+Validation reports the same raw and weighted losses, cosine metrics, and
+trajectory errors as training under `validation/*` W&B keys. The monitored
+quantity is the weighted validation objective:
+
+```text
+validation/loss/total = alpha * L_latent
+                      + beta  * L_waypoint
+                      + gamma * L_spatial_forcing
+```
+
+An improvement must exceed `--early_stopping_min_delta` (default `1e-4`). A
+new best checkpoint is saved immediately and recorded in
+`<output_dir>/best_checkpoint.json`. Training stops after five consecutive
+validation checks without sufficient improvement, equivalent to at most 2,500
+non-improving training steps with the defaults. The best loss, patience count,
+sample count, and best-checkpoint path are included in every Stage 4 checkpoint
+and restored by `--resume_from`.
+
+Controls:
+
+```bash
+--eval_steps 500
+--eval_batches 50
+--eval_batch_size 16
+--early_stopping_patience 5
+--early_stopping_min_delta 1e-4
+--no_early_stopping       # keep validation, never stop early
+--no_eval                 # disable validation and early stopping
 ```
 
 ## Optimization recipe

@@ -1,9 +1,11 @@
 import io
+import sys
 
 import torch
 import torch.nn as nn
 from PIL import Image
 
+from train.stage4.checkpointing import restore_stage4_training_state
 from train.stage4.losses import (
     latent_reasoning_preservation_loss,
     waypoint_loss,
@@ -33,7 +35,9 @@ from train.stage4.train_stage4 import (
     Stage4Config,
     _build_optimizer_groups,
     _parameter_grad_norm,
+    _update_early_stopping,
     _validate_config,
+    parse_args,
 )
 
 
@@ -362,3 +366,75 @@ def test_wandb_configuration_validation():
         assert "wandb_mode" in str(error)
     else:
         raise AssertionError("Invalid W&B mode was accepted")
+
+
+def test_early_stopping_requires_minimum_improvement_and_resets_patience():
+    best, bad, improved = _update_early_stopping(
+        validation_loss=0.99,
+        best_validation_loss=1.0,
+        bad_evaluations=3,
+        min_delta=0.001,
+    )
+    assert improved
+    assert best == 0.99
+    assert bad == 0
+
+    best, bad, improved = _update_early_stopping(
+        validation_loss=0.9895,
+        best_validation_loss=best,
+        bad_evaluations=bad,
+        min_delta=0.001,
+    )
+    assert not improved
+    assert best == 0.99
+    assert bad == 1
+
+
+def test_early_stopping_configuration_validation():
+    _validate_config(Stage4Config(eval_steps=100, eval_batches=2))
+    try:
+        _validate_config(Stage4Config(early_stopping_patience=0))
+    except ValueError as error:
+        assert "early_stopping_patience" in str(error)
+    else:
+        raise AssertionError("Zero early-stopping patience was accepted")
+
+
+def test_stage4_resume_restores_early_stopping_metadata(tmp_path):
+    alignment = nn.Linear(2, 2)
+    checkpoint_dir = tmp_path / "step_000500"
+    checkpoint_dir.mkdir()
+    torch.save(
+        {
+            "step": 500,
+            "spatial_alignment": alignment.state_dict(),
+            "optimizer": None,
+            "scheduler": None,
+            "training_metadata": {
+                "best_validation_loss": 1.25,
+                "early_stopping_bad_evals": 3,
+            },
+        },
+        checkpoint_dir / "stage4_state.pt",
+    )
+    restored = {}
+    step = restore_stage4_training_state(
+        checkpoint_dir,
+        alignment,
+        training_metadata_out=restored,
+    )
+    assert step == 500
+    assert restored["best_validation_loss"] == 1.25
+    assert restored["early_stopping_bad_evals"] == 3
+
+
+def test_no_eval_cli_also_disables_early_stopping(monkeypatch):
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        ["train_stage4.py", "--no_eval", "--no_wandb"],
+    )
+    config = parse_args()
+    assert not config.evaluate
+    assert not config.early_stopping
+    _validate_config(config)

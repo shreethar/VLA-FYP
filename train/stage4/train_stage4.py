@@ -94,6 +94,13 @@ class Stage4Config:
     grad_clip: float = 1.0
     save_steps: int = 500
     log_steps: int = 10
+    evaluate: bool = True
+    eval_steps: int = 500
+    eval_batches: int = 50
+    eval_batch_size: Optional[int] = None
+    early_stopping: bool = True
+    early_stopping_patience: int = 5
+    early_stopping_min_delta: float = 1e-4
     seed: int = 42
     projector_normalization: str = "batchnorm"
     use_vggt_position_embedding: bool = False
@@ -179,6 +186,215 @@ def _parameter_grad_norm(parameters: list[torch.nn.Parameter]) -> float:
     if not norms:
         return 0.0
     return float(torch.stack(norms).norm(2).item())
+
+
+def _write_best_checkpoint_pointer(
+    output_dir: str,
+    *,
+    checkpoint_path: str,
+    step: int,
+    validation_loss: float,
+) -> Path:
+    """Atomically record which step owns the best validation objective."""
+    root = Path(output_dir)
+    root.mkdir(parents=True, exist_ok=True)
+    target = root / "best_checkpoint.json"
+    temporary = root / "best_checkpoint.json.tmp"
+    temporary.write_text(
+        json.dumps(
+            {
+                "checkpoint_path": checkpoint_path,
+                "step": step,
+                "monitor": "validation/loss/total",
+                "validation_loss": validation_loss,
+            },
+            indent=2,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    temporary.replace(target)
+    return target
+
+
+def _update_early_stopping(
+    *,
+    validation_loss: float,
+    best_validation_loss: float,
+    bad_evaluations: int,
+    min_delta: float,
+) -> tuple[float, int, bool]:
+    """Update a minimization monitor using an absolute improvement threshold."""
+    improved = validation_loss < best_validation_loss - min_delta
+    if improved:
+        return validation_loss, 0, True
+    return best_validation_loss, bad_evaluations + 1, False
+
+
+def _detached_stage4_metrics(
+    losses,
+    predicted_waypoints: torch.Tensor,
+    ground_truth: torch.Tensor,
+    config: Stage4Config,
+) -> dict[str, float]:
+    """Scalar objective and trajectory-quality metrics shared by train/eval."""
+    metrics = losses.detached_metrics()
+    trajectory_error = (
+        predicted_waypoints.detach().float() - ground_truth.detach().float()
+    )
+    latent_value = metrics["loss/latent"]
+    waypoint_value = metrics["loss/waypoint"]
+    spatial_value = metrics["loss/spatial_forcing"]
+    metrics.update(
+        {
+            "loss_weighted/latent": config.alpha * latent_value,
+            "loss_weighted/waypoint": config.beta * waypoint_value,
+            "loss_weighted/spatial_forcing": config.gamma * spatial_value,
+            "latent/cosine": 1.0 - latent_value,
+            "trajectory/mae_normalized": float(
+                trajectory_error.abs().mean().item()
+            ),
+            "trajectory/rmse_normalized": float(
+                trajectory_error.square().mean().sqrt().item()
+            ),
+            "trajectory/mae_pixels": float(
+                trajectory_error.abs().mean().mul(255.0).item()
+            ),
+            "trajectory/prediction_mean": float(
+                predicted_waypoints.detach().float().mean().item()
+            ),
+            "trajectory/prediction_std": float(
+                predicted_waypoints.detach().float().std(unbiased=False).item()
+            ),
+            "trajectory/target_mean": float(ground_truth.float().mean().item()),
+            "trajectory/target_std": float(
+                ground_truth.float().std(unbiased=False).item()
+            ),
+        }
+    )
+    return metrics
+
+
+@torch.no_grad()
+def _evaluate_stage4(
+    dataloader,
+    *,
+    reference,
+    student,
+    vggt,
+    spatial_alignment,
+    device: torch.device,
+    config: Stage4Config,
+    qwen_spatial_merge_size: int,
+) -> dict[str, float]:
+    """Evaluate a stable prefix of the validation partition without gradients."""
+    student_was_training = student.training
+    alignment_was_training = spatial_alignment.training
+    student.eval()
+    spatial_alignment.eval()
+    metric_sums: dict[str, float] = {}
+    sample_count = 0
+    batch_count = 0
+    started = time.perf_counter()
+
+    try:
+        for batch_index, batch in enumerate(dataloader):
+            if batch_index >= config.eval_batches:
+                break
+            input_ids = batch["input_ids"].to(device, non_blocking=True)
+            attention_mask = batch["attention_mask"].to(device, non_blocking=True)
+            pixel_values = _move_optional(batch.get("pixel_values"), device)
+            image_grid_thw = _move_optional(batch.get("image_grid_thw"), device)
+            pixel_values_videos = _move_optional(
+                batch.get("pixel_values_videos"), device
+            )
+            video_grid_thw = _move_optional(batch.get("video_grid_thw"), device)
+            ground_truth = batch["gt_waypoints"].to(device, non_blocking=True)
+            vggt_images = batch["vggt_images"].to(device, non_blocking=True)
+            vggt_view_mask = batch["vggt_view_mask"].to(
+                device, non_blocking=True
+            )
+            planner_view_indices = batch["planner_view_indices"].to(
+                device, non_blocking=True
+            )
+
+            with _autocast_context(device):
+                reference_latents = reference.generate_reasoning_latents(
+                    input_ids,
+                    pixel_values,
+                    image_grid_thw,
+                    attention_mask,
+                    pixel_values_videos=pixel_values_videos,
+                    video_grid_thw=video_grid_thw,
+                )
+                geometry_features = vggt(vggt_images, vggt_view_mask)
+                sf_latents, _, _, predicted_waypoints = student.generate_latents(
+                    input_ids,
+                    pixel_values,
+                    image_grid_thw,
+                    attention_mask,
+                    pixel_values_videos=pixel_values_videos,
+                    video_grid_thw=video_grid_thw,
+                )
+                student_visual, student_visual_mask = (
+                    student.get_mid_layer_visual_features(
+                        input_ids,
+                        pixel_values,
+                        image_grid_thw,
+                        attention_mask,
+                        pixel_values_videos=pixel_values_videos,
+                        video_grid_thw=video_grid_thw,
+                        layer_idx=config.student_visual_layer,
+                        return_mask=True,
+                    )
+                )
+
+            latent = latent_reasoning_preservation_loss(
+                sf_latents, reference_latents
+            )
+            waypoint = waypoint_loss(predicted_waypoints, ground_truth)
+            spatial_forcing, spatial_cosine = spatial_alignment(
+                student_visual,
+                student_visual_mask,
+                geometry_features,
+                image_grid_thw=image_grid_thw,
+                spatial_merge_size=qwen_spatial_merge_size,
+                planner_view_indices=planner_view_indices,
+                vggt_patch_size=vggt.patch_size,
+            )
+            losses = combine_stage4_losses(
+                latent=latent,
+                waypoint=waypoint,
+                spatial_forcing=spatial_forcing,
+                spatial_cosine=spatial_cosine,
+                alpha=config.alpha,
+                beta=config.beta,
+                gamma=config.gamma,
+            )
+            batch_size = int(input_ids.shape[0])
+            for key, value in _detached_stage4_metrics(
+                losses, predicted_waypoints, ground_truth, config
+            ).items():
+                metric_sums[key] = metric_sums.get(key, 0.0) + value * batch_size
+            sample_count += batch_size
+            batch_count += 1
+    finally:
+        student.train(student_was_training)
+        spatial_alignment.train(alignment_was_training)
+
+    if sample_count == 0:
+        raise RuntimeError("Validation dataloader produced no samples")
+    elapsed = time.perf_counter() - started
+    metrics = {key: value / sample_count for key, value in metric_sums.items()}
+    metrics.update(
+        {
+            "evaluation/batches": float(batch_count),
+            "evaluation/samples": float(sample_count),
+            "evaluation/seconds": elapsed,
+            "evaluation/samples_per_second": sample_count / max(elapsed, 1e-12),
+        }
+    )
+    return metrics
 
 
 def _build_scheduler(optimizer, warmup_steps: int, total_steps: int):
@@ -335,13 +551,25 @@ def _validate_config(config: Stage4Config) -> None:
         )
     if config.log_steps < 1:
         raise ValueError("log_steps must be positive")
+    if config.evaluate and config.eval_steps < 1:
+        raise ValueError("eval_steps must be positive when evaluation is enabled")
+    if config.evaluate and config.eval_batches < 1:
+        raise ValueError("eval_batches must be positive when evaluation is enabled")
+    if config.eval_batch_size is not None and config.eval_batch_size < 1:
+        raise ValueError("eval_batch_size must be positive")
+    if config.early_stopping and not config.evaluate:
+        raise ValueError("Early stopping requires evaluation")
+    if config.early_stopping_patience < 1:
+        raise ValueError("early_stopping_patience must be positive")
+    if config.early_stopping_min_delta < 0.0:
+        raise ValueError("early_stopping_min_delta must be non-negative")
     if config.use_wandb and not config.wandb_project.strip():
         raise ValueError("wandb_project cannot be empty when W&B is enabled")
     if config.wandb_mode not in {"online", "offline"}:
         raise ValueError("wandb_mode must be online or offline")
 
 
-def train(config: Stage4Config, dataloader=None) -> None:
+def train(config: Stage4Config, dataloader=None, validation_dataloader=None) -> None:
     _validate_config(config)
     wandb_run = _init_wandb(config)
     if not torch.cuda.is_available():
@@ -422,21 +650,26 @@ def train(config: Stage4Config, dataloader=None) -> None:
     )
 
     start_step = 0
+    restored_training_metadata: dict = {}
     if config.resume_from:
         start_step = restore_stage4_training_state(
             config.resume_from,
             spatial_alignment,
             optimizer,
             scheduler,
+            training_metadata_out=restored_training_metadata,
         )
         logger.info("Resumed Stage 4 optimizer/projector at step %d", start_step)
 
-    if dataloader is None:
+    processor = None
+    if dataloader is None or (config.evaluate and validation_dataloader is None):
         from transformers import AutoProcessor
 
         processor = AutoProcessor.from_pretrained(
             processor_name, trust_remote_code=True
         )
+
+    if dataloader is None:
         dataloader = build_stage4_dataloader(
             processor=processor,
             hf_repo=config.hf_repo,
@@ -455,6 +688,27 @@ def train(config: Stage4Config, dataloader=None) -> None:
             seed=config.seed,
             materialized_data_dir=config.materialized_data_dir,
             allow_incomplete_materialized=config.allow_incomplete_materialized,
+        )
+    if config.evaluate and validation_dataloader is None:
+        validation_dataloader = build_stage4_dataloader(
+            processor=processor,
+            hf_repo=config.hf_repo,
+            hf_config=config.hf_config,
+            split=config.split,
+            data_partition="validation",
+            split_ratios=(
+                config.train_ratio,
+                config.validation_ratio,
+                config.test_ratio,
+            ),
+            batch_size=config.eval_batch_size or config.batch_size,
+            num_workers=config.num_workers,
+            max_length=config.max_seq_len,
+            sample_ratio=config.sample_ratio,
+            seed=config.seed,
+            materialized_data_dir=config.materialized_data_dir,
+            allow_incomplete_materialized=config.allow_incomplete_materialized,
+            drop_last=False,
         )
 
     logger.info(
@@ -503,6 +757,17 @@ def train(config: Stage4Config, dataloader=None) -> None:
         config.warmup_steps,
         config.max_steps,
     )
+    if config.evaluate:
+        logger.info(
+            "Validation every %d steps: up to %d batches of %d; early "
+            "stopping=%s patience=%d min_delta=%g monitor=loss/total",
+            config.eval_steps,
+            config.eval_batches,
+            config.eval_batch_size or config.batch_size,
+            config.early_stopping,
+            config.early_stopping_patience,
+            config.early_stopping_min_delta,
+        )
 
     reference.eval()
     vggt.eval()
@@ -511,15 +776,52 @@ def train(config: Stage4Config, dataloader=None) -> None:
     data_iterator = iter(dataloader)
     optimizer.zero_grad(set_to_none=True)
     last_saved_step = start_step
-    samples_seen = start_step * config.batch_size * config.gradient_accumulation_steps
-    best_total_loss = math.inf
-    best_waypoint_loss = math.inf
-    best_latent_loss = math.inf
-    best_spatial_cosine = -math.inf
+    samples_seen = int(
+        restored_training_metadata.get(
+            "samples_seen",
+            start_step * config.batch_size * config.gradient_accumulation_steps,
+        )
+    )
+    best_total_loss = float(
+        restored_training_metadata.get("best_total_loss", math.inf)
+    )
+    best_waypoint_loss = float(
+        restored_training_metadata.get("best_waypoint_loss", math.inf)
+    )
+    best_latent_loss = float(
+        restored_training_metadata.get("best_latent_loss", math.inf)
+    )
+    best_spatial_cosine = float(
+        restored_training_metadata.get("best_spatial_cosine", -math.inf)
+    )
+    best_validation_loss = float(
+        restored_training_metadata.get("best_validation_loss", math.inf)
+    )
+    early_stopping_bad_evals = int(
+        restored_training_metadata.get("early_stopping_bad_evals", 0)
+    )
+    best_checkpoint_path = restored_training_metadata.get("best_checkpoint_path")
+    stopped_early = False
+    final_step = start_step
+
+    def checkpoint_metadata() -> dict:
+        return {
+            "samples_seen": samples_seen,
+            "best_total_loss": best_total_loss,
+            "best_waypoint_loss": best_waypoint_loss,
+            "best_latent_loss": best_latent_loss,
+            "best_spatial_cosine": best_spatial_cosine,
+            "best_validation_loss": best_validation_loss,
+            "early_stopping_bad_evals": early_stopping_bad_evals,
+            "best_checkpoint_path": best_checkpoint_path,
+            "stopped_early": stopped_early,
+        }
+
     if device.type == "cuda":
         torch.cuda.reset_peak_memory_stats(device)
 
     for step in range(start_step + 1, config.max_steps + 1):
+        final_step = step
         step_started = time.perf_counter()
         step_sample_count = 0
         should_log = step % config.log_steps == 0 or step == start_step + 1
@@ -606,39 +908,9 @@ def train(config: Stage4Config, dataloader=None) -> None:
             )
             (losses.total / config.gradient_accumulation_steps).backward()
 
-            for key, value in losses.detached_metrics().items():
-                metric_sums[key] = metric_sums.get(key, 0.0) + value
-            trajectory_error = (
-                predicted_waypoints.detach().float() - ground_truth.detach().float()
-            )
-            auxiliary_metrics = {
-                "loss_weighted/latent": config.alpha * float(latent.detach().item()),
-                "loss_weighted/waypoint": config.beta
-                * float(waypoint.detach().item()),
-                "loss_weighted/spatial_forcing": config.gamma
-                * float(spatial_forcing.detach().item()),
-                "latent/cosine": 1.0 - float(latent.detach().item()),
-                "trajectory/mae_normalized": float(
-                    trajectory_error.abs().mean().item()
-                ),
-                "trajectory/rmse_normalized": float(
-                    trajectory_error.square().mean().sqrt().item()
-                ),
-                "trajectory/mae_pixels": float(
-                    trajectory_error.abs().mean().mul(255.0).item()
-                ),
-                "trajectory/prediction_mean": float(
-                    predicted_waypoints.detach().float().mean().item()
-                ),
-                "trajectory/prediction_std": float(
-                    predicted_waypoints.detach().float().std(unbiased=False).item()
-                ),
-                "trajectory/target_mean": float(ground_truth.float().mean().item()),
-                "trajectory/target_std": float(
-                    ground_truth.float().std(unbiased=False).item()
-                ),
-            }
-            for key, value in auxiliary_metrics.items():
+            for key, value in _detached_stage4_metrics(
+                losses, predicted_waypoints, ground_truth, config
+            ).items():
                 metric_sums[key] = metric_sums.get(key, 0.0) + value
 
         assert_spatial_tokens_frozen(student)
@@ -678,6 +950,14 @@ def train(config: Stage4Config, dataloader=None) -> None:
                 current_lrs["qwen_layers_8_31"],
                 current_lrs["waypoint_head"],
                 current_lrs["sf_projector"],
+            )
+            best_total_loss = min(best_total_loss, metrics["loss/total"])
+            best_waypoint_loss = min(
+                best_waypoint_loss, metrics["loss/waypoint"]
+            )
+            best_latent_loss = min(best_latent_loss, metrics["loss/latent"])
+            best_spatial_cosine = max(
+                best_spatial_cosine, metrics["spatial/cosine"]
             )
             if wandb_run is not None:
                 wandb_metrics = {
@@ -721,16 +1001,8 @@ def train(config: Stage4Config, dataloader=None) -> None:
                         }
                     )
                     torch.cuda.reset_peak_memory_stats(device)
-                wandb_run.log(wandb_metrics, step=step)
+                wandb_run.log(wandb_metrics)
 
-                best_total_loss = min(best_total_loss, metrics["loss/total"])
-                best_waypoint_loss = min(
-                    best_waypoint_loss, metrics["loss/waypoint"]
-                )
-                best_latent_loss = min(best_latent_loss, metrics["loss/latent"])
-                best_spatial_cosine = max(
-                    best_spatial_cosine, metrics["spatial/cosine"]
-                )
                 wandb_run.summary.update(
                     {
                         "best/loss_total": best_total_loss,
@@ -740,7 +1012,107 @@ def train(config: Stage4Config, dataloader=None) -> None:
                     }
                 )
 
-        if step % config.save_steps == 0:
+        should_evaluate = config.evaluate and (
+            step % config.eval_steps == 0 or step == config.max_steps
+        )
+        if should_evaluate:
+            validation_metrics = _evaluate_stage4(
+                validation_dataloader,
+                reference=reference,
+                student=student,
+                vggt=vggt,
+                spatial_alignment=spatial_alignment,
+                device=device,
+                config=config,
+                qwen_spatial_merge_size=qwen_spatial_merge_size,
+            )
+            validation_loss = validation_metrics["loss/total"]
+            (
+                best_validation_loss,
+                early_stopping_bad_evals,
+                improved,
+            ) = _update_early_stopping(
+                validation_loss=validation_loss,
+                best_validation_loss=best_validation_loss,
+                bad_evaluations=early_stopping_bad_evals,
+                min_delta=config.early_stopping_min_delta,
+            )
+            if improved:
+                best_checkpoint_path = str(
+                    Path(config.output_dir) / f"step_{step:06d}"
+                )
+                saved = save_stage4_checkpoint(
+                    config.output_dir,
+                    step,
+                    student,
+                    spatial_alignment,
+                    optimizer,
+                    scheduler,
+                    config,
+                    training_metadata=checkpoint_metadata(),
+                )
+                last_saved_step = step
+                best_checkpoint_path = str(saved)
+                pointer = _write_best_checkpoint_pointer(
+                    config.output_dir,
+                    checkpoint_path=best_checkpoint_path,
+                    step=step,
+                    validation_loss=validation_loss,
+                )
+                logger.info("New best validation checkpoint: %s (%s)", saved, pointer)
+                if wandb_run is not None:
+                    wandb_run.summary["checkpoint/latest_step"] = step
+                    wandb_run.summary["checkpoint/latest_path"] = str(saved)
+
+            logger.info(
+                "validation step=%d total=%.6f latent=%.6f waypoint=%.6f "
+                "sf=%.6f sf_cos=%.6f samples=%d improved=%s patience=%d/%d",
+                step,
+                validation_metrics["loss/total"],
+                validation_metrics["loss/latent"],
+                validation_metrics["loss/waypoint"],
+                validation_metrics["loss/spatial_forcing"],
+                validation_metrics["spatial/cosine"],
+                int(validation_metrics["evaluation/samples"]),
+                improved,
+                early_stopping_bad_evals,
+                config.early_stopping_patience,
+            )
+            if wandb_run is not None:
+                wandb_run.log(
+                    {
+                        "progress/optimizer_step": step,
+                        **{
+                            f"validation/{key}": value
+                            for key, value in validation_metrics.items()
+                        },
+                        "early_stopping/best_validation_loss": best_validation_loss,
+                        "early_stopping/bad_evaluations": early_stopping_bad_evals,
+                        "early_stopping/patience": config.early_stopping_patience,
+                        "early_stopping/improved": float(improved),
+                    }
+                )
+                wandb_run.summary["best/validation_loss"] = best_validation_loss
+                if best_checkpoint_path:
+                    wandb_run.summary["best/checkpoint_path"] = best_checkpoint_path
+
+            if (
+                config.early_stopping
+                and early_stopping_bad_evals >= config.early_stopping_patience
+            ):
+                stopped_early = True
+                logger.info(
+                    "Early stopping at step %d: validation loss did not improve "
+                    "by at least %g for %d evaluations. Best=%.6f at %s",
+                    step,
+                    config.early_stopping_min_delta,
+                    config.early_stopping_patience,
+                    best_validation_loss,
+                    best_checkpoint_path,
+                )
+                break
+
+        if step % config.save_steps == 0 and last_saved_step != step:
             saved = save_stage4_checkpoint(
                 config.output_dir,
                 step,
@@ -749,6 +1121,7 @@ def train(config: Stage4Config, dataloader=None) -> None:
                 optimizer,
                 scheduler,
                 config,
+                training_metadata=checkpoint_metadata(),
             )
             last_saved_step = step
             logger.info("Saved %s", saved)
@@ -756,26 +1129,31 @@ def train(config: Stage4Config, dataloader=None) -> None:
                 wandb_run.summary["checkpoint/latest_step"] = step
                 wandb_run.summary["checkpoint/latest_path"] = str(saved)
 
-    if last_saved_step != config.max_steps:
+    if last_saved_step != final_step:
         saved = save_stage4_checkpoint(
             config.output_dir,
-            config.max_steps,
+            final_step,
             student,
             spatial_alignment,
             optimizer,
             scheduler,
             config,
+            training_metadata=checkpoint_metadata(),
         )
         logger.info("Saved final checkpoint %s", saved)
-        last_saved_step = config.max_steps
+        last_saved_step = final_step
         if wandb_run is not None:
-            wandb_run.summary["checkpoint/latest_step"] = config.max_steps
+            wandb_run.summary["checkpoint/latest_step"] = final_step
             wandb_run.summary["checkpoint/latest_path"] = str(saved)
 
     if wandb_run is not None:
-        wandb_run.summary["training/final_step"] = config.max_steps
+        wandb_run.summary["training/final_step"] = final_step
         wandb_run.summary["training/samples_seen"] = samples_seen
         wandb_run.summary["training/completed"] = True
+        wandb_run.summary["training/stopped_early"] = stopped_early
+        wandb_run.summary["early_stopping/bad_evaluations"] = (
+            early_stopping_bad_evals
+        )
         wandb_run.finish()
 
 
@@ -839,6 +1217,22 @@ def parse_args() -> Stage4Config:
     parser.add_argument("--grad_clip", type=float, default=1.0)
     parser.add_argument("--save_steps", type=int, default=500)
     parser.add_argument("--log_steps", type=int, default=10)
+    parser.add_argument("--eval_steps", type=int, default=500)
+    parser.add_argument(
+        "--eval_batches",
+        type=int,
+        default=50,
+        help="Maximum validation batches per evaluation",
+    )
+    parser.add_argument(
+        "--eval_batch_size",
+        type=int,
+        help="Validation batch size (defaults to --batch_size)",
+    )
+    parser.add_argument("--no_eval", action="store_true")
+    parser.add_argument("--no_early_stopping", action="store_true")
+    parser.add_argument("--early_stopping_patience", type=int, default=5)
+    parser.add_argument("--early_stopping_min_delta", type=float, default=1e-4)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--wandb_project", default="reasonflow-vla")
     parser.add_argument("--wandb_entity")
@@ -868,6 +1262,9 @@ def parse_args() -> Stage4Config:
     args = parser.parse_args()
     values = vars(args)
     values["use_wandb"] = not values.pop("no_wandb")
+    values["evaluate"] = not values.pop("no_eval")
+    no_early_stopping = values.pop("no_early_stopping")
+    values["early_stopping"] = values["evaluate"] and not no_early_stopping
     values["wandb_tags"] = tuple(
         tag.strip() for tag in values["wandb_tags"].split(",") if tag.strip()
     )

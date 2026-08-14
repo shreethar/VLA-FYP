@@ -170,6 +170,7 @@ def save_stage4_checkpoint(
     optimizer,
     scheduler,
     config,
+    training_metadata: Optional[dict[str, Any]] = None,
 ) -> Path:
     checkpoint_dir = Path(output_dir) / f"step_{step:06d}"
     checkpoint_dir.mkdir(parents=True, exist_ok=True)
@@ -191,6 +192,7 @@ def save_stage4_checkpoint(
             "spatial_alignment": spatial_alignment.state_dict(),
             "optimizer": optimizer.state_dict(),
             "scheduler": scheduler.state_dict() if scheduler is not None else None,
+            "training_metadata": training_metadata or {},
         },
         checkpoint_dir / "stage4_state.pt",
     )
@@ -206,6 +208,7 @@ def restore_stage4_training_state(
     spatial_alignment,
     optimizer=None,
     scheduler=None,
+    training_metadata_out: Optional[dict[str, Any]] = None,
 ) -> int:
     state_path = Path(checkpoint_dir) / "stage4_state.pt"
     if not state_path.is_file():
@@ -216,4 +219,6 @@ def restore_stage4_training_state(
         optimizer.load_state_dict(state["optimizer"])
     if scheduler is not None and state.get("scheduler") is not None:
         scheduler.load_state_dict(state["scheduler"])
+    if training_metadata_out is not None:
+        training_metadata_out.update(state.get("training_metadata", {}))
     return int(state["step"])
