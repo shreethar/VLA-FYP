@@ -302,6 +302,35 @@ The frozen reference continues to load from the original Stage 2 checkpoint,
 while the trainable student, projector, optimizer, and scheduler resume from
 Stage 4.
 
+## Merge the best Stage 4 student and upload it
+
+The merge utility accepts either a concrete `step_*` checkpoint or the Stage 4
+run directory. When given the run directory it follows `best_checkpoint.json`,
+so an early-stopped run publishes the best validation checkpoint rather than
+the final checkpoint by accident.
+
+Authenticate once on the training machine, then run:
+
+```bash
+hf auth login
+
+python train/stage4/merge_and_upload.py \
+  --stage4_checkpoint checkpoints/stage4_partial_run_2 \
+  --base_model shreethar/LatentStudent-ckpt-400 \
+  --repo_id shreethar/Latent-Student-Spatial-Forcing
+```
+
+By default the merge runs on CPU in bfloat16 and writes its upload bundle to
+`checkpoints/Latent-Student-Spatial-Forcing-merged`. This requires enough CPU
+RAM for the full Stage 2 model and merge operation. Use `--device_map auto` if
+the training machine has enough accelerator memory. To inspect the local
+bundle before publishing, add `--no_upload`.
+
+The uploaded repository contains the merged VLM, processor/tokenizer, and the
+Stage 4 `spatial_parameters.pt` holding the frozen five spatial slots and
+updated waypoint head. VGGT and the SF projector are training-only and are not
+included in the inference path.
+
 ## Validate token correspondence first
 
 Before training, run the correspondence inspector on several samples. It
