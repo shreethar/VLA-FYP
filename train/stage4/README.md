@@ -389,8 +389,10 @@ python train/stage4/benchmark_forward.py \
 ```
 
 The script selects the first valid MolmoAct trajectory from the requested
-split and benchmarks all four models sequentially. To avoid loading a dataset,
-provide `--image /path/to/image.jpg --instruction "close the box"` instead.
+split by streaming directly from the downloaded local Parquet shards; it does
+not build a second Arrow copy of the dataset. It then benchmarks all four
+models sequentially. To avoid loading a dataset, provide
+`--image /path/to/image.jpg --instruction "close the box"` instead.
 
 For each model it reports model-loading time, input-preprocessing time, the
 CUDA-synchronized prefill forward-pass latency, peak allocated accelerator

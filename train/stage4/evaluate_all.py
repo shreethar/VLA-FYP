@@ -425,8 +425,9 @@ def _load_parquet_split(
     split: str,
     cache_dir: Optional[str],
     parquet_dir: Optional[str],
+    streaming: bool = False,
 ):
-    """Download only one split's raw Parquet shards and load them locally."""
+    """Download one split's Parquet shards and load or stream them locally."""
     if not re.fullmatch(r"[A-Za-z0-9_.-]+", split):
         raise ValueError(f"Invalid split name: {split!r}")
 
@@ -454,6 +455,7 @@ def _load_parquet_split(
         data_files={split: [str(path) for path in parquet_files]},
         split=split,
         cache_dir=cache_dir,
+        streaming=streaming,
     )
     return dataset, parquet_files
 

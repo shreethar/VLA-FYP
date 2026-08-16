@@ -36,11 +36,12 @@ from train.stage4.evaluate_all import (
     DEFAULT_SPATIAL_FORCING,
     DEFAULT_STAGE1,
     DEFAULT_TEACHER,
+    EXPECTED_WAYPOINTS,
     _load_parquet_split,
     _message_text,
     _model_device_map,
-    _select_trajectory_rows,
     _synchronize,
+    parse_trajectory,
 )
 
 
@@ -326,20 +327,38 @@ def _dataset_sample(args):
         split=args.split,
         cache_dir=args.cache_dir,
         parquet_dir=args.parquet_dir,
+        streaming=True,
     )
-    selected, indices = _select_trajectory_rows(dataset, 1)
-    row = selected[0]
+    row = None
+    dataset_index = None
+    print("Streaming local Parquet rows until one valid trajectory is found...")
+    for index, candidate in enumerate(dataset):
+        if candidate.get("dataset") != "molmoact":
+            continue
+        if candidate.get("type") != "trajectory":
+            continue
+        trajectory = parse_trajectory(candidate.get("assistant", ""))
+        if trajectory is None or len(trajectory) != EXPECTED_WAYPOINTS:
+            continue
+        row = candidate
+        dataset_index = index
+        break
+    if row is None:
+        raise ValueError(
+            "No valid five-waypoint MolmoAct trajectory was found in the split"
+        )
+
     image = row["frames"][0].convert("RGB").copy()
     sample = {"human": row["human"], "frames": [image]}
     source = {
         "source": "dataset",
         "dataset": args.dataset,
         "split": args.split,
-        "dataset_index": indices[0],
+        "dataset_index": dataset_index,
         "parquet_files": [str(path) for path in parquet_files],
         "instruction": row["human"],
     }
-    del selected, dataset
+    del dataset
     gc.collect()
     return sample, source
 
