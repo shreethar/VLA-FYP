@@ -372,6 +372,34 @@ Aggregate metrics, per-sample predictions, timings, selected dataset indices,
 and provenance are saved in `evaluation_stage4/evaluation_results.json`.
 Comparison grids are written to the same directory.
 
+## Measure single-sample model latency
+
+The aggregate evaluator reports throughput by dividing each batch's wall time
+by its batch size. To measure the latency of one request instead, run the
+forward benchmark with its default batch size of 1:
+
+```bash
+python train/stage4/benchmark_forward.py \
+  --split train \
+  --batch_size 1 \
+  --max_new_tokens 512 \
+  --warmup_runs 1 \
+  --measured_runs 3 \
+  --output evaluation_stage4/forward_benchmark.json
+```
+
+The script selects the first valid MolmoAct trajectory from the requested
+split and benchmarks all four models sequentially. To avoid loading a dataset,
+provide `--image /path/to/image.jpg --instruction "close the box"` instead.
+
+For each model it reports model-loading time, input-preprocessing time, the
+CUDA-synchronized prefill forward-pass latency, peak allocated accelerator
+memory, and full prediction latency. The teacher's full prediction includes up
+to 512 autoregressively generated tokens. The latent students' full prediction
+includes six autoregressive latent steps and the five parallel spatial slots.
+Each individual measured duration and an output preview or waypoint prediction
+is retained in the JSON report.
+
 ## Validate token correspondence first
 
 Before training, run the correspondence inspector on several samples. It
