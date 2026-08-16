@@ -334,15 +334,17 @@ included in the inference path.
 ## Compare Stage 4 against the previous models
 
 The Stage 4 evaluator uses the same `shreethar/FYP-Stage2-dataset` train split.
-It evaluates the first 10,000 valid five-waypoint trajectory rows and uses
-NumPy seed 42 to select 50 of those evaluated rows for visualization only. It
-compares the dataset ground truth, Stage 1, textual-thinking teacher, Latent
-Student checkpoint 400, and the merged Spatial Forcing student:
+It selects rows only when `dataset == "molmoact"` and `type == "trajectory"`,
+then evaluates the first 10,000 with valid five-waypoint annotations. NumPy
+seed 42 selects 50 of those evaluated rows for visualization only. It compares
+the dataset ground truth, Stage 1, textual-thinking teacher, Latent Student
+checkpoint 400, and the merged Spatial Forcing student:
 
 ```bash
 python train/stage4/evaluate_all.py \
   --evaluation_rows 10000 \
   --num_visualizations 50 \
+  --batch_size 128 \
   --spatial_forcing_model shreethar/Latent-Student-Spatial-Forcing \
   --output_dir evaluation_stage4
 ```
@@ -353,8 +355,10 @@ automatically and subsequent runs reuse the cache. Use `--cache_dir` to place
 that cache on a specific local SSD.
 
 Models run sequentially to avoid placing four large models on `cuda:0` at the
-same time. The evaluator retains the old 0-1000 pointwise L2 and DTW metrics
-and also calculates the actual Stage 4 waypoint objective:
+same time. Each active model processes up to 128 samples per batch; use
+`--batch_size` to lower this if generation exceeds available VRAM. The
+evaluator retains the old 0-1000 pointwise L2 and DTW metrics and also
+calculates the actual Stage 4 waypoint objective:
 
 ```text
 mean_i ||(prediction_i - ground_truth_i) / 1000||_2^2

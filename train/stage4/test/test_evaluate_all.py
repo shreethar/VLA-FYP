@@ -2,6 +2,7 @@ import math
 
 from train.stage4.evaluate_all import (
     _select_trajectory_rows,
+    _slice_rows,
     calc_dtw,
     calc_l2_distance,
     calc_waypoint_loss,
@@ -35,7 +36,7 @@ def test_invalid_waypoint_count_is_reported_as_failure():
 
 
 class _FakeDataset:
-    column_names = ["assistant", "other"]
+    column_names = ["assistant", "dataset", "type", "other"]
 
     def __init__(self, rows, selected=None):
         self.rows = rows
@@ -58,10 +59,26 @@ def test_select_trajectory_rows_skips_non_trajectory_answers():
     valid = "[[1,2],[3,4],[5,6],[7,8],[9,10]]"
     dataset = _FakeDataset(
         [
-            {"assistant": "plain QA answer"},
-            {"assistant": valid},
-            {"assistant": "[[1,2],[3,4]]"},
-            {"assistant": valid},
+            {
+                "assistant": valid,
+                "dataset": "robovqa",
+                "type": "trajectory",
+            },
+            {
+                "assistant": valid,
+                "dataset": "molmoact",
+                "type": "trajectory",
+            },
+            {
+                "assistant": valid,
+                "dataset": "molmoact",
+                "type": "qa",
+            },
+            {
+                "assistant": valid,
+                "dataset": "molmoact",
+                "type": "trajectory",
+            },
         ]
     )
 
@@ -69,3 +86,14 @@ def test_select_trajectory_rows_skips_non_trajectory_answers():
 
     assert indices == [1, 3]
     assert selected.selected == [1, 3]
+
+
+def test_slice_rows_converts_hf_column_batch_to_sample_dicts():
+    class _ColumnBatch:
+        def __getitem__(self, _slice):
+            return {"human": ["a", "b"], "frames": [[1], [2]]}
+
+    assert _slice_rows(_ColumnBatch(), 0, 2) == [
+        {"human": "a", "frames": [1]},
+        {"human": "b", "frames": [2]},
+    ]

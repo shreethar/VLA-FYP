@@ -9,7 +9,8 @@ Hugging Face.
 
 Models are evaluated sequentially by default. The original evaluator launched
 four 4B/5B models on the same CUDA device concurrently, which can easily OOM
-and does not change the evaluation protocol.
+and does not change the evaluation protocol. Within each model, examples are
+processed in batches of 128 by default.
 """
 
 from __future__ import annotations
@@ -234,6 +235,18 @@ def _model_device_map(device: str):
     return {"": device}
 
 
+def _slice_rows(rows, start: int, end: int) -> list[dict[str, Any]]:
+    """Return a list of rows from either an HF Dataset or a Python sequence."""
+    sliced = rows[start:end]
+    if isinstance(sliced, dict):
+        keys = list(sliced)
+        count = len(sliced[keys[0]]) if keys else 0
+        return [
+            {key: sliced[key][index] for key in keys} for index in range(count)
+        ]
+    return list(sliced)
+
+
 def process_text_model(
     *,
     model_name: str,
@@ -243,10 +256,12 @@ def process_text_model(
     description: str,
     device: str,
     max_new_tokens: int,
+    batch_size: int,
 ):
     processor = AutoProcessor.from_pretrained(
         processor_name, trust_remote_code=True
     )
+    processor.tokenizer.padding_side = "left"
     model = AutoModelForImageTextToText.from_pretrained(
         model_name,
         dtype=torch.bfloat16,
@@ -255,23 +270,36 @@ def process_text_model(
     )
     model.eval()
     results, timings = [], []
-    for sample in tqdm(samples, desc=description):
-        prompt = _message_text(
-            processor, sample, enable_thinking=enable_thinking
-        )
+    starts = range(0, len(samples), batch_size)
+    for start in tqdm(
+        starts,
+        total=math.ceil(len(samples) / batch_size),
+        desc=description,
+    ):
+        batch = _slice_rows(samples, start, min(start + batch_size, len(samples)))
+        prompts = [
+            _message_text(processor, sample, enable_thinking=enable_thinking)
+            for sample in batch
+        ]
+        images = [sample["frames"][0] for sample in batch]
         inputs = processor(
-            text=[prompt], images=[sample["frames"][0]], return_tensors="pt"
+            text=prompts,
+            images=images,
+            padding=True,
+            return_tensors="pt",
         ).to(device)
         _synchronize(device)
         started = time.perf_counter()
         with torch.inference_mode():
             output = model.generate(**inputs, max_new_tokens=max_new_tokens)
         _synchronize(device)
-        timings.append(time.perf_counter() - started)
-        generated = processor.tokenizer.decode(
-            output[0][inputs.input_ids.shape[1] :]
+        elapsed = time.perf_counter() - started
+        timings.extend([elapsed / len(batch)] * len(batch))
+        prompt_length = inputs.input_ids.shape[1]
+        generated_batch = processor.tokenizer.batch_decode(
+            output[:, prompt_length:]
         )
-        results.append(parse_trajectory(generated))
+        results.extend(parse_trajectory(generated) for generated in generated_batch)
     return results, timings
 
 
@@ -283,10 +311,12 @@ def process_latent_model(
     end_think_token_id: int,
     description: str,
     device: str,
+    batch_size: int,
 ):
     processor = AutoProcessor.from_pretrained(
         processor_name, trust_remote_code=True
     )
+    processor.tokenizer.padding_side = "left"
     student = load_latent_student_checkpoint(
         checkpoint=model_name,
         end_think_token_id=end_think_token_id,
@@ -296,10 +326,23 @@ def process_latent_model(
     ).to(device)
     student.eval()
     results, timings = [], []
-    for sample in tqdm(samples, desc=description):
-        prompt = _message_text(processor, sample, enable_thinking=True)
+    starts = range(0, len(samples), batch_size)
+    for start in tqdm(
+        starts,
+        total=math.ceil(len(samples) / batch_size),
+        desc=description,
+    ):
+        batch = _slice_rows(samples, start, min(start + batch_size, len(samples)))
+        prompts = [
+            _message_text(processor, sample, enable_thinking=True)
+            for sample in batch
+        ]
+        images = [sample["frames"][0] for sample in batch]
         inputs = processor(
-            text=[prompt], images=[sample["frames"][0]], return_tensors="pt"
+            text=prompts,
+            images=images,
+            padding=True,
+            return_tensors="pt",
         ).to(device)
         _synchronize(device)
         started = time.perf_counter()
@@ -313,9 +356,10 @@ def process_latent_model(
                 video_grid_thw=inputs.get("video_grid_thw"),
             )
         _synchronize(device)
-        timings.append(time.perf_counter() - started)
-        results.append(
-            waypoints[0].detach().float().cpu().mul(COORDINATE_SCALE).tolist()
+        elapsed = time.perf_counter() - started
+        timings.extend([elapsed / len(batch)] * len(batch))
+        results.extend(
+            waypoints.detach().float().cpu().mul(COORDINATE_SCALE).tolist()
         )
     return results, timings
 
@@ -332,14 +376,21 @@ def _extract_instruction(human_prompt: str) -> str:
 
 
 def _select_trajectory_rows(dataset, evaluation_rows: int):
-    """Select the first N rows whose assistant answer contains five waypoints."""
-    if "assistant" not in dataset.column_names:
-        raise ValueError("Evaluation dataset must contain an 'assistant' column")
-    assistant_rows = dataset.select_columns(["assistant"])
+    """Select N valid rows where dataset=molmoact and type=trajectory."""
+    required_columns = {"dataset", "type", "assistant"}
+    missing = required_columns.difference(dataset.column_names)
+    if missing:
+        raise ValueError(
+            "Evaluation dataset is missing required columns: "
+            + ", ".join(sorted(missing))
+        )
+    metadata_rows = dataset.select_columns(sorted(required_columns))
     selected_indices = []
     for row_index, row in enumerate(
-        tqdm(assistant_rows, desc="Selecting trajectory rows")
+        tqdm(metadata_rows, desc="Selecting MolmoAct trajectories")
     ):
+        if row["dataset"] != "molmoact" or row["type"] != "trajectory":
+            continue
         trajectory = parse_trajectory(row["assistant"])
         if trajectory is None or len(trajectory) != EXPECTED_WAYPOINTS:
             continue
@@ -348,8 +399,8 @@ def _select_trajectory_rows(dataset, evaluation_rows: int):
             break
     if len(selected_indices) < evaluation_rows:
         raise ValueError(
-            f"Requested {evaluation_rows} valid trajectory rows, but found only "
-            f"{len(selected_indices)} in {len(dataset)} dataset rows"
+            f"Requested {evaluation_rows} valid molmoact/trajectory rows, but "
+            f"found only {len(selected_indices)} in {len(dataset)} dataset rows"
         )
     return dataset.select(selected_indices), selected_indices
 
@@ -456,6 +507,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--split", default="train")
     parser.add_argument("--evaluation_rows", type=int, default=10000)
     parser.add_argument("--num_visualizations", type=int, default=50)
+    parser.add_argument("--batch_size", type=int, default=128)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument(
         "--cache_dir",
@@ -483,6 +535,8 @@ def main() -> None:
             "--num_visualizations must be positive and no greater than "
             "--evaluation_rows"
         )
+    if args.batch_size <= 0:
+        raise ValueError("--batch_size must be positive")
     if args.device.startswith("cuda") and not torch.cuda.is_available():
         raise RuntimeError("CUDA was requested but is unavailable")
 
@@ -530,6 +584,7 @@ def main() -> None:
         description="Stage 1",
         device=args.device,
         max_new_tokens=args.max_new_tokens,
+        batch_size=args.batch_size,
     )
     _release_accelerator_memory()
 
@@ -542,6 +597,7 @@ def main() -> None:
         description="Teacher",
         device=args.device,
         max_new_tokens=args.max_new_tokens,
+        batch_size=args.batch_size,
     )
     _release_accelerator_memory()
 
@@ -553,6 +609,7 @@ def main() -> None:
         end_think_token_id=end_think_token_id,
         description="Latent 400",
         device=args.device,
+        batch_size=args.batch_size,
     )
     _release_accelerator_memory()
 
@@ -564,6 +621,7 @@ def main() -> None:
         end_think_token_id=end_think_token_id,
         description="Spatial Forcing",
         device=args.device,
+        batch_size=args.batch_size,
     )
     _release_accelerator_memory()
 
@@ -579,7 +637,13 @@ def main() -> None:
             "split": args.split,
             "evaluation_rows": args.evaluation_rows,
             "num_visualizations": args.num_visualizations,
+            "batch_size": args.batch_size,
             "seed": args.seed,
+            "filters": {
+                "dataset": "molmoact",
+                "type": "trajectory",
+                "waypoint_count": EXPECTED_WAYPOINTS,
+            },
             "selected_dataset_indices": selected_dataset_indices,
             "visualization_positions": [
                 int(position) for position in visualization_positions
