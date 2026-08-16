@@ -331,6 +331,32 @@ Stage 4 `spatial_parameters.pt` holding the frozen five spatial slots and
 updated waypoint head. VGGT and the SF projector are training-only and are not
 included in the inference path.
 
+## Compare Stage 4 against the previous models
+
+The Stage 4 evaluator reproduces `train/stage2/evaluate_all.py` on the same
+`shreethar/FYP-Stage2-dataset` train split, sampling 50 rows from the first
+8,000 with NumPy seed 42. It compares the dataset ground truth, Stage 1,
+textual-thinking teacher, Latent Student checkpoint 400, and the merged Spatial
+Forcing student:
+
+```bash
+python train/stage4/evaluate_all.py \
+  --spatial_forcing_model shreethar/Latent-Student-Spatial-Forcing \
+  --output_dir evaluation_stage4
+```
+
+Models run sequentially to avoid placing four large models on `cuda:0` at the
+same time. The evaluator retains the old 0-1000 pointwise L2 and DTW metrics
+and also calculates the actual Stage 4 waypoint objective:
+
+```text
+mean_i ||(prediction_i - ground_truth_i) / 1000||_2^2
+```
+
+Aggregate metrics, per-sample predictions, timings, selected dataset indices,
+and provenance are saved in `evaluation_stage4/evaluation_results.json`.
+Comparison grids are written to the same directory.
+
 ## Validate token correspondence first
 
 Before training, run the correspondence inspector on several samples. It
