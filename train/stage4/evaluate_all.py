@@ -2,9 +2,10 @@
 """Compare Stage 1, textual teacher, B2, and Spatial-Forcing students.
 
 This is the Stage 4 counterpart of ``train/stage2/evaluate_all.py``. It keeps
-the same dataset, split, seed, first-8,000 sampling pool, and 50-sample default.
-The former checkpoint-619 column is replaced by the merged Spatial Forcing
-student from Hugging Face.
+the same dataset and split, evaluates 10,000 valid trajectory rows by default,
+and samples 50 of those evaluated rows for visualization. The former
+checkpoint-619 column is replaced by the merged Spatial Forcing student from
+Hugging Face.
 
 Models are evaluated sequentially by default. The original evaluator launched
 four 4B/5B models on the same CUDA device concurrently, which can easily OOM
@@ -330,6 +331,29 @@ def _extract_instruction(human_prompt: str) -> str:
     return match.group(1).strip() if match else human_prompt
 
 
+def _select_trajectory_rows(dataset, evaluation_rows: int):
+    """Select the first N rows whose assistant answer contains five waypoints."""
+    if "assistant" not in dataset.column_names:
+        raise ValueError("Evaluation dataset must contain an 'assistant' column")
+    assistant_rows = dataset.select_columns(["assistant"])
+    selected_indices = []
+    for row_index, row in enumerate(
+        tqdm(assistant_rows, desc="Selecting trajectory rows")
+    ):
+        trajectory = parse_trajectory(row["assistant"])
+        if trajectory is None or len(trajectory) != EXPECTED_WAYPOINTS:
+            continue
+        selected_indices.append(row_index)
+        if len(selected_indices) == evaluation_rows:
+            break
+    if len(selected_indices) < evaluation_rows:
+        raise ValueError(
+            f"Requested {evaluation_rows} valid trajectory rows, but found only "
+            f"{len(selected_indices)} in {len(dataset)} dataset rows"
+        )
+    return dataset.select(selected_indices), selected_indices
+
+
 def _generate_plots(samples, results, metrics, output_dir: Path) -> None:
     column_names = [
         "Instruction",
@@ -430,9 +454,13 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--dataset", default=DEFAULT_DATASET)
     parser.add_argument("--split", default="train")
-    parser.add_argument("--sample_pool_size", type=int, default=8000)
-    parser.add_argument("--num_samples", type=int, default=50)
+    parser.add_argument("--evaluation_rows", type=int, default=10000)
+    parser.add_argument("--num_visualizations", type=int, default=50)
     parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument(
+        "--cache_dir",
+        help="Optional Hugging Face dataset cache directory.",
+    )
     parser.add_argument("--processor", default=DEFAULT_PROCESSOR)
     parser.add_argument("--stage1_model", default=DEFAULT_STAGE1)
     parser.add_argument("--teacher_model", default=DEFAULT_TEACHER)
@@ -448,10 +476,13 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = parse_args()
-    if args.num_samples <= 0:
-        raise ValueError("--num_samples must be positive")
-    if args.sample_pool_size < args.num_samples:
-        raise ValueError("--sample_pool_size must be at least --num_samples")
+    if args.evaluation_rows <= 0:
+        raise ValueError("--evaluation_rows must be positive")
+    if not 0 < args.num_visualizations <= args.evaluation_rows:
+        raise ValueError(
+            "--num_visualizations must be positive and no greater than "
+            "--evaluation_rows"
+        )
     if args.device.startswith("cuda") and not torch.cuda.is_available():
         raise RuntimeError("CUDA was requested but is unavailable")
 
@@ -459,25 +490,33 @@ def main() -> None:
     output_dir.mkdir(parents=True, exist_ok=True)
 
     print(f"Loading {args.dataset}[{args.split}]...")
-    dataset = load_dataset(args.dataset, split=args.split)
-    pool_size = min(args.sample_pool_size, len(dataset))
-    if pool_size < args.num_samples:
-        raise ValueError(
-            f"Dataset provides only {pool_size} rows in the requested sampling pool"
-        )
+    dataset = load_dataset(
+        args.dataset,
+        split=args.split,
+        cache_dir=args.cache_dir,
+    )
+    samples, selected_dataset_indices = _select_trajectory_rows(
+        dataset, args.evaluation_rows
+    )
     random_state = np.random.RandomState(args.seed)
-    indices = random_state.choice(pool_size, args.num_samples, replace=False)
-    samples = [dataset[int(index)] for index in indices]
+    visualization_positions = random_state.choice(
+        args.evaluation_rows,
+        args.num_visualizations,
+        replace=False,
+    )
 
     processor = AutoProcessor.from_pretrained(
         args.processor, trust_remote_code=True
     )
     end_think_token_id = processor.tokenizer.convert_tokens_to_ids("</think>")
 
+    text_rows = samples.select_columns(["human", "assistant"])
     results: dict[str, Any] = {
-        "instruction": [_extract_instruction(sample["human"]) for sample in samples],
+        "instruction": [
+            _extract_instruction(sample["human"]) for sample in text_rows
+        ],
         "ground_truth": [
-            parse_trajectory(sample["assistant"]) for sample in samples
+            parse_trajectory(sample["assistant"]) for sample in text_rows
         ],
     }
     timings: dict[str, list[float]] = {}
@@ -538,10 +577,17 @@ def main() -> None:
         "configuration": {
             "dataset": args.dataset,
             "split": args.split,
-            "sample_pool_size": pool_size,
-            "num_samples": args.num_samples,
+            "evaluation_rows": args.evaluation_rows,
+            "num_visualizations": args.num_visualizations,
             "seed": args.seed,
-            "indices": [int(index) for index in indices],
+            "selected_dataset_indices": selected_dataset_indices,
+            "visualization_positions": [
+                int(position) for position in visualization_positions
+            ],
+            "visualization_dataset_indices": [
+                selected_dataset_indices[int(position)]
+                for position in visualization_positions
+            ],
             "coordinate_scale": COORDINATE_SCALE,
             "models": {
                 "stage1": args.stage1_model,
@@ -559,7 +605,26 @@ def main() -> None:
     print(f"Saved {report_path}")
 
     print("Generating comparison plots...")
-    _generate_plots(samples, results, metrics, output_dir)
+    plot_samples = [samples[int(position)] for position in visualization_positions]
+    plot_results = {
+        key: [values[int(position)] for position in visualization_positions]
+        for key, values in results.items()
+    }
+    plot_metrics = {
+        key: {
+            "per_sample": [
+                values["per_sample"][int(position)]
+                for position in visualization_positions
+            ]
+        }
+        for key, values in metrics.items()
+    }
+    _generate_plots(
+        plot_samples,
+        plot_results,
+        plot_metrics,
+        output_dir,
+    )
 
 
 if __name__ == "__main__":

@@ -333,17 +333,24 @@ included in the inference path.
 
 ## Compare Stage 4 against the previous models
 
-The Stage 4 evaluator reproduces `train/stage2/evaluate_all.py` on the same
-`shreethar/FYP-Stage2-dataset` train split, sampling 50 rows from the first
-8,000 with NumPy seed 42. It compares the dataset ground truth, Stage 1,
-textual-thinking teacher, Latent Student checkpoint 400, and the merged Spatial
-Forcing student:
+The Stage 4 evaluator uses the same `shreethar/FYP-Stage2-dataset` train split.
+It evaluates the first 10,000 valid five-waypoint trajectory rows and uses
+NumPy seed 42 to select 50 of those evaluated rows for visualization only. It
+compares the dataset ground truth, Stage 1, textual-thinking teacher, Latent
+Student checkpoint 400, and the merged Spatial Forcing student:
 
 ```bash
 python train/stage4/evaluate_all.py \
+  --evaluation_rows 10000 \
+  --num_visualizations 50 \
   --spatial_forcing_model shreethar/Latent-Student-Spatial-Forcing \
   --output_dir evaluation_stage4
 ```
+
+The evaluator uses normal Hugging Face cached loading rather than streaming.
+If the dataset is not present, `load_dataset` downloads the train split
+automatically and subsequent runs reuse the cache. Use `--cache_dir` to place
+that cache on a specific local SSD.
 
 Models run sequentially to avoid placing four large models on `cuda:0` at the
 same time. The evaluator retains the old 0-1000 pointwise L2 and DTW metrics
