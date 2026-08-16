@@ -1,6 +1,7 @@
 import math
 
 from train.stage4.evaluate_all import (
+    _find_split_parquet_files,
     _select_trajectory_rows,
     _slice_rows,
     calc_dtw,
@@ -86,6 +87,32 @@ def test_select_trajectory_rows_skips_non_trajectory_answers():
 
     assert indices == [1, 3]
     assert selected.selected == [1, 3]
+
+
+def test_select_trajectory_rows_zero_selects_all_matching_rows():
+    valid = "[[1,2],[3,4],[5,6],[7,8],[9,10]]"
+    dataset = _FakeDataset(
+        [
+            {"assistant": valid, "dataset": "molmoact", "type": "trajectory"},
+            {"assistant": valid, "dataset": "robovqa", "type": "trajectory"},
+            {"assistant": valid, "dataset": "molmoact", "type": "trajectory"},
+        ]
+    )
+
+    selected, indices = _select_trajectory_rows(dataset, 0)
+
+    assert indices == [0, 2]
+    assert selected.selected == [0, 2]
+
+
+def test_find_split_parquet_files_excludes_train_shards(tmp_path):
+    data_dir = tmp_path / "data"
+    data_dir.mkdir()
+    test_shard = data_dir / "test-00000-of-00001.parquet"
+    test_shard.touch()
+    (data_dir / "train-00000-of-00001.parquet").touch()
+
+    assert _find_split_parquet_files(tmp_path, "test") == [test_shard]
 
 
 def test_slice_rows_converts_hf_column_batch_to_sample_dicts():

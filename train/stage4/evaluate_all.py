@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
 """Compare Stage 1, textual teacher, B2, and Spatial-Forcing students.
 
-This is the Stage 4 counterpart of ``train/stage2/evaluate_all.py``. It keeps
-the same dataset and split, evaluates 10,000 valid trajectory rows by default,
-and samples 50 of those evaluated rows for visualization. The former
-checkpoint-619 column is replaced by the merged Spatial Forcing student from
-Hugging Face.
+This is the Stage 4 counterpart of ``train/stage2/evaluate_all.py``. It
+downloads only the requested split's Parquet shards, evaluates every valid
+MolmoAct trajectory in the test split by default, and samples 50 of those
+evaluated rows for visualization. The former checkpoint-619 column is replaced
+by the merged Spatial Forcing student from Hugging Face.
 
 Models are evaluated sequentially by default. The original evaluator launched
 four 4B/5B models on the same CUDA device concurrently, which can easily OOM
@@ -34,6 +34,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 import torch
 from datasets import load_dataset
+from huggingface_hub import snapshot_download
 from PIL import Image, ImageDraw
 from tqdm import tqdm
 from transformers import AutoModelForImageTextToText, AutoProcessor
@@ -376,7 +377,9 @@ def _extract_instruction(human_prompt: str) -> str:
 
 
 def _select_trajectory_rows(dataset, evaluation_rows: int):
-    """Select N valid rows where dataset=molmoact and type=trajectory."""
+    """Select up to N valid MolmoAct trajectories, or all of them when N=0."""
+    if evaluation_rows < 0:
+        raise ValueError("evaluation_rows cannot be negative")
     required_columns = {"dataset", "type", "assistant"}
     missing = required_columns.difference(dataset.column_names)
     if missing:
@@ -395,14 +398,64 @@ def _select_trajectory_rows(dataset, evaluation_rows: int):
         if trajectory is None or len(trajectory) != EXPECTED_WAYPOINTS:
             continue
         selected_indices.append(row_index)
-        if len(selected_indices) == evaluation_rows:
+        if evaluation_rows and len(selected_indices) == evaluation_rows:
             break
-    if len(selected_indices) < evaluation_rows:
+    if not selected_indices:
+        raise ValueError(
+            "Found no valid rows where dataset=molmoact, type=trajectory, "
+            "and the annotation contains exactly five waypoints"
+        )
+    if evaluation_rows and len(selected_indices) < evaluation_rows:
         raise ValueError(
             f"Requested {evaluation_rows} valid molmoact/trajectory rows, but "
             f"found only {len(selected_indices)} in {len(dataset)} dataset rows"
         )
     return dataset.select(selected_indices), selected_indices
+
+
+def _find_split_parquet_files(snapshot_dir: Path, split: str) -> list[Path]:
+    """Return split shards from either the repository root or data directory."""
+    files = set(snapshot_dir.glob(f"{split}-*.parquet"))
+    files.update((snapshot_dir / "data").glob(f"{split}-*.parquet"))
+    return sorted(path for path in files if path.is_file())
+
+
+def _load_parquet_split(
+    dataset_repo: str,
+    split: str,
+    cache_dir: Optional[str],
+    parquet_dir: Optional[str],
+):
+    """Download only one split's raw Parquet shards and load them locally."""
+    if not re.fullmatch(r"[A-Za-z0-9_.-]+", split):
+        raise ValueError(f"Invalid split name: {split!r}")
+
+    patterns = [f"data/{split}-*.parquet", f"{split}-*.parquet"]
+    download_kwargs: dict[str, Any] = {
+        "repo_id": dataset_repo,
+        "repo_type": "dataset",
+        "allow_patterns": patterns,
+        "cache_dir": cache_dir,
+    }
+    if parquet_dir is not None:
+        download_kwargs["local_dir"] = parquet_dir
+    snapshot_dir = Path(snapshot_download(**download_kwargs))
+    parquet_files = _find_split_parquet_files(snapshot_dir, split)
+    if not parquet_files:
+        raise FileNotFoundError(
+            f"No {split}-*.parquet shards were found in {dataset_repo}"
+        )
+
+    print(f"Using {len(parquet_files)} {split} Parquet shard(s):")
+    for parquet_file in parquet_files:
+        print(f"  {parquet_file}")
+    dataset = load_dataset(
+        "parquet",
+        data_files={split: [str(path) for path in parquet_files]},
+        split=split,
+        cache_dir=cache_dir,
+    )
+    return dataset, parquet_files
 
 
 def _generate_plots(samples, results, metrics, output_dir: Path) -> None:
@@ -504,14 +557,26 @@ def _print_summary(metrics, timings) -> None:
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--dataset", default=DEFAULT_DATASET)
-    parser.add_argument("--split", default="train")
-    parser.add_argument("--evaluation_rows", type=int, default=10000)
+    parser.add_argument("--split", default="test")
+    parser.add_argument(
+        "--evaluation_rows",
+        type=int,
+        default=0,
+        help="Maximum eligible rows to evaluate; 0 evaluates the entire split.",
+    )
     parser.add_argument("--num_visualizations", type=int, default=50)
     parser.add_argument("--batch_size", type=int, default=128)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument(
         "--cache_dir",
         help="Optional Hugging Face dataset cache directory.",
+    )
+    parser.add_argument(
+        "--parquet_dir",
+        help=(
+            "Optional visible destination for the raw split Parquet shards. "
+            "Without it, the shards remain in the Hugging Face cache."
+        ),
     )
     parser.add_argument("--processor", default=DEFAULT_PROCESSOR)
     parser.add_argument("--stage1_model", default=DEFAULT_STAGE1)
@@ -528,13 +593,10 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = parse_args()
-    if args.evaluation_rows <= 0:
-        raise ValueError("--evaluation_rows must be positive")
-    if not 0 < args.num_visualizations <= args.evaluation_rows:
-        raise ValueError(
-            "--num_visualizations must be positive and no greater than "
-            "--evaluation_rows"
-        )
+    if args.evaluation_rows < 0:
+        raise ValueError("--evaluation_rows cannot be negative")
+    if args.num_visualizations <= 0:
+        raise ValueError("--num_visualizations must be positive")
     if args.batch_size <= 0:
         raise ValueError("--batch_size must be positive")
     if args.device.startswith("cuda") and not torch.cuda.is_available():
@@ -543,18 +605,29 @@ def main() -> None:
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    print(f"Loading {args.dataset}[{args.split}]...")
-    dataset = load_dataset(
-        args.dataset,
+    print(f"Downloading only {args.dataset} {args.split}-*.parquet shards...")
+    dataset, parquet_files = _load_parquet_split(
+        dataset_repo=args.dataset,
         split=args.split,
         cache_dir=args.cache_dir,
+        parquet_dir=args.parquet_dir,
     )
     samples, selected_dataset_indices = _select_trajectory_rows(
         dataset, args.evaluation_rows
     )
+    actual_evaluation_rows = len(samples)
+    if args.num_visualizations > actual_evaluation_rows:
+        raise ValueError(
+            f"--num_visualizations={args.num_visualizations} exceeds the "
+            f"{actual_evaluation_rows} eligible evaluation rows"
+        )
+    print(
+        f"Evaluating {actual_evaluation_rows} rows after applying "
+        "dataset=molmoact, type=trajectory, and five-waypoint filters."
+    )
     random_state = np.random.RandomState(args.seed)
     visualization_positions = random_state.choice(
-        args.evaluation_rows,
+        actual_evaluation_rows,
         args.num_visualizations,
         replace=False,
     )
@@ -635,7 +708,8 @@ def main() -> None:
         "configuration": {
             "dataset": args.dataset,
             "split": args.split,
-            "evaluation_rows": args.evaluation_rows,
+            "evaluation_rows": actual_evaluation_rows,
+            "evaluation_row_limit": args.evaluation_rows,
             "num_visualizations": args.num_visualizations,
             "batch_size": args.batch_size,
             "seed": args.seed,
@@ -653,6 +727,7 @@ def main() -> None:
                 for position in visualization_positions
             ],
             "coordinate_scale": COORDINATE_SCALE,
+            "parquet_files": [str(path) for path in parquet_files],
             "models": {
                 "stage1": args.stage1_model,
                 "teacher": args.teacher_model,

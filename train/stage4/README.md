@@ -333,26 +333,30 @@ included in the inference path.
 
 ## Compare Stage 4 against the previous models
 
-The Stage 4 evaluator uses the same `shreethar/FYP-Stage2-dataset` train split.
-It selects rows only when `dataset == "molmoact"` and `type == "trajectory"`,
-then evaluates the first 10,000 with valid five-waypoint annotations. NumPy
-seed 42 selects 50 of those evaluated rows for visualization only. It compares
-the dataset ground truth, Stage 1, textual-thinking teacher, Latent Student
+The Stage 4 evaluator defaults to the `shreethar/FYP-Stage2-dataset` test
+split. It downloads only the raw `data/test-*.parquet` shards, then selects
+rows where `dataset == "molmoact"`, `type == "trajectory"`, and the annotation
+has exactly five waypoints. The test split has fewer than 10,000 total rows, so
+the default `--evaluation_rows 0` evaluates every matching row. NumPy seed 42
+selects 50 of those evaluated rows for visualization only. It compares the
+dataset ground truth, Stage 1, textual-thinking teacher, Latent Student
 checkpoint 400, and the merged Spatial Forcing student:
 
 ```bash
 python train/stage4/evaluate_all.py \
-  --evaluation_rows 10000 \
+  --split test \
+  --evaluation_rows 0 \
   --num_visualizations 50 \
   --batch_size 128 \
   --spatial_forcing_model shreethar/Latent-Student-Spatial-Forcing \
   --output_dir evaluation_stage4
 ```
 
-The evaluator uses normal Hugging Face cached loading rather than streaming.
-If the dataset is not present, `load_dataset` downloads the train split
-automatically and subsequent runs reuse the cache. Use `--cache_dir` to place
-that cache on a specific local SSD.
+The evaluator materializes the selected Parquet shards rather than streaming.
+Subsequent runs reuse the Hugging Face cache. Use `--cache_dir` to place the
+cache on a specific local SSD, or `--parquet_dir /path/to/test_parquet` to put
+the raw `test-xxxxx-of-xxxxx.parquet` files in a directly visible directory.
+Passing a positive `--evaluation_rows` applies an upper limit after filtering.
 
 Models run sequentially to avoid placing four large models on `cuda:0` at the
 same time. Each active model processes up to 128 samples per batch; use
